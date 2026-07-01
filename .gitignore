@@ -1,0 +1,23 @@
+# dependencies
+**/node_modules/
+
+# next.js
+**/.next/
+**/out/
+
+# env / secrets — JAMAIS en Git
+**/.env
+**/.env.local
+**/.env*.local
+
+# prisma generated client
+**/prisma/generated/
+
+# typescript build info
+**/*.tsbuildinfo
+**/next-env.d.ts
+
+# logs / os
+**/*.log
+.DS_Store
+Thumbs.db

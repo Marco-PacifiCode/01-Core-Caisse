@@ -1,0 +1,93 @@
+/* Core Caisse — design system partagé (mêmes tokens que les autres moteurs).
+   Polices chargées par le layout. Charte du marchand surchargée par tenant (lib/theme.ts). */
+:root{
+  --blush:#FBF3EE; --blush-2:#FFF7F3; --cream:#F4ECDD;
+  --sage:#97A488; --sage-soft:#AEB9A2; --sage-deep:#6C7A60; --sage-ink:#515B45;
+  --ink:#2C2A27; --muted:#928B81; --line:#E3D9CF; --line-sage:#C9D1BE;
+  --ok:#6C7A60; --warn:#B98A4B; --soon:#9A86C4; --danger:#B4553F;
+  --maxw:1180px;
+}
+*{box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  margin:0;background:var(--blush);color:var(--ink);
+  font-family:"Cormorant Garamond",Georgia,serif;font-size:19px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+img{display:block;max-width:100%;}
+a{color:inherit;text-decoration:none;}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 32px;}
+.wrap-narrow{max-width:760px;margin:0 auto;padding:0 24px;}
+
+.label{font-family:"Jost",sans-serif;font-weight:400;font-size:12px;letter-spacing:.3em;
+  text-transform:uppercase;color:var(--sage-deep);}
+.mono{font-family:"Jost",sans-serif;font-variant-numeric:tabular-nums;}
+h1,h2,h3{margin:0;font-weight:500;letter-spacing:.005em;}
+.title{font-size:clamp(30px,4vw,48px);line-height:1.04;}
+.subtitle{font-size:20px;color:var(--sage-ink);font-style:italic;}
+
+/* buttons */
+.btn{font-family:"Jost",sans-serif;font-size:12.5px;font-weight:500;letter-spacing:.16em;
+  text-transform:uppercase;display:inline-flex;align-items:center;justify-content:center;gap:9px;
+  padding:13px 26px;border-radius:999px;background:var(--sage);color:#fff;border:1px solid var(--sage);
+  cursor:pointer;transition:background .25s,transform .2s,box-shadow .25s;
+  box-shadow:0 6px 20px -8px rgba(82,91,69,.5);}
+.btn:hover{background:var(--sage-deep);transform:translateY(-1px);}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none;}
+.btn.ghost{background:transparent;color:var(--sage-ink);border:1px solid var(--line-sage);box-shadow:none;}
+.btn.ghost:hover{background:rgba(151,164,136,.12);}
+.btn.sm{padding:9px 16px;font-size:11px;}
+.btn.lg{padding:16px 34px;font-size:14px;}
+.btn .arr{font-family:Georgia,serif;font-size:14px;}
+
+/* page shell */
+.page{padding:48px 0 40px;min-height:60vh;}
+.page-head{margin-bottom:28px;}
+.page-head .label{display:block;margin-bottom:10px;}
+.crumb{font-family:"Jost",sans-serif;font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+
+/* cards + stats */
+.card{background:var(--blush-2);border:1px solid var(--line);border-radius:20px;padding:26px 28px;}
+.grid{display:grid;gap:22px;}
+.grid.cols-2{grid-template-columns:repeat(2,1fr);}
+.grid.cols-3{grid-template-columns:repeat(3,1fr);}
+@media (max-width:960px){.grid.cols-2,.grid.cols-3{grid-template-columns:1fr;}}
+.stat .k{font-family:"Jost",sans-serif;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--sage-deep);}
+.stat .v{font-size:34px;font-weight:600;color:var(--sage-ink);font-variant-numeric:tabular-nums;margin-top:6px;}
+
+/* badges */
+.badge{font-family:"Jost",sans-serif;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  padding:4px 10px;border-radius:999px;display:inline-flex;align-items:center;gap:6px;font-weight:500;}
+.badge.done{background:rgba(108,122,96,.12);color:var(--ok);border:1px solid rgba(108,122,96,.35);}
+.badge.warn{background:rgba(185,138,75,.14);color:var(--warn);border:1px solid rgba(185,138,75,.4);}
+.badge.danger{background:rgba(180,85,63,.12);color:var(--danger);border:1px solid rgba(180,85,63,.4);}
+
+/* table */
+.tbl{width:100%;border-collapse:collapse;font-size:17px;}
+.tbl th{font-family:"Jost",sans-serif;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);text-align:left;padding:10px 12px;border-bottom:1px solid var(--line-sage);font-weight:500;}
+.tbl td{padding:12px;border-bottom:1px solid var(--line);vertical-align:middle;}
+.tbl td.num,.tbl th.num{text-align:right;font-variant-numeric:tabular-nums;}
+.tbl tr:last-child td{border-bottom:none;}
+
+/* forms */
+.field{margin-bottom:18px;}
+.field label{display:block;font-family:"Jost",sans-serif;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--sage-deep);margin-bottom:7px;}
+.field input,.field select{width:100%;font-family:"Cormorant Garamond",serif;font-size:18px;
+  padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#fff;color:var(--ink);}
+.field input:focus,.field select:focus{outline:none;border-color:var(--sage);}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+@media (max-width:560px){.row2,.row3{grid-template-columns:1fr;}}
+.err{color:var(--danger);font-size:15px;margin:8px 0;}
+.ok{color:var(--ok);font-size:15px;margin:8px 0;}
+.section{margin-top:40px;}
+.section h2{font-size:26px;margin-bottom:16px;}
+
+/* caisse specifics */
+.money{font-variant-numeric:tabular-nums;font-family:"Jost",sans-serif;}
+.total-line{display:flex;justify-content:space-between;align-items:baseline;padding:8px 0;}
+.total-line.grand{border-top:2px solid var(--line-sage);margin-top:8px;padding-top:14px;font-size:26px;}
+.change{color:var(--ok);font-weight:600;}

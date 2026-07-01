@@ -1,0 +1,138 @@
+// Core Caisse — moteur de POINT DE VENTE / tenue de caisse au comptoir, multi-tenant.
+// Il ORCHESTRE les autres cores : à l'encaissement il pousse une facture + un paiement à Core-Compta
+// et décrémente Core-Stock. Il ne refait NI la compta (Compta) NI l'inventaire (Stock) — il gère les
+// OPÉRATIONS de vente/encaissement (ticket, paiements offline, rendu monnaie, session/clôture Z).
+//
+// Isolation par tenantId sur chaque table + RLS PostgreSQL (voir prisma/rls.sql).
+// tenantId = UUID scalaire (résolu via core_auth /api/tenant, pas de table locale).
+// Argent = XPF entier (BigInt), jamais de float/centime.
+//
+// --- Choix de conception : montants STOCKÉS sur la vente ---
+// Sale.subtotalXpf / totalXpf sont STOCKÉS (source de vérité du ticket au moment de l'encaissement),
+// pas re-sommés depuis les lignes à chaque lecture — même philosophie que Core-Compta (Invoice.totalXpf)
+// et Core-Stock (StockItem.qtyOnHand). Ils sont figés à la validation du ticket.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// État d'une session de caisse (journée / poste).
+enum SessionStatus {
+  OPEN
+  CLOSED
+}
+
+// Cycle de vie d'un ticket de vente.
+enum SaleStatus {
+  DRAFT // en cours de composition (lignes ajoutées, pas encore encaissé)
+  PAID // encaissé + poussé à Compta/Stock (invoiceId rempli)
+  VOID // annulé avant encaissement
+}
+
+// Nature d'une ligne de ticket.
+enum LineKind {
+  SERVICE // prestation (ex : soin cabine) — pas de décrément stock
+  PRODUCT // produit physique — décrémente Core-Stock (productId requis)
+  OTHER // divers (remise forfaitaire, frais…) — pas de stock
+}
+
+// Moyen de paiement offline (pas de Core-Paiement en ligne en v1).
+enum PayMethod {
+  CASH
+  CARD
+  TRANSFER
+  CHEQUE
+  OTHER
+}
+
+// Session de caisse : ouverture avec fond de caisse, clôture Z (attendu vs compté, écart).
+model CashSession {
+  id               String        @id @default(uuid()) @db.Uuid
+  tenantId         String        @db.Uuid
+  openedBy         String        @db.Uuid // staff qui a ouvert la session
+  openedAt         DateTime      @default(now())
+  openingFloatXpf  BigInt        @default(0) // fond de caisse initial (espèces), XPF entier
+  closedAt         DateTime?
+  closedBy         String?       @db.Uuid
+  closingCountedXpf BigInt? // espèces réellement comptées à la clôture (saisie caissier)
+  expectedXpf      BigInt? // attendu = fond + encaissements ESPÈCES rattachés (figé à la clôture)
+  varianceXpf      BigInt? // écart = compté - attendu (négatif = manquant, positif = excédent)
+  note             String?
+  status           SessionStatus @default(OPEN)
+
+  sales Sale[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, openedAt])
+}
+
+// Ticket de vente (panier au comptoir).
+model Sale {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @db.Uuid
+  sessionId   String?      @db.Uuid // session de caisse de rattachement (null = hors session)
+  session     CashSession? @relation(fields: [sessionId], references: [id])
+  status      SaleStatus   @default(DRAFT)
+  cashierId   String?      @db.Uuid // staff qui encaisse
+  clientName  String? // nom client optionnel (repris sur la facture)
+  subtotalXpf BigInt       @default(0) // somme des lignes (= total en v1, pas de remise globale séparée)
+  totalXpf    BigInt       @default(0) // total à payer, XPF entier
+  // Lien source externe optionnel (ex : RDV honoré) — souple, sans FK.
+  sourceType  String?
+  sourceId    String?
+  invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
+  invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
+  paidAt      DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  lines    SaleLine[]
+  payments SalePayment[]
+
+  // Idempotence source externe : une vente issue d'un même (sourceType, sourceId) n'est créée qu'une fois.
+  @@index([tenantId, sourceType, sourceId])
+  @@index([tenantId, status])
+  @@index([tenantId, sessionId])
+  @@index([tenantId, createdAt])
+}
+
+// Ligne de ticket.
+model SaleLine {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  saleId    String   @db.Uuid
+  sale      Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  kind      LineKind
+  label     String
+  productId String?  @db.Uuid // requis si kind=PRODUCT → cible du décrément Core-Stock
+  qty       Int      @default(1) // quantité (entier — un article = 1 unité stock)
+  unitXpf   BigInt   @default(0) // prix unitaire XPF entier
+  lineXpf   BigInt   @default(0) // = unitXpf * qty (stocké, figé à la validation)
+  createdAt DateTime @default(now())
+
+  @@index([tenantId, saleId])
+  @@index([tenantId, productId])
+}
+
+// Paiement encaissé (offline). Paiement MIXTE = plusieurs SalePayment pour un même Sale.
+model SalePayment {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @db.Uuid
+  saleId      String    @db.Uuid
+  sale        Sale      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method      PayMethod
+  amountXpf   BigInt // montant imputé à la vente (ce qui solde la facture)
+  tenderedXpf BigInt? // montant remis par le client (espèces) — pour le rendu monnaie
+  // Référence idempotente vers le Payment côté Compta (POST /api/settle paymentRef).
+  // Déterministe : "caisse:<saleId>:<index>" → rejouer /api/settle ne double pas le paiement.
+  settleRef   String?
+  createdAt   DateTime  @default(now())
+
+  @@index([tenantId, saleId])
+}

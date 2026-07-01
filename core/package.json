@@ -1,0 +1,33 @@
+{
+  "name": "core-caisse",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3106",
+    "build": "next build",
+    "start": "next start -p 3106",
+    "test": "node --test --experimental-strip-types \"lib/**/*.test.ts\"",
+    "db:migrate": "prisma migrate dev --name init",
+    "db:rls": "prisma db execute --file prisma/rls.sql --schema prisma/schema.prisma",
+    "db:seed": "prisma db seed",
+    "db:setup": "prisma migrate deploy && npm run db:rls && npm run db:seed"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "next": "16.2.9",
+    "next-auth": "^5.0.0-beta.31",
+    "prisma": "^6.19.3",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "tsx": "^4.22.4",
+    "typescript": "^5"
+  }
+}
