@@ -14,7 +14,15 @@
   Prisma 6.19.3 · next-auth 5 beta · PostgreSQL 16. Port dev **:3106**.
 - **Vérifications vertes** : `npx tsc --noEmit` OK · `npx next build` compile (9 routes) · `npm test` 6/6
   (rendu monnaie + total ligne). Build fait avec `CORE_CLIENTS_MOCK=1` (aucun service tiers requis).
-- **PAS déployé** (conformément à la consigne). Base `core_caisse` non provisionnée en prod.
+- **Mise en prod PRÉPARÉE `2026-07-02` (v1 Ellément), BLOQUÉE sur 2 actions Marco** (runbook complet =
+  `01-Core-Stock/vps/GO-LIVE-STOCK-CAISSE.md`, couvre Stock ET Caisse) : (1) **créer le repo GitHub**
+  `Marco-PacifiCode/01-Core-Caisse` (PAT ronde sans permission Administration → 403) — branche locale
+  renommée `master`→`main`, code prêt à pousser ; (2) **provisionner `core_caisse` + rôles owner/app**
+  (`sudo -u postgres`, mdp requis ; script `provision-stock-caisse-dbs.sh` fourni). Après : .env avec
+  clients S2S vers les vrais moteurs prod (`CORE_COMPTA_URL=:3101` / `CORE_STOCK_URL=:3105` + leurs clés
+  entrantes ; `CORE_CLIENTS_MOCK=""`), migration owner AVANT code, db:rls, seed, PM2
+  `pm2 start npm --name core-caisse -- start` (:3106), nginx `/caisse` + `/_caisse/_next/` par chemin.
+- Base `core_caisse` non provisionnée en prod (cf. blocage #2).
 
 ## Modèles (Prisma, tenantId + RLS)
 
