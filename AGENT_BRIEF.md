@@ -15,7 +15,12 @@
   actions). Remote `github.com/Marco-PacifiCode/01-Core-Caisse` (`main`). Les 2 anciens blocages Marco
   (repo GitHub + provisioning DB) sont **levés**.
 - Stack : Next.js 16.2.9 · React 19.2.4 · Prisma 6.19.3 · next-auth 5 beta · PostgreSQL 16. Port **:3106**.
-- **Vérifications vertes** : `tsc --noEmit` OK · `next build` compile · `npm test` 6/6.
+- **Vérifications vertes (2026-07-02, post-chantier fiabilité)** : `tsc --noEmit` OK · `next build`
+  compile (12 routes dont `/api/health`, `/api/cron/repair-sales`, `/api/sales/[id]/repair`) ·
+  `npm test` **16/16** (money 6 + clients/timeouts 4 + sync/reprise 6).
+- ⚠️ **Chantier fiabilité 2026-07-02 committé en LOCAL uniquement (non poussé, non déployé)** —
+  cf. Dernières actions : le déploiement exige la migration `sale_sync_state` (owner) AVANT le code,
+  puis `prisma generate` serveur + `CRON_KEY`/`CRON_DATABASE_URL` dans `.env` + crontab repair.
 
 ## Modèles (Prisma, tenantId + RLS)
 
@@ -24,19 +29,34 @@
 `SaleLine` (kind SERVICE/PRODUCT/OTHER, `productId?`, qty, unitXpf, lineXpf) ·
 `SalePayment` (method CASH/CARD/TRANSFER/CHEQUE/OTHER, amountXpf, `tenderedXpf?`, `settleRef` ; mixte).
 Index unique **partiel** `uniq_sale_external_source` (RLS SQL) pour l'idempotence des ventes sourcées.
+**Sale porte l'état de synchro** (migration additive `20260702220000_sale_sync_state`, backfill des
+PAID existantes) : `comptaSyncedAt?`/`stockSyncedAt?`/`syncError?`/`syncAttempts` — « à réparer » ⇔
+PAID + un des deux timestamps NULL (index partiel `idx_sale_sync_pending` dans rls.sql).
 
-## Flux d'encaissement (cœur) — `lib/caisse.ts checkoutSale()`
+## Flux d'encaissement (cœur) — `lib/caisse.ts checkoutSale()` (remanié 2026-07-02, chantier fiabilité)
 
-Ordre robuste : (a) facture Compta `POST /api/invoices` (idempotent `caisse`+saleId, invoiceId persisté
-aussitôt) → (b) `POST /api/settle` par paiement, `paymentRef` déterministe `caisse:<saleId>:<i>` → (c)
-`POST /api/movements` SALE par ligne PRODUCT (idempotent `caisse`+`<saleId>:<lineId>`) → (d) ticket PAID.
-**Échec partiel = rejouable en sûreté** (idempotence de bout en bout) ; loggué ; remonté `CORE_CALL_FAILED`.
+(1) paiements validés+persistés (`settleRef` déterministe `caisse:<saleId>:<i>` ; UNDERPAID refuse ICI)
+→ (2) **ticket PAID immédiatement** (l'argent est pris) → (3) **synchro** `lib/sync.ts runSaleSync()` :
+facture Compta (idempotent `caisse`+saleId, invoiceId persisté aussitôt) → settle par paiement →
+mouvement SALE Stock par ligne PRODUCT (`<saleId>:<lineId>`). Chaque étage convergé est daté sur `Sale`
+(`comptaSyncedAt`/`stockSyncedAt`). **Échec partiel post-encaissement : la vente RESTE PAID**, trace
+`syncError`+`syncAttempts`, réponse `syncPending:true` (invoiceId/receiptUrl possiblement null) ;
+reprise idempotente par `repairSale()` (ne rejoue QUE le manquant) via `/api/sales/:id/repair` ou le
+balayage cron. **Timeouts** : tout appel S2S sortant = `AbortSignal.timeout` (`CORE_CLIENT_TIMEOUT_MS`,
+défaut 8 s) ; `CoreClientError.kind` distinguable `timeout|network|http`. `CORE_CALL_FAILED` n'existe
+plus (un échec S2S ne fait plus échouer le checkout).
 
 ## Endpoints (S2S `X-Core-Key`)
 
 `POST/GET /api/sessions` · `POST /api/sessions/:id/close` (Z) · `POST/GET /api/sales` ·
-`POST /api/sales/:id/checkout`. Back-office `/caisse` (JWT PRO/ADMIN, tenant par hostname) : écran caisse
-complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, session, historique).
+`POST /api/sales/:id/checkout` · `POST /api/sales/:id/repair` (reprise ciblée) ·
+`POST /api/cron/repair-sales` (**clé dédiée `X-Cron-Key: CRON_KEY`**, pattern Core-RDV ; balayage
+cross-tenant via `CRON_DATABASE_URL` rôle owner en lecture id+tenantId seulement, réparations en rôle
+app+RLS ; crontab `*/15` documentée dans README, **non installée**) · `GET /api/health` (**sans
+secret** : `{ok,db,rlsEnabled,rlsForced,deps:{compta,stock}}`, 503 si DB/RLS KO ; deps informatives,
+sondes 2 s, n'affectent pas le status). Back-office `/caisse` (JWT PRO/ADMIN, tenant par hostname) :
+écran caisse complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, session,
+historique).
 
 ## Intégrations (contrats vérifiés en frais dans les repos, 2026-07-02)
 
@@ -63,6 +83,38 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 - Reçu = endpoint Compta (pas de PDF local) → zéro duplication du moteur de rendu.
 
 ## Dernières actions
+
+- 2026-07-02 (soir) : **CHANTIER FIABILITÉ CHECKOUT (audit 02/07 §3, prio n°3+5) — code complet,
+  commits LOCAUX sur `main`, PAS poussé/déployé.**
+  - **Timeouts S2S** (`lib/clients.ts`) : `AbortSignal.timeout` sur tous les appels sortants
+    (`CORE_CLIENT_TIMEOUT_MS`, défaut 8 s) ; `CoreClientError.kind` = `timeout|network|http` (status 0
+    pour timeout/network). Classe désucrée (plus de parameter properties) → chargeable par
+    `node --experimental-strip-types`.
+  - **État de synchro persistant sur `Sale`** : `comptaSyncedAt`/`stockSyncedAt`/`syncError`/
+    `syncAttempts` (migration additive+réversible `20260702220000_sale_sync_state`, backfill des PAID
+    pré-existantes — l'ancien flux ne marquait PAID qu'après synchro complète). Index partiel de
+    balayage `idx_sale_sync_pending` ajouté à `prisma/rls.sql`.
+  - **Checkout remanié** (`lib/caisse.ts`) : PAID dès paiement validé → synchro via **moteur pur
+    injecté** `lib/sync.ts runSaleSync()` (testable sans DB/HTTP) ; échec S2S → vente PAID +
+    `syncPending:true` + trace, plus jamais de 502 post-encaissement. Rejouer checkout sur une vente
+    PAID non convergée RETENTE la synchro.
+  - **Reprise** : `repairSale()` idempotente (ne rejoue que les étapes manquantes) ; endpoints
+    `POST /api/sales/:id/repair` (X-Core-Key) + `POST /api/cron/repair-sales` (X-Cron-Key=`CRON_KEY`,
+    pattern Core-RDV ; listing cross-tenant via client Prisma dédié `CRON_DATABASE_URL` rôle owner,
+    réparations en rôle app+RLS ; 200 ventes/passage, rapport `{scanned,repaired,stillPending,failures}`).
+    Crontab `*/15` documentée (README + route), **PAS installée** (infra Contabo).
+  - **`GET /api/health`** (sans secret) : `{ok,db,rlsEnabled,rlsForced,deps:{compta,stock}}` ;
+    `ok=db&&rlsEnabled` (design local = ENABLE + rôle app non-owner → `rlsForced` informatif) ;
+    deps = sondes 2 s informatives (une panne Compta ne rend pas la Caisse « down »). 503 si KO.
+  - **Validation UUID** de `tenantId` dans `withTenant` avant interpolation `SET LOCAL` (idem Stock).
+  - **UI** : `receiptUrl` nullable + bandeau « synchro différée (reprise automatique) » si syncPending.
+  - **Tests 16/16** : suite sync (échec partiel → trace → repair ne rejoue QUE le manquant → converge ;
+    timeout compta ; settle échoué → facture réutilisée ; vente 100 % service ; no-op si convergée) +
+    suite clients (serveur HTTP local muet → kind=timeout ; port fermé → network ; 409 → http+corps).
+  - **POUR DÉPLOYER (futur, action délibérée)** : appliquer la migration en rôle owner AVANT le code
+    (`prisma migrate deploy` avec `CORE_CAISSE_OWNER_URL`), rejouer `db:rls` (nouvel index), `prisma
+    generate` sur le serveur, ajouter `CRON_KEY` (+ `CRON_DATABASE_URL`=owner) au `.env`, installer la
+    crontab repair, brancher les crons de surveillance sur `/api/health` (Caisse ET Stock).
 
 - 2026-07-02 : **GO-LIVE PROD Core-Caisse (v1 Ellément) — EN LIGNE ✅**. Serveur Contabo
   `vmi3228606` (46.250.245.33), `/home/deploy/moteurs/01-Core-Caisse/core`. Remote
@@ -103,8 +155,8 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 
 ## Reste à faire / TODO
 
-- ~~Provisionner `core_caisse` + déployer~~ — **FAIT 2026-07-02 (EN PROD)**.
+- **Déployer le chantier fiabilité** (commits locaux `main`, non poussés) — checklist dans
+  « Dernières actions » ci-dessus (migration owner AVANT code, `CRON_KEY`, crontab, crons → /api/health).
 - Ajouter `.github/workflows/ci.yml` (tsc+eslint) sur le modèle des autres moteurs si CI souhaitée
   (Caisse n'en a pas encore ; un `[deploy]` sur `main` ne passe pas par ci.yml pour l'instant).
 - Éventuel endpoint `GET /api/sessions/:id/z` en lecture seule (rapport Z sans clôturer).
-- Tests d'intégration du flux checkout en mode mock (bout en bout + rejeu).

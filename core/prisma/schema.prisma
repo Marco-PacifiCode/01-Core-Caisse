@@ -89,6 +89,13 @@ model Sale {
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
+  // ── État de synchro post-encaissement (chantier fiabilité 2026-07, cf. lib/sync.ts) ──
+  // Vente « à réparer » ⇔ status=PAID ET (comptaSyncedAt IS NULL OU stockSyncedAt IS NULL).
+  // Index PARTIEL de balayage `idx_sale_sync_pending` dans prisma/rls.sql (non modélisable ici).
+  comptaSyncedAt DateTime? // facture créée + paiements soldés côté Core-Compta
+  stockSyncedAt  DateTime? // décréments SALE passés côté Core-Stock (posé même sans ligne PRODUCT)
+  syncError      String? // dernière erreur de synchro ("core:op kind status detail")
+  syncAttempts   Int       @default(0) // nombre de tentatives de synchro
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 

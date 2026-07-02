@@ -155,8 +155,9 @@ export default function CaisseView({
         return;
       }
       setOk(
-        `Encaissé — ${res.invoiceNumber ?? "facture créée"} · payé ${fmt(res.paidXpf)}` +
-          (res.changeXpf > 0 ? ` · rendu ${fmt(res.changeXpf)}` : ""),
+        `Encaissé — ${res.invoiceNumber ?? (res.syncPending ? "facture en attente" : "facture créée")} · payé ${fmt(res.paidXpf)}` +
+          (res.changeXpf > 0 ? ` · rendu ${fmt(res.changeXpf)}` : "") +
+          (res.syncPending ? " · ⚠ synchro compta/stock différée (reprise automatique)" : ""),
       );
       setLastReceipt(res.receiptUrl);
       resetTicket();

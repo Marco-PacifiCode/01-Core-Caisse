@@ -32,19 +32,24 @@ sur `Sale` → une vente sourcée n'est créée qu'une fois.
 Ouvrir un ticket → ajouter des lignes → encaisser (1..n paiements offline, rendu monnaie) → à la
 validation, dans l'**ordre robuste** :
 
-1. **(a) Facture Compta** — `POST /api/invoices`, idempotent `sourceType:"caisse"` + `sourceId:saleId`.
-   `invoiceId` persisté immédiatement sur le ticket.
-2. **(b) Paiement(s) Compta** — `POST /api/settle` par paiement, `paymentRef` **déterministe**
-   `caisse:<saleId>:<index>` → rejouer ne double pas.
-3. **(c) Stock** — `POST /api/movements` `{type:"SALE"}` pour chaque ligne PRODUCT, idempotent
-   (`sourceType:"caisse"`, `sourceId:"<saleId>:<lineId>"`).
-4. **(d) Ticket `PAID`** + `invoiceId`/`invoiceNumber` stockés.
+1. **(1) Paiement(s) validés + persistés** (`settleRef` déterministe `caisse:<saleId>:<index>`) —
+   `UNDERPAID`/`NO_PAYMENT` refusent le checkout **ici**, avant tout effet.
+2. **(2) Ticket `PAID` immédiatement** — l'argent est dans le tiroir ; la suite est de la synchro.
+3. **(3) Synchro** (`lib/sync.ts` → `runSaleSync`) : **facture Compta** (`POST /api/invoices`,
+   idempotent `sourceType:"caisse"`+`sourceId:saleId`, `invoiceId` persisté dès création) →
+   **settle par paiement** (`POST /api/settle`, `paymentRef` déterministe) → **décrément Stock**
+   (`POST /api/movements` `{type:"SALE"}` par ligne PRODUCT, `sourceId:"<saleId>:<lineId>"`).
+   Chaque étage convergé est daté sur la vente : `comptaSyncedAt` / `stockSyncedAt`.
 
-**Idempotence de bout en bout / échec partiel.** Chaque étape est idempotente côté cible. En cas
-d'échec après une étape réussie (ex. Stock KO après facture+settle OK), il suffit de **rejouer**
-`checkoutSale(saleId, payments)` : les étapes déjà faites sont détectées (`alreadyExisted` /
-`paymentRef` connu / ticket déjà PAID) et non rejouées, la suite reprend. L'échec est **loggué** et
-remonté (`CORE_CALL_FAILED`, HTTP 502) — jamais de donnée dupliquée.
+**Échec partiel APRÈS encaissement = vente PAID + reprise différée.** Un échec S2S (timeout 8 s,
+réseau, 5xx…) ne bloque plus le ticket : la vente **reste PAID**, l'étape manquante reste `NULL`,
+l'erreur est tracée (`syncError`, `syncAttempts`) et la réponse porte `syncPending:true`
+(`invoiceId`/`receiptUrl` possiblement `null` tant que la facture manque). La convergence est reprise
+par `POST /api/sales/:id/repair` (ciblée) ou le **balayage** `POST /api/cron/repair-sales` — qui ne
+rejouent **que les étapes manquantes**. Toutes les cibles dédupliquent (facture par `sourceId`,
+settle par `paymentRef`, mouvement par ligne) → rejouer est **toujours** sûr, jamais de doublon.
+Vente « à réparer » ⇔ `status=PAID ET (comptaSyncedAt IS NULL OU stockSyncedAt IS NULL)`
+(index partiel `idx_sale_sync_pending`, cf. `prisma/rls.sql`).
 
 **Rendu monnaie** (`lib/money.ts` `computeChange`) : Σ(tendered) − Σ(amount imputé), borné à ≥ 0.
 
@@ -75,7 +80,21 @@ Généré via l'endpoint **reçu** de Core-Compta : `GET /api/invoices/:id/recei
 | POST | `/api/sessions/:id/close` | Clôture Z (`closedBy`, `closingCountedXpf`). |
 | POST | `/api/sales` | Créer un ticket (`lines:[{kind,label,productId?,qty,unitXpf}]`, `sourceType?/sourceId?`). |
 | GET | `/api/sales?tenantId=…` | Historique des tickets. |
-| POST | `/api/sales/:id/checkout` | Encaisser (`payments:[{method,amountXpf,tenderedXpf?}]`) → orchestration + `receiptUrl`. |
+| POST | `/api/sales/:id/checkout` | Encaisser (`payments:[{method,amountXpf,tenderedXpf?}]`) → PAID + synchro + `receiptUrl`/`syncPending`. |
+| POST | `/api/sales/:id/repair` | Reprise ciblée de la synchro d'une vente PAID (rejoue les étapes manquantes, idempotent). |
+| GET | `/api/health` | **Sans secret** : `{ok, db, rlsEnabled, rlsForced, deps:{compta,stock}}` — 503 si DB/RLS KO. |
+
+**Cron de reprise** — `POST /api/cron/repair-sales`, clé **dédiée** `X-Cron-Key: CRON_KEY` (pattern
+Core-RDV) : rejoue la synchro de toutes les ventes PAID non convergées (plus anciennes d'abord,
+200/passage). Crontab recommandée sur le VPS (**à installer côté infra, pas ici**) :
+
+```cron
+*/15 * * * * curl -fsS -X POST http://localhost:3106/api/cron/repair-sales \
+  -H "X-Cron-Key: $CRON_KEY" >> /var/log/core-caisse-repair.log 2>&1
+```
+
+Le balayage LISTE les ventes en attente via `CRON_DATABASE_URL` (rôle owner — cross-tenant,
+lecture `id`+`tenantId` seulement) puis répare chaque vente via le rôle app + RLS.
 
 **Back-office** `/caisse` (session JWT PRO/ADMIN, résolue par hostname) : écran caisse (catalogue depuis
 Stock, saisie libre, ticket, encaissement + rendu monnaie), ouverture/clôture de session, historique.
@@ -86,6 +105,12 @@ Stock, saisie libre, ticket, encaissement + rendu monnaie), ouverture/clôture d
 
 Clients sortants **configurables par env** (URL + clé), avec **mode simulé** (`CORE_CLIENTS_MOCK=1`) qui
 simule Compta & Stock en mémoire → build/tsc/test passent **sans** les autres services up.
+
+**Timeout systématique** : tout appel sortant porte `AbortSignal.timeout` (`CORE_CLIENT_TIMEOUT_MS`,
+défaut 8000 ms) — une cible muette ne gèle jamais un encaissement. Échec normalisé `CoreClientError`
+avec `kind` **distinguable** : `timeout` (pas de réponse) · `network` (connexion impossible) · `http`
+(réponse non-2xx, `status` porté). `timeout`/`network`/5xx = transitoires (le rejeu convergera) ;
+4xx = problème de données (ex. 409 `INSUFFICIENT_STOCK`) qui nécessite une action métier.
 
 - **Compta** : `POST /api/invoices` → `{invoiceId, number, totalXpf, alreadyExisted}` ·
   `POST /api/settle` `{tenantId, invoiceId, amountXpf, method, paymentRef}` → `{ok, paid, remaining}` ·

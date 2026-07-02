@@ -9,17 +9,23 @@
 // paiement à Core-Compta et DÉCRÉMENTE Core-Stock. Tout est idempotent de bout en bout : rejouer un
 // checkout ne double NI la facture (idempotence sourceType="caisse"+sourceId=saleId côté Compta) NI le
 // stock (idempotence tenantId+sourceType+sourceId côté Stock) NI les paiements (paymentRef déterministe).
+//
+// FIABILITÉ (2026-07) : la vente passe PAID dès le paiement validé (l'argent est pris), PUIS la synchro
+// Compta/Stock converge (moteur lib/sync.ts). Un échec S2S post-encaissement ne bloque plus le ticket :
+// il est tracé sur la vente (comptaSyncedAt/stockSyncedAt/syncError) et repris par repairSale
+// (endpoint /api/sales/:id/repair + balayage /api/cron/repair-sales).
 
 import { withTenant } from "./tenant";
-import { comptaClient, stockClient, CoreClientError } from "./clients";
+import { comptaClient, stockClient } from "./clients";
 import { computeChange, lineTotalXpf } from "./money";
+import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
 
-// sourceType constant utilisé dans les appels sortants (idempotence).
-export const CAISSE_SOURCE_TYPE = "caisse";
+// sourceType constant utilisé dans les appels sortants (idempotence) — défini dans lib/sync.ts.
+export { CAISSE_SOURCE_TYPE } from "./sync";
 
 // ─── Sessions de caisse ──────────────────────────────────────────────────────
 
@@ -250,13 +256,15 @@ export type CheckoutResult = {
   ok: true;
   saleId: string;
   status: SaleStatus;
-  invoiceId: string;
+  invoiceId: string | null; // null si la facture Compta n'a pas encore pu être créée (syncPending)
   invoiceNumber: string | null;
   totalXpf: number;
   paidXpf: number;
   changeXpf: number; // rendu monnaie total (Σ tendered - Σ amount, borné à ≥0)
-  receiptUrl: string; // URL S2S du ticket PDF (Core-Compta) — à imprimer
+  receiptUrl: string | null; // URL S2S du ticket PDF (Core-Compta) — null tant que la facture manque
   stockDecremented: number; // nb de lignes PRODUCT décrémentées
+  syncPending: boolean; // true = Compta/Stock pas encore convergés (reprise auto par cron/repair)
+  syncError: string | null; // dernière erreur de synchro (trace exploitable)
   alreadyPaid: boolean;
 };
 
@@ -264,24 +272,126 @@ export type CheckoutError =
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "ALREADY_VOID" }
   | { ok: false; error: "NO_PAYMENT" }
-  | { ok: false; error: "UNDERPAID"; totalXpf: number; paidXpf: number }
-  | { ok: false; error: "CORE_CALL_FAILED"; core: "compta" | "stock"; op: string; detail: string };
+  | { ok: false; error: "UNDERPAID"; totalXpf: number; paidXpf: number };
+
+// ─── Synchronisation Compta/Stock (moteur lib/sync.ts branché sur Prisma) ───
+
+type LoadedSale = NonNullable<Awaited<ReturnType<typeof getSale>>>;
+
+function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
+  return {
+    id: sale.id,
+    tenantId: sale.tenantId,
+    clientName: sale.clientName,
+    cashierId: sale.cashierId,
+    invoiceId: sale.invoiceId,
+    invoiceNumber: sale.invoiceNumber,
+    comptaSyncedAt: sale.comptaSyncedAt,
+    stockSyncedAt: sale.stockSyncedAt,
+    lines: sale.lines.map((l) => ({
+      id: l.id,
+      kind: l.kind,
+      label: l.label,
+      productId: l.productId,
+      qty: l.qty,
+      unitXpf: l.unitXpf,
+    })),
+    payments: sale.payments.map((p) => ({
+      id: p.id,
+      method: p.method,
+      amountXpf: p.amountXpf,
+      settleRef: p.settleRef,
+    })),
+  };
+}
+
+function persistFor(tenantId: string, saleId: string): SyncPersist {
+  const update = (data: Prisma.SaleUpdateInput) =>
+    withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data })).then(() => undefined);
+  return {
+    saveInvoiceRef: (invoiceId, invoiceNumber) => update({ invoiceId, invoiceNumber }),
+    markComptaSynced: () => update({ comptaSyncedAt: new Date() }),
+    markStockSynced: () => update({ stockSyncedAt: new Date() }),
+    recordFailure: (detail) => update({ syncError: detail, syncAttempts: { increment: 1 } }),
+    clearError: () => update({ syncError: null }),
+  };
+}
 
 /**
- * ENCAISSE un ticket et l'ORCHESTRE vers Compta + Stock, dans l'ordre robuste :
- *   (a) créer la facture Compta (idempotent sourceType="caisse"+sourceId=saleId)
- *   (b) enregistrer le(s) paiement(s) Compta (POST /api/settle, paymentRef déterministe)
- *   (c) décrémenter Stock pour chaque ligne PRODUCT (idempotent tenantId+sourceType+sourceId)
- *   (d) marquer le ticket PAID + stocker invoiceId/number
+ * Rejoue les étapes de synchro MANQUANTES d'une vente déjà chargée (PAID attendu).
+ * N'échoue jamais sur un échec core : l'issue est retournée + persistée (syncError/syncAttempts).
+ */
+async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
+  const outcome = await runSaleSync(toSnapshot(sale), comptaClient(), stockClient(), persistFor(sale.tenantId, sale.id));
+  if (!outcome.synced && outcome.failure) {
+    const f = outcome.failure;
+    console.error(
+      `[caisse] synchro incomplète sale=${sale.id} tenant=${sale.tenantId} core=${f.core} op=${f.op} kind=${f.kind} status=${f.status} detail=${f.detail} — reprise via /api/sales/:id/repair ou cron repair-sales`,
+    );
+  }
+  return outcome;
+}
+
+export type RepairResult =
+  | { ok: false; error: "SALE_NOT_FOUND" | "NOT_PAID" }
+  | {
+      ok: true;
+      saleId: string;
+      synced: boolean;
+      alreadySynced: boolean;
+      invoiceId: string | null;
+      invoiceNumber: string | null;
+      stockDecremented: number;
+      syncError: string | null;
+    };
+
+/**
+ * REPRISE idempotente d'une vente PAID dont la synchro Compta/Stock est incomplète.
+ * Ne rejoue QUE les étapes manquantes ; sans effet (alreadySynced) si tout est déjà convergé.
+ */
+export async function repairSale(tenantId: string, saleId: string): Promise<RepairResult> {
+  const sale = await getSale(tenantId, saleId);
+  if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
+  if (sale.status !== "PAID") return { ok: false, error: "NOT_PAID" };
+
+  if (sale.comptaSyncedAt && sale.stockSyncedAt) {
+    return {
+      ok: true,
+      saleId,
+      synced: true,
+      alreadySynced: true,
+      invoiceId: sale.invoiceId,
+      invoiceNumber: sale.invoiceNumber,
+      stockDecremented: sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId).length,
+      syncError: null,
+    };
+  }
+
+  const outcome = await syncLoadedSale(sale);
+  return {
+    ok: true,
+    saleId,
+    synced: outcome.synced,
+    alreadySynced: false,
+    invoiceId: outcome.invoiceId,
+    invoiceNumber: outcome.invoiceNumber,
+    stockDecremented: outcome.stockDecremented,
+    syncError: outcome.failure ? `${outcome.failure.core}:${outcome.failure.op} ${outcome.failure.kind} ${outcome.failure.status} ${outcome.failure.detail}` : null,
+  };
+}
+
+/**
+ * ENCAISSE un ticket puis le SYNCHRONISE vers Compta + Stock :
+ *   (1) valider/persister le(s) paiement(s) (settleRef déterministe "caisse:<saleId>:<i>")
+ *   (2) marquer le ticket PAID IMMÉDIATEMENT — l'argent est dans le tiroir
+ *   (3) synchro (lib/sync.ts) : facture Compta → settle par paiement → décrément Stock par ligne PRODUCT
  *
- * STRATÉGIE IDEMPOTENCE / ÉCHEC PARTIEL :
- * Chaque étape est idempotente côté cible. En cas d'échec APRÈS une étape réussie (ex : Stock KO après
- * facture+settle OK), l'appelant peut simplement REJOUER checkoutSale(saleId, payments) : les étapes
- * déjà faites sont détectées (alreadyExisted / paymentRef connu) et NON rejouées, et la suite reprend.
- * On persiste invoiceId dès (a) réussi (via une petite MAJ) pour que le rejeu réutilise la même facture.
- * Les paiements portent un paymentRef DÉTERMINISTE "caisse:<saleId>:<index>" → /api/settle ne double pas.
- * Le décrément Stock utilise sourceId="<saleId>:<lineId>" → dédupe par ligne.
- * Le ticket ne passe PAID qu'une fois (d) atteint ; tout échec intermédiaire est loggué et remonté.
+ * ÉCHEC PARTIEL APRÈS ENCAISSEMENT : la vente RESTE PAID (le client est servi), l'étape manquante est
+ * tracée sur la vente (comptaSyncedAt/stockSyncedAt NULL + syncError) et le résultat porte
+ * syncPending=true. La convergence est reprise par repairSale (S2S /api/sales/:id/repair) ou le
+ * balayage /api/cron/repair-sales. Toutes les étapes sont idempotentes côté cible (facture par
+ * sourceId, settle par paymentRef, mouvement stock par "<saleId>:<lineId>") → rejouable en sûreté.
+ * Seules les validations AVANT encaissement (UNDERPAID, NO_PAYMENT…) refusent le checkout.
  */
 export async function checkoutSale(
   tenantId: string,
@@ -294,22 +404,28 @@ export async function checkoutSale(
   if (sale.status === "VOID") return { ok: false, error: "ALREADY_VOID" };
 
   const compta = comptaClient();
-  const stock = stockClient();
 
-  // Idempotence : si déjà PAID, on renvoie l'état existant sans rien rejouer.
-  if (sale.status === "PAID" && sale.invoiceId) {
+  // Idempotence : si déjà PAID, ne pas ré-encaisser — mais retenter la synchro si elle est incomplète.
+  if (sale.status === "PAID") {
     const paid = sale.payments.reduce((t, p) => t + p.amountXpf, 0n);
+    const pending = !sale.comptaSyncedAt || !sale.stockSyncedAt;
+    const outcome = pending ? await syncLoadedSale(sale) : null;
+    const invoiceId = outcome ? outcome.invoiceId : sale.invoiceId;
     return {
       ok: true,
       saleId: sale.id,
       status: "PAID",
-      invoiceId: sale.invoiceId,
-      invoiceNumber: sale.invoiceNumber,
+      invoiceId,
+      invoiceNumber: outcome ? outcome.invoiceNumber : sale.invoiceNumber,
       totalXpf: Number(sale.totalXpf),
       paidXpf: Number(paid),
       changeXpf: 0,
-      receiptUrl: compta.receiptUrl(sale.invoiceId, tenantId),
-      stockDecremented: sale.lines.filter((l) => l.kind === "PRODUCT").length,
+      receiptUrl: invoiceId ? compta.receiptUrl(invoiceId, tenantId) : null,
+      stockDecremented: outcome
+        ? outcome.stockDecremented
+        : sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId).length,
+      syncPending: outcome ? !outcome.synced : false,
+      syncError: outcome?.failure ? `${outcome.failure.core}:${outcome.failure.op} ${outcome.failure.detail}` : null,
       alreadyPaid: true,
     };
   }
@@ -356,82 +472,30 @@ export async function checkoutSale(
     tenderedXpf: p.tenderedXpf ?? undefined,
   }))));
 
-  try {
-    // (a) FACTURE Compta — idempotent sur sourceType="caisse"+sourceId=saleId
-    let invoiceId = sale.invoiceId;
-    let invoiceNumber = sale.invoiceNumber;
-    if (!invoiceId) {
-      const inv = await compta.createInvoice({
-        tenantId,
-        sourceType: CAISSE_SOURCE_TYPE,
-        sourceId: saleId,
-        clientName: sale.clientName,
-        lines: sale.lines.map((l) => ({ label: l.label, qty: l.qty, unitXpf: Number(l.unitXpf) })),
-      });
-      invoiceId = inv.invoiceId;
-      invoiceNumber = inv.number;
-      // Persister DÈS que la facture existe → un rejeu réutilise la même facture (pas de doublon).
-      await withTenant(tenantId, (tx) =>
-        tx.sale.update({ where: { id: saleId }, data: { invoiceId, invoiceNumber } }),
-      );
-    }
+  // 2. ENCAISSEMENT ACTÉ : le ticket passe PAID AVANT la synchro (l'argent est dans le tiroir).
+  await withTenant(tenantId, (tx) =>
+    tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: new Date() } }),
+  );
 
-    // (b) PAIEMENT(S) Compta — settle par paiement, paymentRef déterministe (idempotent)
-    for (const p of persisted) {
-      await compta.settle({
-        tenantId,
-        invoiceId,
-        amountXpf: Number(p.amountXpf),
-        method: p.method,
-        paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${saleId}:${p.id}`,
-      });
-    }
+  // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
+  const reloaded = await getSale(tenantId, saleId);
+  const outcome = await syncLoadedSale(reloaded!);
 
-    // (c) STOCK — décrément SALE par ligne PRODUCT, idempotent (sourceId = "<saleId>:<lineId>")
-    let stockDecremented = 0;
-    for (const l of sale.lines) {
-      if (l.kind !== "PRODUCT" || !l.productId) continue;
-      await stock.recordSale({
-        tenantId,
-        productId: l.productId,
-        qty: l.qty,
-        sourceType: CAISSE_SOURCE_TYPE,
-        sourceId: `${saleId}:${l.id}`,
-        actorId: sale.cashierId ?? undefined,
-      });
-      stockDecremented++;
-    }
-
-    // (d) Ticket PAID
-    await withTenant(tenantId, (tx) =>
-      tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: new Date() } }),
-    );
-
-    return {
-      ok: true,
-      saleId,
-      status: "PAID",
-      invoiceId: invoiceId!,
-      invoiceNumber: invoiceNumber ?? null,
-      totalXpf: Number(sale.totalXpf),
-      paidXpf: Number(paidTotal),
-      changeXpf: change,
-      receiptUrl: compta.receiptUrl(invoiceId!, tenantId),
-      stockDecremented,
-      alreadyPaid: false,
-    };
-  } catch (e) {
-    // Échec partiel : on LOGGUE et on remonte. L'état persisté (paiements + invoiceId éventuel) permet
-    // de REJOUER checkoutSale en sûreté (idempotence de bout en bout) — aucune donnée dupliquée.
-    if (e instanceof CoreClientError) {
-      console.error(
-        `[caisse] checkout échec partiel sale=${saleId} tenant=${tenantId} core=${e.core} op=${e.op} status=${e.status} detail=${e.detail} — REJOUABLE`,
-      );
-      return { ok: false, error: "CORE_CALL_FAILED", core: e.core, op: e.op, detail: e.detail };
-    }
-    console.error(`[caisse] checkout erreur inattendue sale=${saleId} tenant=${tenantId}:`, e);
-    throw e;
-  }
+  return {
+    ok: true,
+    saleId,
+    status: "PAID",
+    invoiceId: outcome.invoiceId,
+    invoiceNumber: outcome.invoiceNumber,
+    totalXpf: Number(sale.totalXpf),
+    paidXpf: Number(paidTotal),
+    changeXpf: change,
+    receiptUrl: outcome.invoiceId ? compta.receiptUrl(outcome.invoiceId, tenantId) : null,
+    stockDecremented: outcome.stockDecremented,
+    syncPending: !outcome.synced,
+    syncError: outcome.failure ? `${outcome.failure.core}:${outcome.failure.op} ${outcome.failure.detail}` : null,
+    alreadyPaid: false,
+  };
 }
 
 /** Annule un ticket non encaissé (DRAFT → VOID). */

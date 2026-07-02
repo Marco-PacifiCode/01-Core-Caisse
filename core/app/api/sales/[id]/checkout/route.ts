@@ -10,15 +10,19 @@ const VALID_METHODS: PayMethod[] = ["CASH", "CARD", "TRANSFER", "CHEQUE", "OTHER
 /**
  * POST /api/sales/:id/checkout
  * ENCAISSE un ticket (S2S, X-Core-Key) : enregistre le(s) paiement(s) offline, calcule le rendu monnaie,
- * puis ORCHESTRE Compta (facture + settle) et Stock (décrément SALE). Idempotent de bout en bout :
- * rejouer avec le même saleId ne double NI la facture NI le stock NI les paiements.
+ * marque la vente PAID (l'argent est pris), puis SYNCHRONISE Compta (facture + settle) et Stock
+ * (décrément SALE). Idempotent de bout en bout : rejouer avec le même saleId ne double NI la facture
+ * NI le stock NI les paiements.
  *
  * Body : { tenantId, payments: { method, amountXpf, tenderedXpf? }[] }
  *   payments : 1..n (paiement MIXTE supporté). tenderedXpf (espèces) → rendu monnaie.
  *
  * Réponse 200 : { ok, saleId, status, invoiceId, invoiceNumber, totalXpf, paidXpf, changeXpf,
- *                 receiptUrl, stockDecremented, alreadyPaid }
- * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/ALREADY_VOID/NO_PAYMENT · 502 CORE_CALL_FAILED (rejouable).
+ *                 receiptUrl, stockDecremented, syncPending, syncError, alreadyPaid }
+ *   Un échec S2S APRÈS encaissement ne fait PAS échouer la requête : la vente reste PAID,
+ *   syncPending=true (invoiceId/receiptUrl éventuellement null), et la convergence est reprise par
+ *   POST /api/sales/:id/repair ou le balayage /api/cron/repair-sales.
+ * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/ALREADY_VOID/NO_PAYMENT (validations AVANT encaissement).
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -60,7 +64,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       ALREADY_VOID: 409,
       NO_PAYMENT: 409,
       UNDERPAID: 409,
-      CORE_CALL_FAILED: 502,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

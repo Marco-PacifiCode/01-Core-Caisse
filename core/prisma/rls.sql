@@ -40,3 +40,11 @@ DROP INDEX IF EXISTS "uniq_sale_external_source";
 CREATE UNIQUE INDEX "uniq_sale_external_source"
   ON "Sale" ("tenantId", "sourceType", "sourceId")
   WHERE "sourceType" IS NOT NULL AND "sourceId" IS NOT NULL;
+
+-- Balayage de REPRISE (chantier fiabilité 2026-07) : index PARTIEL des ventes PAID dont la synchro
+-- Compta/Stock est incomplète (cf. lib/sync.ts + /api/cron/repair-sales). Partiel car en régime normal
+-- ~0 ligne le porte → coût nul en écriture, balayage O(pending) en lecture. Non modélisable en Prisma.
+DROP INDEX IF EXISTS "idx_sale_sync_pending";
+CREATE INDEX "idx_sale_sync_pending"
+  ON "Sale" ("paidAt")
+  WHERE "status" = 'PAID' AND ("comptaSyncedAt" IS NULL OR "stockSyncedAt" IS NULL);

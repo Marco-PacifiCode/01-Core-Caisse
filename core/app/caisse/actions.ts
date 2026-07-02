@@ -90,7 +90,8 @@ export type CheckoutActionResult =
       totalXpf: number;
       paidXpf: number;
       changeXpf: number;
-      receiptUrl: string;
+      receiptUrl: string | null; // null tant que la facture Compta n'a pas pu être créée (syncPending)
+      syncPending: boolean; // true = synchro Compta/Stock différée (reprise automatique)
     };
 
 /**
@@ -143,11 +144,9 @@ export async function checkoutAction(
     const msg =
       res.error === "UNDERPAID"
         ? `Paiement insuffisant (${res.paidXpf} / ${res.totalXpf} F).`
-        : res.error === "CORE_CALL_FAILED"
-          ? `Échec d'orchestration (${res.core}). Réessayez — l'opération est rejouable en sûreté.`
-          : res.error === "NO_PAYMENT"
-            ? "Aucun paiement."
-            : "Encaissement impossible.";
+        : res.error === "NO_PAYMENT"
+          ? "Aucun paiement."
+          : "Encaissement impossible.";
     return { ok: false, error: msg };
   }
 
@@ -160,5 +159,6 @@ export async function checkoutAction(
     paidXpf: res.paidXpf,
     changeXpf: res.changeXpf,
     receiptUrl: res.receiptUrl,
+    syncPending: res.syncPending,
   };
 }
