@@ -9,20 +9,13 @@
 
 ## État courant (2026-07-02)
 
-- **v1 construite en local** sous `C:\dev\ecosysteme\01-Core-Caisse\` (repo git local initialisé, **jamais
-  poussé**, pas de repo GitHub). Stack alignée sur Core-Compta/Core-Stock : Next.js 16.2.9 · React 19.2.4 ·
-  Prisma 6.19.3 · next-auth 5 beta · PostgreSQL 16. Port dev **:3106**.
-- **Vérifications vertes** : `npx tsc --noEmit` OK · `npx next build` compile (9 routes) · `npm test` 6/6
-  (rendu monnaie + total ligne). Build fait avec `CORE_CLIENTS_MOCK=1` (aucun service tiers requis).
-- **Mise en prod PRÉPARÉE `2026-07-02` (v1 Ellément), BLOQUÉE sur 2 actions Marco** (runbook complet =
-  `01-Core-Stock/vps/GO-LIVE-STOCK-CAISSE.md`, couvre Stock ET Caisse) : (1) **créer le repo GitHub**
-  `Marco-PacifiCode/01-Core-Caisse` (PAT ronde sans permission Administration → 403) — branche locale
-  renommée `master`→`main`, code prêt à pousser ; (2) **provisionner `core_caisse` + rôles owner/app**
-  (`sudo -u postgres`, mdp requis ; script `provision-stock-caisse-dbs.sh` fourni). Après : .env avec
-  clients S2S vers les vrais moteurs prod (`CORE_COMPTA_URL=:3101` / `CORE_STOCK_URL=:3105` + leurs clés
-  entrantes ; `CORE_CLIENTS_MOCK=""`), migration owner AVANT code, db:rls, seed, PM2
-  `pm2 start npm --name core-caisse -- start` (:3106), nginx `/caisse` + `/_caisse/_next/` par chemin.
-- Base `core_caisse` non provisionnée en prod (cf. blocage #2).
+- **🟢 EN PROD `2026-07-02` (v1 Ellément)** sur Contabo `vmi3228606` — PM2 `core-caisse` :3106, base
+  `core_caisse` provisionnée + migrée + RLS + seed, nginx `/caisse` sous `ellement.pacificode.nc`,
+  clients S2S RÉELS vers Compta (:3101) et Stock (:3105) **testés de bout en bout** (cf. Dernières
+  actions). Remote `github.com/Marco-PacifiCode/01-Core-Caisse` (`main`). Les 2 anciens blocages Marco
+  (repo GitHub + provisioning DB) sont **levés**.
+- Stack : Next.js 16.2.9 · React 19.2.4 · Prisma 6.19.3 · next-auth 5 beta · PostgreSQL 16. Port **:3106**.
+- **Vérifications vertes** : `tsc --noEmit` OK · `next build` compile · `npm test` 6/6.
 
 ## Modèles (Prisma, tenantId + RLS)
 
@@ -71,6 +64,36 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 
 ## Dernières actions
 
+- 2026-07-02 : **GO-LIVE PROD Core-Caisse (v1 Ellément) — EN LIGNE ✅**. Serveur Contabo
+  `vmi3228606` (46.250.245.33), `/home/deploy/moteurs/01-Core-Caisse/core`. Remote
+  `github.com/Marco-PacifiCode/01-Core-Caisse` (`main`). Pushé, cloné, déployé.
+  - **DB** : migration `20260702151449_init` (générée via `prisma migrate diff`, appliquée en rôle
+    **owner** `CORE_CAISSE_OWNER_URL` par `migrate deploy` — l'owner n'a pas CREATEDB, pattern identique
+    à Stock/Compta), puis `db:rls` (policies `tenant_isolation` sur `CashSession`/`Sale`/`SaleLine`/
+    `SalePayment` + index unique partiel `uniq_sale_external_source`), `db:seed` (sessions OPEN Ellément
+    + Boutique), `prisma generate` **sur le serveur**. RLS vérifiée (rôle app voit 0 ligne sans tenant).
+    Migration committée + poussée (survie au `git reset --hard` du deploy.yml).
+  - **.env serveur** (`core/.env`, 600) : `AUTH_SECRET` partagé (== autres moteurs) ; `DATABASE_URL`=app,
+    `DATABASE_URL_OWNER`=owner ; `CORE_CAISSE_API_KEY` (entrante, `openssl rand -base64 32`, présente
+    **uniquement** dans ce .env) ; clients **S2S SORTANTS RÉELS** (`CORE_CLIENTS_MOCK=""`) :
+    `CORE_COMPTA_URL=http://localhost:3101` + `CORE_COMPTA_API_KEY` (== clé entrante `COMPTA_API_KEY` de
+    core_compta) et `CORE_STOCK_URL=http://localhost:3105` + `CORE_STOCK_API_KEY` (== clé entrante de
+    core_stock). Header S2S = `X-Core-Key`.
+  - **Runtime** : `next build` vert, **PM2 `core-caisse` :3106** (`pm2 save`). Healthchecks EN FRAIS :
+    local `GET /`→**200**, `/caisse`→307 (login JWT), API sans clé→**401** ; via **nginx**
+    `Host: ellement.pacificode.nc` `/caisse`→**307**, `/_caisse/_next/`→308.
+  - **Nginx** : `/caisse` + `/_caisse/_next/` → :3106 (vhost `pacificode`, repo `Marco-PacifiCode/
+    PacifiCode` commit `de52cdc`).
+  - **✅ TEST S2S BOUT-EN-BOUT EN FRAIS** : `POST /api/sales` puis `POST /api/sales/:id/checkout`
+    (tenant démo Ellément, 1× produit Stock, CASH 3000 tendered 5000) → **HTTP 200**, `status=PAID`,
+    facture Compta **FAC-2026-0002** créée (invoiceId `443fb98c…`, reçu PDF), `stockDecremented=1`
+    (qtyOnHand Stock 2→1, mouvement `SALE src=caisse:<saleId>:<lineId>`), `changeXpf=2000`.
+    → Caisse joint **réellement** Compta ET Stock en prod, orchestration idempotente prouvée.
+  - **ROLLBACK (réversible)** : `pm2 delete core-caisse && pm2 save` ; retirer les 2 locations
+    `/caisse` du vhost (revert `de52cdc` PacifiCode + redeploy) ; `rm -rf /home/deploy/moteurs/01-Core-Caisse`.
+    DB (**destructif → validation Marco**) : `DROP` tables/DATABASE `core_caisse` + rôles.
+    (La vente de test est du tenant démo, additive.)
+
 - 2026-07-02 : **note TGC** (brief seul, aucun code touché). Le taux TGC par tenant est géré côté
   **Core-Compta** (`TenantTaxSetting`, self-service) et appliqué automatiquement à l'émission de la
   facture. La Caisse n'a **rien à changer** : elle poste déjà `/api/invoices` sans `tgcRatePpm`. Détail
@@ -80,7 +103,8 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 
 ## Reste à faire / TODO
 
-- Provisionner `core_caisse` (owner/app) + secrets (Bitwarden) puis déployer (manuel) — **non fait**.
-- Ajouter `.github/workflows/ci.yml` (tsc+eslint) sur le modèle des autres moteurs si CI souhaitée.
+- ~~Provisionner `core_caisse` + déployer~~ — **FAIT 2026-07-02 (EN PROD)**.
+- Ajouter `.github/workflows/ci.yml` (tsc+eslint) sur le modèle des autres moteurs si CI souhaitée
+  (Caisse n'en a pas encore ; un `[deploy]` sur `main` ne passe pas par ci.yml pour l'instant).
 - Éventuel endpoint `GET /api/sessions/:id/z` en lecture seule (rapport Z sans clôturer).
 - Tests d'intégration du flux checkout en mode mock (bout en bout + rejeu).
