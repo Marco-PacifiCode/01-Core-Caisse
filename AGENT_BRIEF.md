@@ -41,6 +41,13 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 
 - **Compta** : `POST /api/invoices` `{tenantId,sourceType,sourceId,clientName?,lines:[{label,qty,unitXpf}]}`
   → `{invoiceId,number,totalXpf,alreadyExisted}` · `POST /api/settle`
+  - **TGC = zéro code Caisse.** Le taux TGC est un réglage **par tenant** qui vit dans **Core-Compta**
+    (table `TenantTaxSetting`, self-service marchand — branche Compta `claude/tgc-tenant-setting`, non
+    encore déployée). Quand la Caisse poste un ticket sans `tgcRatePpm` (cas actuel), Compta applique
+    **automatiquement** le taux réglé par le marchand et fige HT/TGC datés sur la facture. Le contrat
+    `/api/invoices` est inchangé (`tgcRatePpm` reste optionnel), `totalXpf` (TTC) reste la source, la
+    Caisse ne lit pas HT/TGC → **rien à modifier ici**, le ticket PDF (endpoint reçu Compta) porte la
+    ventilation TGC.
   `{tenantId,invoiceId,amountXpf,method,paymentRef}` → `{ok,paid,remaining}` (idempotent paymentRef) ·
   reçu `GET /api/invoices/:id/receipt?tenantId=…` (PDF 80 mm — réutilisé tel quel).
 - **Stock** : `POST /api/movements` `{tenantId,productId,type:"SALE",qty,sourceType,sourceId,actorId?}`
@@ -56,6 +63,10 @@ complet (catalogue Stock, saisie libre, ticket, encaissement + rendu monnaie, se
 
 ## Dernières actions
 
+- 2026-07-02 : **note TGC** (brief seul, aucun code touché). Le taux TGC par tenant est géré côté
+  **Core-Compta** (`TenantTaxSetting`, self-service) et appliqué automatiquement à l'émission de la
+  facture. La Caisse n'a **rien à changer** : elle poste déjà `/api/invoices` sans `tgcRatePpm`. Détail
+  § Intégrations. Baseline vérifiée en frais : `next typegen` + `tsc --noEmit` **VERTS** (mode mock).
 - 2026-07-02 : création complète v1 (modèles, RLS, libs tenant/RLS/service-auth/clients/caisse/money/catalog,
   6 routes API, back-office `/caisse`, seed session, README, deploy.yml manuel). tsc+build+tests verts.
 
