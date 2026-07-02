@@ -2,8 +2,10 @@
 //
 // MULTI-TENANT / RLS : le balayage est cross-tenant (il liste les ventes PAID non convergées de TOUS
 // les tenants). Il lit donc Sale SANS withTenant — pattern identique au cron de Core-RDV
-// (lib/reminders.ts) : un client Prisma DÉDIÉ sur `CRON_DATABASE_URL` (rôle PROPRIÉTAIRE → bypass RLS,
-// tables non FORCE) ; en dev (rôle mono/owner) fallback sur `DATABASE_URL`.
+// (lib/reminders.ts) : un client Prisma DÉDIÉ sur `CRON_DATABASE_URL`. ⚠️ Depuis FORCE ROW LEVEL
+// SECURITY (2026-07, prisma/manual/2026-07_securite_rls.sql), un rôle owner « nu » NE bypasse PLUS
+// la RLS : le rôle de CRON_DATABASE_URL doit être BYPASSRLS, sinon ce balayage voit 0 vente EN
+// SILENCE et la reprise meurt. En dev (RLS non forcée ou rôle unique) fallback sur `DATABASE_URL`.
 // Le listing ne lit que (id, tenantId) ; CHAQUE réparation repasse ensuite par repairSale → withTenant
 // (rôle applicatif, RLS active) : le client élargi ne sert qu'à découvrir le travail, jamais à écrire.
 

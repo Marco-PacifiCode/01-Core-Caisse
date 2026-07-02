@@ -4,12 +4,12 @@
 // Réponse : { ok, db, rlsEnabled, rlsForced, deps: { compta, stock } } — HTTP 200 si ok, 503 sinon.
 //   db         : SELECT 1 a répondu.
 //   rlsEnabled : pg_class.relrowsecurity sur "Sale" (policy tenant_isolation active).
-//   rlsForced  : pg_class.relforcerowsecurity — informatif : le design local = ENABLE + rôle app
-//                NON-propriétaire (cf. prisma/rls.sql) ; FORCE=false n'est donc pas un échec ici.
+//   rlsForced  : pg_class.relforcerowsecurity sur "Sale" — la RLS est réellement FORCÉE
+//                (l'owner ne bypasse plus ; cf. prisma/manual/2026-07_securite_rls.sql).
 //   deps       : joignabilité des cores consommés (Compta, Stock) — sondes courtes (2 s), INFORMATIVES :
 //                une panne de dépendance ne rend pas la Caisse "down" (les encaissements restent pris,
 //                la synchro converge ensuite) → n'affecte pas le status HTTP. "mock" en mode mock.
-//   ok = db && rlsEnabled.
+//   ok = db && rlsEnabled && rlsForced (rlsForced compte depuis l'alignement FORCE RLS 2026-07).
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
@@ -51,7 +51,7 @@ export async function GET() {
     ? (["mock", "mock"] as DepState[])
     : await Promise.all([probe(targets.compta), probe(targets.stock)]);
 
-  const ok = db && rlsEnabled;
+  const ok = db && rlsEnabled && rlsForced;
   return NextResponse.json(
     { ok, db, rlsEnabled, rlsForced, deps: { compta, stock } },
     { status: ok ? 200 : 503 },

@@ -84,6 +84,19 @@ historique).
 
 ## Dernières actions
 
+- 2026-07-03 : **FORCE ROW LEVEL SECURITY (alignement chantier A audit 02/07) — commit LOCAL sur
+  `main`, PAS poussé/déployé.**
+  - `prisma/rls.sql` : ajout `ALTER TABLE … FORCE ROW LEVEL SECURITY` sur les 4 tables tenant
+    (`CashSession`,`Sale`,`SaleLine`,`SalePayment`).
+  - **Migration manuelle idempotente** `prisma/manual/2026-07_securite_rls.sql` (FORCE + policies ;
+    à jouer en prod par owner/postgres AVANT le code ; rollback = `NO FORCE`).
+  - ⚠️ **PIÈGE CRON documenté** (en-tête de la migration + `.env.example` + `lib/repair-sweep.ts`) :
+    le balayage `CRON_DATABASE_URL` lit `Sale` cross-tenant — son rôle doit avoir **BYPASSRLS AVANT
+    d'appliquer FORCE**, sinon il voit 0 vente en silence (même piège que le cron RDV).
+  - `/api/health` : **`rlsForced` compte désormais dans le `ok`** (`ok=db&&rlsEnabled&&rlsForced`) →
+    déployer le code APRÈS la migration, sinon 503.
+  - Seeds post-FORCE : rôle **BYPASSRLS** requis (`.env.example` mis à jour).
+  - Vérifs : `tsc --noEmit` VERT · `next build` VERT.
 - 2026-07-02 (soir) : **CHANTIER FIABILITÉ CHECKOUT (audit 02/07 §3, prio n°3+5) — code complet,
   commits LOCAUX sur `main`, PAS poussé/déployé.**
   - **Timeouts S2S** (`lib/clients.ts`) : `AbortSignal.timeout` sur tous les appels sortants

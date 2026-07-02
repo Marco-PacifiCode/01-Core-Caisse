@@ -10,9 +10,16 @@
 -- On enveloppe donc en NULLIF(…, '')::uuid : un GUC absent OU vide devient NULL → la comparaison
 -- `tenantId = NULL` est NULL (aucune ligne) au lieu de planter. Neutre quand le GUC porte un vrai uuid.
 --
--- NB : le propriétaire de la table CONTOURNE la RLS sauf FORCE ROW LEVEL SECURITY. On garde ENABLE
--- (PAS FORCE) : en prod l'app se connecte avec un rôle DÉDIÉ non-propriétaire (la RLS s'applique) ;
--- les migrations/seed tournent avec le rôle propriétaire qui DOIT bypasser la RLS.
+-- ⚠️ FORCE ROW LEVEL SECURITY (alignement chantier sécurité audit 2026-07-02) : sans FORCE, le
+-- propriétaire des tables CONTOURNE silencieusement la RLS. FORCE soumet AUSSI l'owner aux
+-- policies → si le runtime se connecte par erreur en owner, l'isolation tient.
+-- Conséquences opérationnelles :
+--   - le RUNTIME doit se connecter avec un rôle applicatif NON-propriétaire (cf. .env.example) ;
+--   - les seeds/scripts cross-tenant (prisma db seed, seed:tenant) doivent tourner avec un rôle
+--     BYPASSRLS (ex. postgres) — le rôle owner « nu » ne bypasse plus ;
+--   - ⚠️ le BALAYAGE CRON (lib/repair-sweep.ts, CRON_DATABASE_URL) lit Sale CROSS-TENANT :
+--     son rôle doit être BYPASSRLS AVANT d'appliquer FORCE, sinon il voit 0 ligne en silence
+--     (même piège que le cron de rappels de Core-RDV).
 
 DO $$
 DECLARE
@@ -23,6 +30,7 @@ DECLARE
 BEGIN
   FOREACH t IN ARRAY tables LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I;', t);
     EXECUTE format(
       'CREATE POLICY tenant_isolation ON %I USING ("tenantId" = NULLIF(current_setting(''app.current_tenant'', true), '''')::uuid) WITH CHECK ("tenantId" = NULLIF(current_setting(''app.current_tenant'', true), '''')::uuid);',
