@@ -10,7 +10,8 @@
     "db:migrate": "prisma migrate dev --name init",
     "db:rls": "prisma db execute --file prisma/rls.sql --schema prisma/schema.prisma",
     "db:seed": "prisma db seed",
-    "db:setup": "prisma migrate deploy && npm run db:rls && npm run db:seed"
+    "db:setup": "prisma migrate deploy && npm run db:rls && npm run db:seed",
+    "seed:tenant": "node scripts/seed-tenant.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
