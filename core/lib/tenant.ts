@@ -46,25 +46,36 @@ export async function resolveTenant(): Promise<TenantConfig | null> {
   }
 }
 
-// UUID (v1-v5, casse indifférente). `SET LOCAL` ne supporte pas les paramètres liés → l'interpolation
-// est inévitable ; on la borne à un UUID STRICTEMENT validé (aucune injection possible).
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** UUID strict (8-4-4-4-12 hex). Seule forme admise pour app.current_tenant. */
+const UUID_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * Garde anti-injection (chantier sécurité audit 2026-07-02) : valide que la
+ * valeur est un UUID strict avant tout usage dans un GUC RLS. Lève sinon.
+ */
+export function assertTenantId(tenantId: string): string {
+  if (typeof tenantId !== "string" || !UUID_RE.test(tenantId)) {
+    throw new Error("INVALID_TENANT_ID");
+  }
+  return tenantId;
+}
 
 /**
  * Exécute `fn` dans une transaction où la variable de session
  * `app.current_tenant` est positionnée → active les politiques RLS
  * (defense-in-depth, voir prisma/rls.sql).
- * Rejette tout tenantId non-UUID AVANT interpolation SQL.
+ * Durci audit 2026-07-02 : tenantId validé UUID strict + set_config PARAMÉTRÉ
+ * (is_local=true ≡ SET LOCAL) — plus d'interpolation SQL. Homogène avec les 5
+ * autres cores (cf. 01-Core-Compta/core/lib/tenant.ts).
  */
 export async function withTenant<T>(
   tenantId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
-  if (!UUID_RE.test(tenantId)) {
-    throw new Error(`withTenant: tenantId invalide (UUID attendu), reçu ${JSON.stringify(tenantId).slice(0, 80)}`);
-  }
+  const safeTenantId = assertTenantId(tenantId);
   return prisma.$transaction(async (tx) => {
-    await tx.$executeRawUnsafe(`SET LOCAL app.current_tenant = '${tenantId}'`);
+    await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
     return fn(tx);
   });
 }

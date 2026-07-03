@@ -1,0 +1,60 @@
+name: CI
+
+# CI moteur core : verifie tsc (typecheck) — exige par la doctrine de deploiement autonome
+# (00-Archi-NextGen/CLAUDE.md regle 8 : CI verte tsc+eslint avant deploy). Pas de build next
+# complet (trop lent ; tsc --noEmit suffit pour la doctrine). Aucun secret : Prisma a juste
+# besoin que DATABASE_URL existe pour generer le client.
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/**"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci"
+
+jobs:
+  ci:
+    name: Typecheck (tsc) · Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: core/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Ensure next-env.d.ts (genere, gitignore)
+        run: |
+          if [ ! -f next-env.d.ts ]; then
+            printf '/// <reference types="next" />\n/// <reference types="next/image-types/global" />\n' > next-env.d.ts
+          fi
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
