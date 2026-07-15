@@ -15,7 +15,7 @@ import { xpf } from "@/lib/serialize";
 export async function POST(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  let body: { tenantId?: string; openedBy?: string; openingFloatXpf?: number; note?: string };
+  let body: { tenantId?: string; openedBy?: string; openedByName?: string; openingFloatXpf?: number; note?: string };
   try {
     body = await req.json();
   } catch {
@@ -29,6 +29,7 @@ export async function POST(req: NextRequest) {
 
   const result = await openSession(tenantId, {
     openedBy,
+    openedByName: body.openedByName?.trim() || undefined,
     openingFloatXpf: BigInt(Math.round(body.openingFloatXpf ?? 0)),
     note: body.note,
   });
@@ -41,6 +42,7 @@ export async function POST(req: NextRequest) {
       id: result.session.id,
       status: result.session.status,
       openedBy: result.session.openedBy,
+      openedByName: result.session.openedByName,
       openingFloatXpf: xpf(result.session.openingFloatXpf),
       openedAt: result.session.openedAt,
     },
@@ -72,10 +74,12 @@ export async function GET(req: NextRequest) {
       id: s.id,
       status: s.status,
       openedBy: s.openedBy,
+      openedByName: s.openedByName,
       openedAt: s.openedAt,
       openingFloatXpf: xpf(s.openingFloatXpf),
       closedAt: s.closedAt,
       closedBy: s.closedBy,
+      closedByName: s.closedByName,
       closingCountedXpf: xpf(s.closingCountedXpf),
       expectedXpf: xpf(s.expectedXpf),
       varianceXpf: xpf(s.varianceXpf),

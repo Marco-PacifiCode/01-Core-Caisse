@@ -31,7 +31,7 @@ export { CAISSE_SOURCE_TYPE } from "./sync";
 
 export async function openSession(
   tenantId: string,
-  input: { openedBy: string; openingFloatXpf: bigint; note?: string },
+  input: { openedBy: string; openedByName?: string; openingFloatXpf: bigint; note?: string },
 ) {
   return withTenant(tenantId, async (tx) => {
     // Une seule session OPEN à la fois par tenant (garde métier simple).
@@ -45,6 +45,7 @@ export async function openSession(
       data: {
         tenantId,
         openedBy: input.openedBy,
+        openedByName: input.openedByName ?? null,
         openingFloatXpf: input.openingFloatXpf,
         note: input.note ?? null,
       },
@@ -79,7 +80,7 @@ export type ZReport = {
  */
 export async function closeSession(
   tenantId: string,
-  input: { sessionId: string; closedBy: string; closingCountedXpf: bigint },
+  input: { sessionId: string; closedBy: string; closedByName?: string; closingCountedXpf: bigint },
 ): Promise<{ ok: false; error: "SESSION_NOT_FOUND" } | { ok: true; report: ZReport; alreadyClosed: boolean }> {
   return withTenant(tenantId, async (tx) => {
     const session = await tx.cashSession.findFirst({ where: { id: input.sessionId, tenantId } });
@@ -132,6 +133,7 @@ export async function closeSession(
         status: "CLOSED",
         closedAt: new Date(),
         closedBy: input.closedBy,
+        closedByName: input.closedByName ?? null,
         closingCountedXpf: input.closingCountedXpf,
         expectedXpf: expected,
         varianceXpf: variance,

@@ -15,7 +15,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id: sessionId } = await ctx.params;
 
-  let body: { tenantId?: string; closedBy?: string; closingCountedXpf?: number };
+  let body: { tenantId?: string; closedBy?: string; closedByName?: string; closingCountedXpf?: number };
   try {
     body = await req.json();
   } catch {
@@ -30,6 +30,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const result = await closeSession(tenantId, {
     sessionId,
     closedBy,
+    closedByName: body.closedByName?.trim() || undefined,
     closingCountedXpf: BigInt(Math.round(closingCountedXpf)),
   });
 
