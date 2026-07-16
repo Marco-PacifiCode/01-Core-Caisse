@@ -17,7 +17,7 @@
 
 import { withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
-import { computeChange, lineTotalXpf } from "./money";
+import { computeChange, lineTotalXpf, normalizePayments } from "./money";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -274,7 +274,11 @@ export type CheckoutError =
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "ALREADY_VOID" }
   | { ok: false; error: "NO_PAYMENT" }
-  | { ok: false; error: "UNDERPAID"; totalXpf: number; paidXpf: number };
+  | { ok: false; error: "UNDERPAID"; totalXpf: number; paidXpf: number }
+  // Excédent sur une méthode qui ne rend pas la monnaie (carte/virement/chèque) : c'est
+  // une saisie fausse, pas un rendu. Les espèces en trop, elles, ne sont JAMAIS une
+  // erreur — le moteur impute le dû et rend la différence.
+  | { ok: false; error: "OVERPAID"; method: string; excessXpf: number; totalXpf: number };
 
 // ─── Synchronisation Compta/Stock (moteur lib/sync.ts branché sur Prisma) ───
 
@@ -437,14 +441,33 @@ export async function checkoutSale(
     return { ok: false, error: "NO_PAYMENT" };
   }
 
-  // Persiste les nouveaux paiements (avec settleRef déterministe) s'il y en a.
+  // « J'encaisse, puis je rends » : c'est LE moteur qui impute, pas l'appelant. On ne
+  // persiste JAMAIS une imputation supérieure au dû — sinon la vente est soldée en trop
+  // en Compta et le rendu part en recette (bug vécu V'Cut : 3000 encaissés sur un ticket
+  // à 2500). Un excédent en carte/virement/chèque est une saisie fausse → refus.
+  let toPersist: PaymentInput[] = payments ?? [];
   if (payments && payments.length > 0) {
+    const norm = normalizePayments(sale.totalXpf, payments);
+    if (!norm.ok) {
+      return {
+        ok: false,
+        error: "OVERPAID",
+        method: norm.method,
+        excessXpf: Number(norm.excessXpf),
+        totalXpf: Number(sale.totalXpf),
+      };
+    }
+    toPersist = norm.payments as PaymentInput[];
+  }
+
+  // Persiste les nouveaux paiements (avec settleRef déterministe) s'il y en a.
+  if (toPersist.length > 0) {
     await withTenant(tenantId, async (tx) => {
       // On (re)crée les paiements uniquement si aucun n'est encore enregistré (évite les doublons au rejeu).
       const already = await tx.salePayment.count({ where: { tenantId, saleId } });
       if (already === 0) {
-        for (let i = 0; i < payments.length; i++) {
-          const p = payments[i];
+        for (let i = 0; i < toPersist.length; i++) {
+          const p = toPersist[i];
           await tx.salePayment.create({
             data: {
               tenantId,
