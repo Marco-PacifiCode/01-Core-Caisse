@@ -84,11 +84,17 @@ historique).
 
 ## Dernières actions
 
-- `2026-07-16` — 💥 **LE MOTEUR IMPUTE ET REND LA MONNAIE (plus l'appelant)** — PR **#4 OUVERTE, PAS
-  MERGÉE, PAS DÉPLOYÉE** (branche `claude/core-normalize-payments`, `4c9fb4d`) : **panne GitHub**
-  (« Partially Degraded Service », API authentifiée en 503) au moment du merge. **À reprendre :** attendre
-  le rétablissement → vérifier la CI verte → squash-merge → déployer (`git reset --hard origin/main`,
-  `npm run build`, `pm2 reload core-caisse`) → healthcheck `localhost:3106/api/health`.
+- `2026-07-16` — 💥 **LE MOTEUR IMPUTE ET REND LA MONNAIE (plus l'appelant)** — **#4 MERGÉE ET DÉPLOYÉE**
+  (`bda6906`). *(Merge fait à la main par Marco : panne GitHub « Partially Degraded Service », API
+  authentifiée en 503 — le self-merge par API était impossible.)*
+  - ✅ **VÉRIFIÉ EN PROD, de bout en bout** (ticket de vérif créé puis supprimé, base laissée vierge) :
+    - **Espèces `amountXpf: 3000` sur un ticket à 2500** — l'entrée **exactement fautive** d'avant →
+      `paidXpf: **2500**` (pas 3000), `changeXpf: **500**`, et la **Compta** enregistre
+      `paidXpf 2500 / remainingXpf 0 / PAYEE`. À comparer à l'avant : `paidXpf 3000 / remainingXpf -500`.
+      **Le moteur ignore l'imputation fautive de l'appelant et rend la différence.**
+    - **Carte 3000 sur un ticket à 2500** → **`409 OVERPAID`** `{method:"CARD", excessXpf:500}`, le ticket
+      **reste `DRAFT`**, `paidXpf 0`, **aucune facture créée** (le refus rend la main AVANT toute
+      persistance → aucun numéro de facture brûlé).
   - **Décision Marco** : « encaissé puis rendu, c'est une manip générale que tout le monde va faire » →
     la règle vit **dans le moteur**, pas dans chaque surface marchande (sinon chacun la réimplémente et
     chacun se trompe pareil).
@@ -106,9 +112,9 @@ historique).
     **inchangé**. Un appelant fautif est désormais **corrigé** au lieu d'être cru.
   - **8 tests ajoutés (27/27 verts)**, dont le scénario exact du bug et la **cohérence avec
     `computeChange`** → l'écran et le reçu ne peuvent plus diverger. `tsc` vert.
-  - ⚠️ *En attendant le déploiement* : **V'Cut est protégé** par son écran (surface `#85`, déployé :
-    un seul champ « Espèces reçues », imputation déduite). **Les autres marchands restent exposés** au
-    trou tant que ce PR n'est pas en prod.
+  - ✅ **Tous les marchands sont désormais protégés au bon niveau** (le trou était ouvert pour Ellément,
+    Onéiti… pas seulement V'Cut). La surface V'Cut (`#85`) garde son écran à **un seul champ « Espèces
+    reçues »** — c'est de l'ergonomie, plus un garde-fou : **le moteur est l'autorité**.
   - 🪤 *Piège rencontré* : `tsc` local échouait sur `openedByName`/`closedByName` **inexistants** — client
     Prisma **périmé** (colonnes ajoutées par #1 en cours de session). `npx prisma generate` avant de
     conclure à une régression.
