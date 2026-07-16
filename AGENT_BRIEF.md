@@ -84,6 +84,35 @@ historique).
 
 ## Dernières actions
 
+- `2026-07-16` — 💥 **LE MOTEUR IMPUTE ET REND LA MONNAIE (plus l'appelant)** — PR **#4 OUVERTE, PAS
+  MERGÉE, PAS DÉPLOYÉE** (branche `claude/core-normalize-payments`, `4c9fb4d`) : **panne GitHub**
+  (« Partially Degraded Service », API authentifiée en 503) au moment du merge. **À reprendre :** attendre
+  le rétablissement → vérifier la CI verte → squash-merge → déployer (`git reset --hard origin/main`,
+  `npm run build`, `pm2 reload core-caisse`) → healthcheck `localhost:3106/api/health`.
+  - **Décision Marco** : « encaissé puis rendu, c'est une manip générale que tout le monde va faire » →
+    la règle vit **dans le moteur**, pas dans chaque surface marchande (sinon chacun la réimplémente et
+    chacun se trompe pareil).
+  - **Le trou** : `amountXpf` (imputé) était pris **tel quel**. Rien n'empêchait `amountXpf` > total → la
+    vente était **soldée en trop en Compta** (`sync.ts` settle sur `amountXpf`) et le rendu comptabilisé
+    **en recette**. **Constaté en prod V'Cut** : `FAC-2026-0002` et `0003` portaient `paidXpf: 3000` pour
+    `totalXpf: 2500` (`remainingXpf: -500`). Seul **`UNDERPAID`** était gardé ; l'excédent passait en
+    **silence** — pour **tous** les marchands (Ellément, Onéiti…), pas seulement V'Cut.
+  - **Le correctif** : `amountXpf` devient une **DÉCLARATION, pas une consigne**. `normalizePayments`
+    (`lib/money.ts`, pur) prend ce que l'appelant dit avoir **reçu** (`max(amount, tendered)`) et impute
+    lui-même **`min(reçu, dû)`** ; l'excédent devient du **rendu** — mais seulement sur les méthodes qui
+    le permettent : un excès en **carte/virement/chèque** est une **saisie fausse** (rien à rendre) →
+    **409 `OVERPAID`**. Appelé dans `checkoutSale` **avant** la persistance des paiements.
+  - **Non-régression** : un appelant correct (`{amount:2500, tendered:3000}` sur 2500) ressort
+    **inchangé**. Un appelant fautif est désormais **corrigé** au lieu d'être cru.
+  - **8 tests ajoutés (27/27 verts)**, dont le scénario exact du bug et la **cohérence avec
+    `computeChange`** → l'écran et le reçu ne peuvent plus diverger. `tsc` vert.
+  - ⚠️ *En attendant le déploiement* : **V'Cut est protégé** par son écran (surface `#85`, déployé :
+    un seul champ « Espèces reçues », imputation déduite). **Les autres marchands restent exposés** au
+    trou tant que ce PR n'est pas en prod.
+  - 🪤 *Piège rencontré* : `tsc` local échouait sur `openedByName`/`closedByName` **inexistants** — client
+    Prisma **périmé** (colonnes ajoutées par #1 en cours de session). `npx prisma generate` avant de
+    conclure à une régression.
+
 - `2026-07-16` — **Nom lisible de l'opérateur de caisse** (#1). Colonnes additives `CashSession.openedByName`
   / `closedByName` (snapshot du nom staff figé à l'ouverture/clôture — la caisse affichait l'UUID brut).
   `openSession`/`closeSession` (`lib/caisse.ts`) + routes `/api/sessions` (POST) & `/close` acceptent le nom,
