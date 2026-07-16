@@ -22,7 +22,11 @@ const VALID_METHODS: PayMethod[] = ["CASH", "CARD", "TRANSFER", "CHEQUE", "OTHER
  *   Un échec S2S APRÈS encaissement ne fait PAS échouer la requête : la vente reste PAID,
  *   syncPending=true (invoiceId/receiptUrl éventuellement null), et la convergence est reprise par
  *   POST /api/sales/:id/repair ou le balayage /api/cron/repair-sales.
- * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/ALREADY_VOID/NO_PAYMENT (validations AVANT encaissement).
+ * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/OVERPAID/ALREADY_VOID/NO_PAYMENT (validations AVANT encaissement).
+ *
+ * `amountXpf` est une DÉCLARATION, pas une consigne : le moteur impute lui-même `min(reçu, dû)`
+ * et rend l'excédent en espèces (cf. lib/money.ts normalizePayments). Un excédent en
+ * carte/virement/chèque → 409 OVERPAID (rien ne se rend sur une carte).
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -64,6 +68,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       ALREADY_VOID: 409,
       NO_PAYMENT: 409,
       UNDERPAID: 409,
+      OVERPAID: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }
