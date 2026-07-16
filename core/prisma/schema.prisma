@@ -54,11 +54,13 @@ enum PayMethod {
 model CashSession {
   id               String        @id @default(uuid()) @db.Uuid
   tenantId         String        @db.Uuid
-  openedBy         String        @db.Uuid // staff qui a ouvert la session
+  openedBy         String        @db.Uuid // staff qui a ouvert la session (UUID)
+  openedByName     String? // nom lisible du staff figé à l'ouverture (affichage caisse)
   openedAt         DateTime      @default(now())
   openingFloatXpf  BigInt        @default(0) // fond de caisse initial (espèces), XPF entier
   closedAt         DateTime?
   closedBy         String?       @db.Uuid
+  closedByName     String? // nom lisible du staff figé à la clôture (affichage caisse)
   closingCountedXpf BigInt? // espèces réellement comptées à la clôture (saisie caissier)
   expectedXpf      BigInt? // attendu = fond + encaissements ESPÈCES rattachés (figé à la clôture)
   varianceXpf      BigInt? // écart = compté - attendu (négatif = manquant, positif = excédent)
