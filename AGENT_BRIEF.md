@@ -1,5 +1,10 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## Dernières actions (2026-07-19)
+- 🚀 **Onboardé sur le pipeline de déploiement unifié.** `core/next.config.ts` → `output:'standalone'` ;
+  `core-caisse` (:3106) redéployable en une commande via le moteur (cutover pm2 auto → health `/api/health`).
+  Détail infra → `00-Archi-NextGen/INFRA.md`.
+
 > Moteur mutualisé de **point de vente / tenue de caisse au comptoir**, multi-tenant. Il **orchestre**
 > Core-Compta (facture + paiement) et Core-Stock (décrément) à l'encaissement. Il ne refait NI la compta
 > NI l'inventaire — il gère les **opérations de vente/encaissement** (ticket, paiements offline, rendu
