@@ -11,6 +11,7 @@
 
 import { PrismaClient } from "@prisma/client";
 import { repairSale } from "./caisse";
+import { log } from "./log";
 
 const cronDbUrl = process.env.CRON_DATABASE_URL ?? process.env.DATABASE_URL;
 const globalForCron = globalThis as unknown as { cronPrisma?: PrismaClient };
@@ -59,6 +60,8 @@ export async function sweepPendingSales(limit = 200): Promise<RepairSweepReport>
       report.stillPending++;
       const msg = e instanceof Error ? e.message : String(e);
       if (report.failures.length < 20) report.failures.push({ saleId: s.id, tenantId: s.tenantId, error: msg });
+      // Socle observabilité : erreur inattendue du balayage de reprise → watchdog.
+      log.error("caisse.repairSweep", e, { saleId: s.id, tenantId: s.tenantId });
       console.error(`[caisse] repair-sweep erreur inattendue sale=${s.id} tenant=${s.tenantId}:`, e);
     }
   }

@@ -17,6 +17,7 @@
 
 import { withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
+import { log } from "./log";
 import { computeChange, lineTotalXpf, normalizePayments } from "./money";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
@@ -331,6 +332,12 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
   const outcome = await runSaleSync(toSnapshot(sale), comptaClient(), stockClient(), persistFor(sale.tenantId, sale.id));
   if (!outcome.synced && outcome.failure) {
     const f = outcome.failure;
+    // Socle observabilité : pont inter-cores (Compta/Stock) en échec après encaissement → watchdog.
+    log.error("caisse.saleSync", new Error(`${f.core}:${f.op} ${f.kind} ${f.status}`), {
+      saleId: sale.id,
+      tenantId: sale.tenantId,
+      detail: f.detail.slice(0, 300),
+    });
     console.error(
       `[caisse] synchro incomplète sale=${sale.id} tenant=${sale.tenantId} core=${f.core} op=${f.op} kind=${f.kind} status=${f.status} detail=${f.detail} — reprise via /api/sales/:id/repair ou cron repair-sales`,
     );

@@ -1,6 +1,13 @@
 # AGENT_BRIEF — 01-Core-Caisse
 > 🚀 **Déploiement (2026-07-19) : pipeline unifié UNIQUEMENT** — `bash 00-Archi-NextGen/_routine/deploy/ng-deploy.sh core-caisse deploy [branche]` (build hors-VPS, cutover auto, healthcheck, rollback). L'ancien `deploy.yml`/`[deploy]` est **SUPPRIMÉ**. Les mentions de `git reset`+`pm2 reload` dans l'historique ci-dessous décrivent le passé, pas la méthode. Détail : `00-Archi-NextGen/_routine/deploy/README.md`.
 
+## Dernières actions (2026-07-20)
+- 🔭 **Socle observabilité déployé** (standard `00-Archi-NextGen/_templates/observabilite/`, tag `[core-caisse]`) :
+  `core/lib/log.ts` + `core/instrumentation.ts` + `core/app/global-error.tsx` ; `log.error` ajouté (aucun changement
+  de comportement) sur : `tenant.resolve`, `catalog.fetch` (Stock injoignable), `caisse.saleSync` (pont Compta/Stock
+  post-encaissement), `caisse.repairSweep`, `api.cron.repairSales`, `health.db`. `lib/sync.ts` non touché (moteur pur
+  sans import runtime) — le log vit chez son appelant `syncLoadedSale`. Tests node 27/27 verts.
+
 ## Dernières actions (2026-07-19)
 - 🚀 **Onboardé sur le pipeline de déploiement unifié.** `core/next.config.ts` → `output:'standalone'` ;
   `core-caisse` (:3106) redéployable en une commande via le moteur (cutover pm2 auto → health `/api/health`).

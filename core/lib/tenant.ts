@@ -1,5 +1,6 @@
 import { headers } from "next/headers";
 import type { Prisma } from "@prisma/client";
+import { log } from "./log";
 import { prisma } from "./prisma";
 
 /** Type local — reflète le payload de core_auth GET /api/tenant */
@@ -41,7 +42,10 @@ export async function resolveTenant(): Promise<TenantConfig | null> {
     });
     if (!res.ok) return null;
     return (await res.json()) as TenantConfig;
-  } catch {
+  } catch (e) {
+    // Socle observabilité : erreur réseau vers core_auth = anomalie (le 404 domaine
+    // inconnu passe par !res.ok au-dessus et reste silencieux, c'est un cas normal).
+    log.error("tenant.resolve", e, { host });
     return null;
   }
 }
