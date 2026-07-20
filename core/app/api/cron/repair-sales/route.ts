@@ -14,6 +14,7 @@
 //     -H "X-Cron-Key: $CRON_KEY" >> /var/log/core-caisse-repair.log 2>&1
 
 import { NextRequest, NextResponse } from "next/server";
+import { log } from "@/lib/log";
 import { sweepPendingSales } from "@/lib/repair-sweep";
 
 // Job cross-tenant à effets réseau → jamais mis en cache / prérendu.
@@ -39,6 +40,8 @@ export async function POST(req: NextRequest) {
     }
     return NextResponse.json({ ok: true, report });
   } catch (e) {
+    // Socle observabilité : échec global du cron de reprise → watchdog.
+    log.error("api.cron.repairSales", e);
     console.error("[api/cron/repair-sales] erreur inattendue", e);
     return NextResponse.json({ ok: false, error: "Erreur interne" }, { status: 500 });
   }

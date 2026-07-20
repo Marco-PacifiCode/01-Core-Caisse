@@ -12,6 +12,7 @@
 //   ok = db && rlsEnabled && rlsForced (rlsForced compte depuis l'alignement FORCE RLS 2026-07).
 
 import { NextResponse } from "next/server";
+import { log } from "@/lib/log";
 import { prisma } from "@/lib/prisma";
 import { coreClientTargets } from "@/lib/clients";
 
@@ -43,6 +44,8 @@ export async function GET() {
     rlsEnabled = rows[0]?.relrowsecurity === true;
     rlsForced = rows[0]?.relforcerowsecurity === true;
   } catch (e) {
+    // Socle observabilité : DB injoignable = visible du watchdog.
+    log.error("health.db", e);
     console.error("[api/health] DB KO", e instanceof Error ? e.message : e);
   }
 

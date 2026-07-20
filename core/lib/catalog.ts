@@ -4,6 +4,7 @@
 // alors la saisie de lignes libres SERVICE/OTHER).
 
 import { clientsAreMocked } from "./clients";
+import { log } from "./log";
 
 export type CatalogProduct = {
   id: string;
@@ -41,7 +42,9 @@ export async function fetchCatalog(tenantId: string): Promise<CatalogProduct[]> 
         qtyOnHand: Number(r.qtyOnHand ?? 0),
       }))
       .filter((p) => p.id && p.name);
-  } catch {
+  } catch (e) {
+    // Socle observabilité : Core-Stock injoignable = catalogue vide en caisse → watchdog.
+    log.error("catalog.fetch", e, { tenantId });
     return [];
   }
 }
