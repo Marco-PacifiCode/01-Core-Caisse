@@ -1,6 +1,38 @@
 # AGENT_BRIEF — 01-Core-Caisse
 > 🚀 **Déploiement (2026-07-19) : pipeline unifié UNIQUEMENT** — `bash 00-Archi-NextGen/_routine/deploy/ng-deploy.sh core-caisse deploy [branche]` (build hors-VPS, cutover auto, healthcheck, rollback). L'ancien `deploy.yml`/`[deploy]` est **SUPPRIMÉ**. Les mentions de `git reset`+`pm2 reload` dans l'historique ci-dessous décrivent le passé, pas la méthode. Détail : `00-Archi-NextGen/_routine/deploy/README.md`.
 
+## 🩺 Anomalie de logs `E57P01` — RIEN À CORRIGER ICI (2026-08-01, tâche `t-20260730T1930-9pmstx`)
+
+Signature escaladée : `[core-caisse] prisma:error Error in PostgreSQL connection … SqlState(E57P01)
+"terminating connection due to administrator command"` — `error/pm2_stdout` ×6, LogEvent
+`cms3mgvfs0002uxklup4xcpk9`. **Verdict : bénigne côté moteur, aucun code touché dans ce repo.**
+
+- **Ce n'est pas un défaut applicatif.** `57P01` est émis par PostgreSQL aux backends qu'une
+  **commande d'administration** termine (`pg_terminate_backend`, arrêt/redémarrage du service). Les
+  moteurs `core-auth`, `core-caisse`, `core-comms`, `core-compta`, `core-stock` (+ `core-rdv`, déjà
+  escaladé le 27/07, LogEvent `cms3mgw3a0007uxkl40fkqkvc`) l'ont émis **dans le même lot d'ingestion,
+  à quelques centaines de ms** : cause **serveur, commune**. Un crash/OOM donnerait `57P02`, pas
+  `57P01` → l'arrêt était **propre et volontaire**.
+- **Pourquoi ça sort en « erreur »** : `core/lib/prisma.ts` construit le client avec `log:["error"]`,
+  donc l'engine Prisma écrit ce message sur **stdout** ; le collecteur (`PacifiCode/deploy/logs-cron.sh`)
+  retient toute ligne contenant la sous-chaîne `error`, et le canal de log de Prisma s'appelle
+  `prisma:error`. C'est un **événement de cycle de vie**, pas une exception applicative : la connexion
+  morte est jetée du pool et remplacée à la requête suivante.
+- **Ne pas « réparer » ça ici.** Basculer Prisma en `emit:"event"` ne supprimerait pas l'événement,
+  changerait juste sa mise en forme, et coûterait un déploiement des 5 moteurs pour zéro gain.
+- **Ce qui reste ouvert, hors de ce repo** : *qui* a lancé la commande d'administration. **Non
+  établi** — pas d'accès VPS depuis le sandbox (egress muré : `curl` sur les domaines publics = `000`).
+  Fenêtres reconstituées (`firstSeen`/`lastSeen` datent de l'**ingestion**, cf. `log-escalate.ts`, et le
+  collecteur tourne en `*/10`) : **~06:20–06:30 Pacific/Noumea les 2026-07-28 et 2026-07-31**.
+  Escaladé à Marco avec les commandes de diagnostic (`journalctl -u postgresql@16-main`,
+  `/var/log/unattended-upgrades/`, `dpkg.log`). Piste n°1 : la fenêtre de mises à jour automatiques
+  Ubuntu (06:00–07:00 locale) redémarrant `postgresql`. **Ne pas conclure sans ces sorties.**
+- **Si la signature revient** : ce n'est toujours pas un bug de ce moteur. Vérifier d'abord côté
+  serveur (état/redémarrages de `postgresql`), puis `/api/health` du moteur (`db:true` ⇒ pool
+  reconnecté). Toute affirmation d'infra se recoupe avec `00-Archi-NextGen/INFRA.md`, en frais.
+
+
+
 ## Dernières actions (2026-07-20)
 - 🔭 **Socle observabilité déployé** (standard `00-Archi-NextGen/_templates/observabilite/`, tag `[core-caisse]`) :
   `core/lib/log.ts` + `core/instrumentation.ts` + `core/app/global-error.tsx` ; `log.error` ajouté (aucun changement
