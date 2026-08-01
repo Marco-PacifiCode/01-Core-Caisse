@@ -10,8 +10,10 @@ on:
     branches:
       - main
       - "claude/**"
-  pull_request:
 
+  # Filet manuel : rien ne se declenche tout seul dessus, mais il permet de relancer
+  # la CI sur une branche quand on en a besoin, sans reactiver `pull_request`.
+  workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
