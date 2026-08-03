@@ -1,0 +1,53 @@
+-- ═══════════════════════════════════════════════════════════════════════════════════════════════
+--  CANDIDAT — NE PAS APPLIQUER. AUCUNE DÉCISION N'EST PRISE PAR CE FICHIER.
+-- ═══════════════════════════════════════════════════════════════════════════════════════════════
+-- Ce fichier est DÉLIBÉRÉMENT placé hors de `prisma/migrations/` : `prisma migrate deploy` ne le
+-- voit pas et ne peut pas l'appliquer par inadvertance au déploiement. Il n'est référencé par aucun
+-- script npm. Il ne devient une migration que si Marco tranche l'OPTION B ci-dessous — et c'est
+-- alors un geste délibéré, pas un effet de bord.
+--
+-- ─── POURQUOI IL EXISTE (tâche t-20260803T2030-caissesweep, 2026-08-03) ─────────────────────────
+-- Le correctif ANTI-FAMINE livré sur la branche claude/repair-sweep-anti-famine n'a besoin d'AUCUNE
+-- migration : il se contente de trier par `syncAttempts` (colonne existante depuis 2026-07) et
+-- d'espacer les reprises. Il ne renonce à AUCUNE vente.
+--
+-- Mais il laisse ouverte une question qui n'est PAS technique : que devient une vente ENCAISSÉE
+-- dont le stock ne bougera JAMAIS (produit supprimé côté Stock → 404 PRODUCT_NOT_FOUND définitif) ?
+-- L'argent est dans le tiroir, la facture Compta existe, et l'inventaire ne sera jamais décrémenté :
+-- c'est un ÉCART D'INVENTAIRE PERMANENT. Quelqu'un doit dire ce qu'on en fait.
+--
+--   OPTION A — NE RIEN AJOUTER (état livré, zéro migration).
+--     La vente reste « en attente » pour toujours, retentée toutes les 6 h, comptée dans `stuck` et
+--     signalée au watchdog. Rien n'est effacé, rien n'est décidé. Coût : la file des « en attente »
+--     ne se vide jamais complètement et mélange deux populations (retard transitoire / insoluble).
+--
+--   OPTION B — METTRE DE CÔTÉ EXPLICITEMENT (ce fichier).
+--     Un opérateur (ou une règle) déclare la vente « abandonnée à la synchro » : elle sort de la
+--     file de reprise, mais reste PAID et traçable, avec QUI a renoncé, QUAND et POURQUOI.
+--     L'écart d'inventaire devient alors DÉCLARÉ et dénombrable au lieu d'être subi.
+--     ⚠️ Conséquence comptable à assumer : l'inventaire Stock restera durablement supérieur au réel
+--     pour ces produits. Le rattrapage propre est un mouvement d'ajustement (ADJUST/LOSS) côté
+--     Core-Stock, saisi par le marchand — PAS une écriture automatique de la Caisse.
+--
+-- Additif et réversible (rollback : DROP des 3 colonnes). N'efface ni ne modifie aucune donnée.
+
+ALTER TABLE "Sale" ADD COLUMN "syncGivenUpAt"     TIMESTAMP(3);
+ALTER TABLE "Sale" ADD COLUMN "syncGivenUpBy"     UUID;
+ALTER TABLE "Sale" ADD COLUMN "syncGivenUpReason" TEXT;
+
+-- La file de reprise ignorerait alors les ventes mises de côté (l'index partiel de balayage
+-- `idx_sale_sync_pending`, dans prisma/rls.sql, devrait recevoir la même condition) :
+--
+--   DROP INDEX IF EXISTS "idx_sale_sync_pending";
+--   CREATE INDEX "idx_sale_sync_pending"
+--     ON "Sale" ("paidAt")
+--     WHERE "status" = 'PAID'
+--       AND ("comptaSyncedAt" IS NULL OR "stockSyncedAt" IS NULL)
+--       AND "syncGivenUpAt" IS NULL;
+--
+-- Et lib/repair-policy.ts ajouterait `syncGivenUpAt: null` à pendingSalesBaseWhere().
+--
+-- ROLLBACK :
+--   ALTER TABLE "Sale" DROP COLUMN "syncGivenUpReason";
+--   ALTER TABLE "Sale" DROP COLUMN "syncGivenUpBy";
+--   ALTER TABLE "Sale" DROP COLUMN "syncGivenUpAt";
