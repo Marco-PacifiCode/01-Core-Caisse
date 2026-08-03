@@ -1,6 +1,97 @@
 # AGENT_BRIEF — 01-Core-Caisse
 > 🚀 **Déploiement (2026-07-19) : pipeline unifié UNIQUEMENT** — `bash 00-Archi-NextGen/_routine/deploy/ng-deploy.sh core-caisse deploy [branche]` (build hors-VPS, cutover auto, healthcheck, rollback). L'ancien `deploy.yml`/`[deploy]` est **SUPPRIMÉ**. Les mentions de `git reset`+`pm2 reload` dans l'historique ci-dessous décrivent le passé, pas la méthode. Détail : `00-Archi-NextGen/_routine/deploy/README.md`.
 
+## 🍽️ FAMINE de la file de reprise — **PROUVÉE**, correctif poussé NON MERGÉ (2026-08-03, `t-20260803T2030-caissesweep`)
+
+> **Branche `claude/repair-sweep-anti-famine`** (sha `7d599a2`) ·
+> compare : `https://github.com/Marco-PacifiCode/01-Core-Caisse/compare/main...claude/repair-sweep-anti-famine`
+> **PR NON OUVERTE** : l'API GitHub répond **403** depuis le sandbox (écriture *et* lecture).
+> **ZÉRO migration Prisma.** Le correctif tient sur des colonnes existantes.
+
+### Le verdict : famine RÉELLE, établie par exécution (pas par lecture)
+`lib/repair-sweep.ts` sélectionnait les ventes PAID non convergées, tri **`paidAt asc`**, fenêtre 200,
+**sans jamais lire `syncAttempts`** — colonne pourtant écrite par `recordFailure` depuis 2026-07 :
+**écrite, jamais lue** (`grep` exhaustif : aucun lecteur dans tout le repo). Une vente insoluble ne
+quittait donc jamais la sélection, et comme elle est ancienne, le tri la ramenait **en tête de file**.
+
+**Rien ne la désamorçait** — cherché activement et exclu : pas de plafond ailleurs, pas d'`updatedAt`
+dans le tri, pas de purge/TTL/`deleteMany` (hors seed), aucun statut qui bascule (`VOID` n'est
+accessible que depuis `DRAFT`). Seule sortie de la file : converger.
+
+**Reproduit** sur base PostgreSQL **jetable** (migrations du repo, rôle app non-propriétaire, FORCE
+RLS vérifié `relforcerowsecurity=t`, rôle cron BYPASSRLS, vrais `checkoutSale`/`sweepPendingSales`,
+vrais serveurs HTTP Compta/Stock) — 200 ventes insolubles anciennes + 5 saines récentes, 5 passages :
+
+| | passage 1 | passages 2-5 | ventes saines |
+|---|---|---|---|
+| **AVANT** | `scanned=200 repaired=0` | idem, à l'identique | **jamais atteintes** (1000 appels Stock pour rien) |
+| **APRÈS** | `scanned=200 repaired=5` | reprise espacée, appels Stock 200 → 0 | **convergées au 1ᵉʳ passage** |
+
+⚠️ **Honnêteté sur la portée** : la famine est un effet de **saturation**, elle exige ≥ 200 ventes
+insolubles. En-dessous, les saines passent quand même (mesuré : 3 insolubles + 2 saines → `repaired=2`).
+Le dommage **présent et certain**, lui, est le **retry non borné** : chaque vente insoluble coûtait 96
+allers-retours Compta/Stock par jour, **à vie**.
+
+### La chaîne causale — le point aveugle qui rend l'empoisonnement atteignable
+Core-Stock **refuse déjà** de supprimer un produit vendu (`PRODUCT_HAS_SALES`)… mais ce garde-fou
+compte les **mouvements SALE**. Une vente Caisse dont le décrément a échoué n'a **aucun mouvement** →
+le garde-fou **ne la voit pas**. Vérifié en exécutant le vrai `deleteProduct` de Core-Stock contre une
+base Stock jetable :
+
+```
+produit AVEC mouvement SALE → {"ok":false,"error":"PRODUCT_HAS_SALES","saleCount":1}   ← protégé
+produit SANS mouvement SALE → {"ok":true,...}        puis reprise → PRODUCT_NOT_FOUND  ← empoisonné
+```
+
+C'est **exactement** l'état d'une vente en attente de synchro : le point aveugle du garde-fou Stock
+est précisément la population que la Caisse doit réparer. **À remonter à Core-Stock** (distinct de la
+course déjà traitée par `claude/delete-produit-preuve-cascade`, qui concerne les ventes *déjà* `ok:true`).
+
+### Ce que le correctif oppose (et ce qu'il refuse de décider)
+1. **Tri `syncAttempts asc, paidAt asc`** — une vente qui échoue en boucle recule derrière toute vente
+   fraîche. La famine devient **structurellement impossible**, sans renoncer à personne.
+2. **Backoff** au-delà de `REPAIR_BACKOFF_AFTER_ATTEMPTS` (défaut 10) : reprise seulement si la
+   dernière tentative (`updatedAt`, poussé par `recordFailure` — vérifié en base) date de plus de
+   `REPAIR_BACKOFF_MINUTES` (défaut 360). **`=0` = interrupteur d'arrêt**, réglable sans redéployer.
+3. **Visibilité** : compteur `stuck` dans le rapport + `log.error("caisse.repairStuck")` → watchdog.
+   Sans lui, on remplacerait une famine bruyante par un **enlisement silencieux**.
+
+**Aucune vente n'est jamais abandonnée, aucun statut d'abandon n'est posé, aucune colonne ajoutée.**
+La règle vit dans **`lib/repair-policy.ts`**, pure et testable sans base (patron `lib/sync.ts` :
+*import type* uniquement).
+
+### ⚖️ CE QUI RESTE À TRANCHER PAR MARCO — décision COMPTABLE, pas technique
+Une vente encaissée dont le stock ne bougera **jamais** est un **écart d'inventaire permanent**.
+- **Option A (état livré, zéro migration)** — la vente reste « en attente » à vie, retentée toutes les
+  6 h, comptée dans `stuck`, signalée. Rien n'est effacé, rien n'est décidé. *Coût : la file ne se vide
+  jamais et mélange retard transitoire et insoluble.*
+- **Option B (mise de côté explicite)** — colonnes `syncGivenUpAt/By/Reason` : qui a renoncé, quand,
+  pourquoi. L'écart devient **déclaré et dénombrable**. *Coût : **exige une migration Prisma** (STOP
+  Marco) ; l'inventaire Stock restera supérieur au réel → rattrapage par un mouvement `ADJUST`/`LOSS`
+  saisi par le marchand, **jamais** une écriture automatique de la Caisse.*
+- 📄 DDL candidat **INERTE** : `core/prisma/candidates/2026-08-03_sale_sync_giveup.CANDIDAT.sql` —
+  délibérément **hors** de `prisma/migrations/` (vérifié : `migrate deploy` voit 3 migrations et ne
+  crée aucune colonne). Il ne devient une migration que si Marco tranche B.
+
+### Compter les ventes concernées en prod (lecture seule — geste de Marco)
+```sql
+SELECT count(*) FILTER (WHERE "syncAttempts" >= 10) AS enlisees,
+       count(*) FILTER (WHERE "syncError" LIKE '%PRODUCT_NOT_FOUND%') AS produit_disparu,
+       count(*) AS total_en_attente, max("syncAttempts") AS pire
+FROM "Sale"
+WHERE status = 'PAID' AND ("comptaSyncedAt" IS NULL OR "stockSyncedAt" IS NULL);
+```
+⚠️ À lancer avec un rôle **BYPASSRLS** (sinon FORCE RLS renvoie 0 ligne **en silence**).
+
+### ⚠️ Deux points NON VÉRIFIABLES depuis le sandbox — à confirmer par Marco
+- **La crontab `*/15` de `/api/cron/repair-sales` est-elle installée ?** Le brief la dit *documentée,
+  non installée* (2026-07-02). **Si elle ne tourne pas, aucune vente n'est jamais réparée** — un
+  problème plus grave que la famine. À vérifier avant tout le reste.
+- **La CI de la branche** : illisible (403 API). `tsc`, `npm test` **35/35** et `next build` sont verts
+  **en local**.
+
+---
+
 ## 🩺 Anomalie de logs `E57P01` — RIEN À CORRIGER ICI (2026-08-01, tâche `t-20260730T1930-9pmstx`)
 
 Signature escaladée : `[core-caisse] prisma:error Error in PostgreSQL connection … SqlState(E57P01)
