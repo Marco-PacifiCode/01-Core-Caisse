@@ -38,6 +38,13 @@ export async function POST(req: NextRequest) {
     if (report.stillPending > 0) {
       console.warn(`[api/cron/repair-sales] ${report.stillPending} vente(s) toujours en attente`, report.failures);
     }
+    // `stuck` = ventes ENCAISSÉES qui ne convergent plus malgré de nombreuses tentatives (ex : produit
+    // supprimé côté Stock → 404 PRODUCT_NOT_FOUND définitif). Chacune est un écart d'inventaire en
+    // puissance et appelle un arbitrage — elle ne doit donc jamais rester silencieuse. Le log.error
+    // part depuis le balayage (lib/repair-sweep.ts) ; on l'expose aussi dans la réponse du cron.
+    if (report.stuck > 0) {
+      console.warn(`[api/cron/repair-sales] ${report.stuck} vente(s) ENLISÉE(S) — arbitrage requis`);
+    }
     return NextResponse.json({ ok: true, report });
   } catch (e) {
     // Socle observabilité : échec global du cron de reprise → watchdog.
