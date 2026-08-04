@@ -1,5 +1,43 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ⚖️ REVUE TRANSVERSE « volet argent » — 2026-08-04 06:55Z (`t-20260804T0630-brcorecaisse`)
+
+Revue des 3 branches du chantier avoir (`PC-0016`), code lu et **tests exécutés** localement.
+Verdict pour ce dépôt : **PR #11 — MERGEABLE, MAIS BLOQUÉE PAR UNE DÉCISION** (celle de §A2, qui
+n'a **aucune réponse** de Marco ; ce dépôt ne bloque rien par lui-même).
+
+**Mesuré ici :** `origin/claude/sale-read-route` = `e6eaf1669756b6568b4806831b6c7236a8fc6043`.
+`main` (`3e722b11`) **n'a pas bougé** depuis : la branche est exactement à jour, zéro dérive.
+Sur la fusion locale : **35/35 tests verts**, `tsc --noEmit` **exit 0**, zéro migration.
+Route en lecture pure, sous RLS (`withTenant`), `X-Core-Key`, `xpf()` sur tous les `BigInt`.
+
+**⚠️ La branche n'ajoute AUCUN test.** Les 35 verts sont **exactement** les 35 de `main` (mesuré :
+`git diff --name-only main...branche | grep -c test` → **0**). `app/api/sales/[id]/route.ts` — le
+chaînon dont dépend toute la reprise de stock de l'avoir — est livré **sans une seule assertion**.
+Ce n'est pas rédhibitoire (66 lignes, lecture seule, aucun effet de bord) mais « 35/35 » ne dit rien
+de cette route : il faut le lire comme « rien n'a été cassé », pas comme « c'est couvert ».
+
+**Vérifié bon, contre un doute légitime :** `SaleLine.qty` est un `Int` (`prisma/schema.prisma:123`),
+pas un `Decimal` — le `qty` renvoyé brut par cette route est donc un vrai nombre JSON, et
+`Core-Stock recordMovement` (`Math.trunc`) le reçoit sans surprise. Pas de bug de sérialisation.
+
+**Écart (a) — CONFIRMÉ DANS LE CODE, et c'est le point dur du chantier.** Le Z se calcule
+exclusivement sur les `Sale` `PAID` de la session et leurs `SalePayment`
+(`lib/caisse.ts:88-105`). La chaîne d'avoir n'écrit **rien** ici : `Core-Compta createCreditNote`
+ne touche que `Invoice`/`InvoiceLine`, et `V-Cut creditInvoice` n'appelle que Compta puis Stock —
+**aucun appel en écriture vers ce moteur**. Donc : aucun `SalePayment`, aucun `Sale`, et
+`closeSession` est idempotent (une session `CLOSED` **renvoie son `varianceXpf` figé**, il n'est
+jamais recalculé). Le réglage « écart imputé sur la session du jour » de §A2 **n'est honoré nulle
+part** — ce n'est pas un oubli d'écriture, c'est structurel à l'option A.
+👉 **Conséquence concrète à porter à Marco** : si le salon rend l'argent en **espèces** au comptoir,
+le tiroir sera court d'autant au Z du jour, et l'app n'aura **aucune ligne pour l'expliquer** —
+l'écart apparaîtra comme une erreur de caisse anonyme. Honorer ce réglage exige une écriture ici,
+c'est-à-dire **l'option B**, qui n'est pas ce qui est écrit.
+
+**Ordre de livraison, corrigé sur pièce :** `core-auth` est déployé (`20260804-140514`) et
+Core-Compta **PR #20 est sur `main` et déployée** (`20260804-140657`) — les deux premières étapes
+sont FAITES. Reste : **Core-Compta #21 → #11 (ici) → V-Cut #201**.
+
 ## 🔎 `GET /api/sales/:id` — la lecture qui manquait, **NON déployée** (2026-08-04, `PC-0016`)
 
 > **PR #11** — https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/11 · branche
