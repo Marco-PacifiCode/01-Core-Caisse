@@ -227,6 +227,24 @@ Signature escaladée : `[core-caisse] prisma:error Error in PostgreSQL connectio
 
 
 ## Dernières actions (2026-07-20)
+- 🧹 **Ménage des branches `claude/*` : 8 → 4 sur ce remote, mesuré sur le CONTENU**
+  (2026-08-04, ordonné par Marco, chantier écosystème. **Aucune ligne de code n'a quitté le dépôt**,
+  rien n'a été déployé, `main`/`master` n'a pas bougé.)
+  📐 Une branche n'a été supprimée que si son contenu est **intégralement retrouvable sur la base** :
+  soit **T1** (tout chemin qu'elle a touché est byte-identique sur la base), soit **T2** (100 % de ses
+  lignes ajoutées non triviales sont présentes dans la version base du même fichier). **Jamais** sur le
+  nom de la branche, **jamais** sur `merge-base` ni `git branch --merged` — on merge en **squash**, et
+  après un squash ces deux-là répondent « non mergée » sur du contenu entièrement absorbé.
+  ⚠️ `git cherry` / patch-id a été mesuré mais **refusé comme critère** : il dit « absorbé » pour un
+  commit appliqué **puis reverté** en amont.
+  🔢 **8 mesurées → 4 supprimées · 1 conservées** (au moins un fichier diverge encore)
+  **· 3 protégées** (branche ouverte, interdiction explicite de merge, ou sommet de moins de 24 h).
+  ↩️ **Réversible** : chaque suppression est consignée avec son SHA dans
+  `00-Archi-NextGen/_queue/branches/purge-20260804/manifeste-01-Core-Caisse-20260804.tsv`, avec un script de
+  restauration (`restaurer-01-Core-Caisse-20260804.sh`). Sauvegarde intégrale : clone miroir
+  `C:\dev\_backup\branch-purge-20260804\01-Core-Caisse.git`. Rejouable :
+  `00-Archi-NextGen/_routine/branches-purge.py`.
+
 - 🔭 **Socle observabilité déployé** (standard `00-Archi-NextGen/_templates/observabilite/`, tag `[core-caisse]`) :
   `core/lib/log.ts` + `core/instrumentation.ts` + `core/app/global-error.tsx` ; `log.error` ajouté (aucun changement
   de comportement) sur : `tenant.resolve`, `catalog.fetch` (Stock injoignable), `caisse.saleSync` (pont Compta/Stock
