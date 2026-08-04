@@ -227,6 +227,22 @@ Signature escaladée : `[core-caisse] prisma:error Error in PostgreSQL connectio
 
 
 ## Dernières actions (2026-07-20)
+- 🧹 **Ménage des branches `claude/*`, 2ᵉ passe : 4 → 3 sur ce remote**
+  (2026-08-05, chantier écosystème ordonné par Marco. **Aucune ligne de code n'a quitté le dépôt**,
+  rien n'a été déployé, la branche par défaut n'a pas bougé.)
+  📐 Même méthode qu'au 04/08, à l'identique : miroir **jetable neuf**, mesure **sur le CONTENU** —
+  **T1** (tout chemin touché est byte-identique sur la base) ou **T2** (100 % des lignes ajoutées non
+  triviales retrouvées dans la version base du même fichier). Jamais le nom de la branche, jamais
+  `merge-base`, jamais `git branch --merged` : on merge en **squash**, ces deux-là répondent
+  « non mergée » sur du contenu absorbé. `git cherry`/patch-id mesuré mais **jamais décisif**.
+  🔢 **4 mesurées → 1 supprimée(s) · 1 conservée(s)** (au moins un fichier diverge)
+  **· 2 protégée(s)** (branche ouverte, interdiction explicite, ou sommet de moins de 24 h).
+  ↩️ **Réversible** : SHA consignés dans
+  `00-Archi-NextGen/_queue/branches/purge-20260805/manifeste-01-Core-Caisse-20260805.tsv`, script
+  `restaurer-01-Core-Caisse-20260805.sh`. Sauvegarde : miroir `C:\dev\_backup\branch-purge-20260805\01-Core-Caisse.git`.
+  ⚠️ Les miroirs du **04/08** sont la sauvegarde des 444 branches de la 1ʳᵉ passe : **ne pas les
+  `--refresh`**, cela les prune et rend ces branches irrécupérables depuis eux.
+
 - 🧹 **Ménage des branches `claude/*` : 8 → 4 sur ce remote, mesuré sur le CONTENU**
   (2026-08-04, ordonné par Marco, chantier écosystème. **Aucune ligne de code n'a quitté le dépôt**,
   rien n'a été déployé, `main`/`master` n'a pas bougé.)
