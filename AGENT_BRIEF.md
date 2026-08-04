@@ -1,4 +1,29 @@
 # AGENT_BRIEF — 01-Core-Caisse
+
+## ✅ La famine de la file de reprise est **CORRIGÉE ET EN PROD** (2026-08-04, ticket `PC-0049`)
+
+La branche `claude/repair-sweep-anti-famine` est mergée et livrée : **PR #10, release
+`20260804-104132`**. Tri + backoff, **zéro migration** (`syncAttempts` existait depuis juillet et
+n'était lu par personne).
+
+**Le dommage certain n'était pas la famine** (qui exige ~200 insolubles) mais le **retry non
+borné : 96 allers-retours par jour et par vente, à vie**.
+
+## 🔎 La crontab `*/15` : le brief avait TORT (2026-08-04, vérifié sur le VPS)
+
+Ce brief la donnait « documentée, **non installée** ». Elle **est installée et tourne** :
+`*/15 * * * * /home/deploy/core-caisse-repair.sh`, log de 240 Ko, **3 080 passages**.
+
+⚠️ **Mais un doute reste, et il est important.** Les 3 080 passages rendent **tous** `scanned=0`.
+Deux lectures opposées : soit il n'y a réellement aucune vente en attente, soit le rôle du cron
+(`core_caisse_owner`, via `CRON_DATABASE_URL`) **n'est pas `BYPASSRLS`** et `FORCE ROW LEVEL
+SECURITY` lui renvoie **0 ligne en silence** — auquel cas le rattrapage n'a jamais rien vu. La
+vérification (`SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user`) est un geste de
+Marco : `00-Archi-NextGen/DECISIONS-2026-08-04.md`, geste **B8**.
+
+La décision comptable (que devient une vente qu'on renonce à synchroniser) reste ouverte —
+entrée **A5** de la même fiche. **Reco : A** (rien ne se perd, zéro migration), sous réserve de B8.
+
 > 🚀 **Déploiement (2026-07-19) : pipeline unifié UNIQUEMENT** — `bash 00-Archi-NextGen/_routine/deploy/ng-deploy.sh core-caisse deploy [branche]` (build hors-VPS, cutover auto, healthcheck, rollback). L'ancien `deploy.yml`/`[deploy]` est **SUPPRIMÉ**. Les mentions de `git reset`+`pm2 reload` dans l'historique ci-dessous décrivent le passé, pas la méthode. Détail : `00-Archi-NextGen/_routine/deploy/README.md`.
 
 ## 🍽️ FAMINE de la file de reprise — **PROUVÉE**, correctif poussé NON MERGÉ (2026-08-03, `t-20260803T2030-caissesweep`)
