@@ -1,5 +1,44 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔎 `GET /api/sales/:id` — la lecture qui manquait, **NON déployée** (2026-08-04, `PC-0016`)
+
+> **PR #11** — https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/11 · branche
+> `claude/sale-read-route` · **35/35 tests**, `tsc --noEmit` 0 erreur · **ZÉRO migration**,
+> lecture seule, aucun effet de bord.
+
+**Ce moteur n'exposait AUCUNE lecture de vente** : uniquement `POST /api/sales`,
+`POST /api/sales/:id/checkout` et `POST /api/sales/:id/repair`. On pouvait créer et encaisser un
+ticket, jamais le relire.
+
+Ça bloquait un geste concret : la **facture d'avoir** (Core-Compta PR #21) doit ré-incrémenter le
+stock des produits vendus, or **la facture Compta ne porte pas les `productId`** — ses lignes n'ont
+que `label`, `qty`, `unitXpf`. Seule la vente d'ici les connaît (`SaleLine.productId`). Sans cette
+route, la reprise du stock était structurellement hors d'atteinte. C'était le seul chaînon manquant.
+
+- Lecture **sous RLS** (`withTenant`), comme tout le moteur.
+- Tous les `BigInt` passent par `xpf()` — un `BigInt` brut lève à la sérialisation `NextResponse.json`.
+- Renvoie l'entête, `lines[]` (avec `kind`, `productId`, `qty`) et `payments[]`.
+- 401 sans clé · 400 sans `tenantId` · 404 `{"error":"Vente introuvable"}`.
+
+### Un écart de contrat signalé, pas comblé en douce
+La spec initiale exposait `payments[].ref`. **Ce champ n'existe pas** : `SalePayment` porte
+`settleRef` (référence d'idempotence vers Compta), pas `ref`. Il a été **omis** plutôt que renommé —
+exposer un champ interne de synchro dans un contrat public est un choix, pas une correction de frappe.
+À trancher si le besoin apparaît.
+
+### Ce que ça implique pour ce moteur, et qui est décidé ailleurs
+Décision `PC-0045` : **c'est la Caisse qui facture**, et elle seule. Le pont RDV→Compta est désarmé
+(Core-RDV PR #41). Rien ne change ici — mais ce moteur devient **le seul** chemin automatique vers la
+facturation, ce qui augmente d'autant le coût d'une panne de `runSaleSync`.
+
+### ⚠️ Ce moteur ne sait toujours pas annuler un encaissement
+`voidSale` refuse un ticket `PAID` et **n'a aucun appelant**. `SaleStatus` reste `DRAFT | PAID | VOID`,
+sans état de remboursement. L'avoir retenu est **comptable** (Core-Compta), pas caissier : il ne crée
+aucun `SalePayment`, donc **le Z de caisse n'en portera aucune trace**, ni la session du jour ni celle
+d'origine (close, `varianceXpf` figé). Le réglage « écart imputé sur la session du jour » **n'est pas
+honoré** et exigerait une écriture ici — c'était l'option B. Reste à trancher.
+
+
 ## ✅ La famine de la file de reprise est **CORRIGÉE ET EN PROD** (2026-08-04, ticket `PC-0049`)
 
 La branche `claude/repair-sweep-anti-famine` est mergée et livrée : **PR #10, release
