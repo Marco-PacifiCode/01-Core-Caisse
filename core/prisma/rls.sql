@@ -25,7 +25,7 @@ DO $$
 DECLARE
   t text;
   tables text[] := ARRAY[
-    'CashSession','Sale','SaleLine','SalePayment'
+    'CashSession','Sale','SaleLine','SalePayment','CashMovement'
   ];
 BEGIN
   FOREACH t IN ARRAY tables LOOP
