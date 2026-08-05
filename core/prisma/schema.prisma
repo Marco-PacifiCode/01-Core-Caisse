@@ -67,7 +67,8 @@ model CashSession {
   note             String?
   status           SessionStatus @default(OPEN)
 
-  sales Sale[]
+  sales     Sale[]
+  movements CashMovement[]
 
   @@index([tenantId])
   @@index([tenantId, status])
@@ -144,4 +145,53 @@ model SalePayment {
   createdAt   DateTime  @default(now())
 
   @@index([tenantId, saleId])
+}
+
+// ── MOUVEMENT DE TIROIR ────────────────────────────────────────────────────────────────────
+// Nature d'un mouvement d'espèces qui n'est PAS une vente.
+//
+// POURQUOI CE MODÈLE EXISTE (chantier « écart de caisse », décision Marco 2026-08-05)
+// Jusqu'ici le Z ne connaissait qu'une seule source d'espèces : les règlements CASH des ventes
+// PAID de la session. Quand un salon REMBOURSAIT un avoir en espèces, l'argent sortait du tiroir
+// sans qu'aucune ligne ne l'explique : le Z du soir affichait un manquant anonyme, indiscernable
+// d'une erreur de caisse.
+//
+// LE CHOIX, ET CE QU'IL ÉCARTE : on aurait pu écrire une « vente négative » (zéro migration) — le
+// Z se serait corrigé tout seul. Écarté, parce que cela ferait BAISSER LE CHIFFRE D'AFFAIRES
+// (totalSalesXpf somme les Sale.totalXpf) et parce qu'une Sale PAID non synchronisée tomberait
+// dans idx_sale_sync_pending, où le cron de reprise lui CRÉERAIT une facture.
+// Un mouvement de tiroir est une opération de TRÉSORERIE, pas une vente : il corrige l'attendu
+// sans toucher au CA. Ce sont deux grandeurs différentes, elles restent séparées.
+enum CashMovementKind {
+  REFUND // remboursement d'un avoir : l'argent sort du tiroir pour la cliente
+  CASH_OUT // prélèvement (dépôt en banque, achat, appoint)
+  CASH_IN // apport de fond en cours de journée
+}
+
+// Mouvement d'espèces rattaché à une session de caisse.
+model CashMovement {
+  id            String           @id @default(uuid()) @db.Uuid
+  tenantId      String           @db.Uuid
+  // OBLIGATOIRE, et c'est le cœur du dispositif : un mouvement hors session serait invisible
+  // de tout Z, donc inutile. La route refuse d'écrire s'il n'y a pas de session OUVERTE — c'est
+  // ce refus qui fait que le Z se ferme juste TOUT SEUL, sans discipline humaine.
+  sessionId     String           @db.Uuid
+  session       CashSession      @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  kind          CashMovementKind
+  // TOUJOURS POSITIF. Le SENS vient de `kind`, jamais du signe — le reste de ce moteur suppose
+  // des montants positifs (normalizePayments écrase les ≤ 0), on ne fabrique pas d'exception.
+  amountXpf     BigInt
+  reason        String // obligatoire : un écart de caisse doit être justifié, sinon on l'a juste déplacé
+  // Numéro de la pièce à l'origine du mouvement (ex. « AVO-2026-0001 ») quand kind = REFUND.
+  // Porte l'unicité anti-double-remboursement (voir @@unique ci-dessous).
+  ref           String?
+  createdBy     String?          @db.Uuid // qui a ouvert le tiroir — la trace manquait partout
+  createdByName String?
+  createdAt     DateTime         @default(now())
+
+  @@unique([tenantId, ref]) // un avoir ne se rembourse qu'UNE fois, garanti EN BASE et pas au clic.
+  // NULLS DISTINCT (défaut PostgreSQL) : plusieurs mouvements SANS ref restent permis — c'est
+  // voulu, un prélèvement ou un apport n'a pas de pièce de référence.
+  @@index([tenantId, sessionId])
+  @@index([tenantId, createdAt])
 }

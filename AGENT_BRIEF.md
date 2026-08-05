@@ -32,10 +32,168 @@ inconnu). **41/41 verts.**
 
 ---
 
-## 🎯 CONCEPTION — l'écart de caisse d'un remboursement
+## 🛑 ÉCART DE CAISSE — ÉCRIT ET TESTÉ, **LA MIGRATION N'EST PAS APPLIQUÉE** (2026-08-05 18:15)
 
-> **STATUT : conçu, PAS implémenté.** Chantier ouvert par Marco le 2026-08-05, qui a demandé à voir
-> la conception avant. **Rien n'est écrit dans ce dépôt au titre de ce chantier.**
+Marco a donné le **go** sur l'option `CashMovement` (celle recommandée ci-dessous). Le code est
+écrit, testé, poussé. **Rien n'est en production, et rien ne doit y aller avant la migration.**
+
+> 🔗 **PR ouverte, volontairement NON mergée** :
+> **https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/14**
+> Le code lit `CashMovement`. Le merger avant la migration ferait **planter `closeSession` à
+> chaque clôture de Z**. L'ordre n'est pas une préférence.
+
+### Pourquoi je n'ai pas appliqué, alors que j'avais le go
+
+Deux constats, dans cet ordre :
+
+1. Le hook `_hooks/gate-deploy.sh:120` **refuse** la commande d'application (DOCTRINE §8, « migration
+   même additive = irréversible »). C'est une contrainte machine, pas une consigne — je ne la
+   contourne pas.
+2. **Le chemin qu'il propose en remplacement ne fait pas ce qu'il annonce.** Le hook renvoie vers
+   `ng-deploy.sh <app> deploy --confirm-schema` en expliquant que « c'est `engine.sh` qui lance
+   prisma, en sous-processus ». **C'est inexact** : `engine.sh` ne lance aucun `prisma migrate`.
+   Le seul effet de `ALLOW_SCHEMA=1` est, ligne 295, de ne pas sortir en `20` — donc de laisser
+   passer **le ship du code**. Vérifié : `grep -n "prisma" engine.sh` ne rend que des commentaires
+   et le motif `MIGRATION_GLOB`.
+
+**Conclusion portée plus haut — et traitée le 2026-08-05 (Marco a validé la construction) :** il
+n'existait aucun chemin outillé qui applique une migration. Le garde-fou était bon ; c'est la porte
+qu'il désignait qui manquait. **Elle existe maintenant.**
+
+### ✅ LE CHEMIN OUTILLÉ EXISTE — geste `migrate` du canal ops (2026-08-05)
+
+`00-Archi-NextGen` PR **#664**, mergée sur `main`. `01-Core-Caisse` en est le **premier client**.
+
+**Ce que Marco fait, et c'est tout :** GitHub > `00-Archi-NextGen` > **Actions** > **Ops** >
+*Run workflow* (branche `main`) :
+
+| champ | valeur |
+|---|---|
+| `geste` | `migrate` |
+| `cible` | `core-caisse` |
+| `argument` | `20260805180000_cash_movement` |
+| `raison` | écart de caisse — PR #14 |
+
+Puis **Review deployments → Approve** (le job d'écriture attend ; **aucune clé SSH n'est montée
+avant ce clic**). ⚠️ **Prérequis, une seule fois :** `Settings > Environments > production >
+Required reviewers` (s'ajouter). Tant que ce n'est pas fait, le geste **échoue** — comportement
+voulu, pas un bug.
+
+> 🔧 **Correction d'un point de ce brief, mesurée sur le VPS le 2026-08-05.** Il était écrit que le
+> script appliquait la migration « **sous le rôle applicatif** ». C'est faux, et ça n'aurait pas
+> marché : `core_caisse_app` **n'a pas `CREATE` sur `public`**. Le piège est **symétrique** de celui
+> qu'on connaissait — `postgres` crée une table que l'app ne peut pas lire, le rôle de l'app ne peut
+> rien créer. Le bon rôle est un **troisième**, `core_caisse_owner`, propriétaire de la base, et sa
+> connexion est **déjà déclarée** dans le `.env` (`DATABASE_URL_OWNER`). Le geste refuse de partir
+> sous tout autre rôle.
+
+Le geste : garde de rôle → **sauvegarde de structure** → application → rejeu de `rls.sql` →
+régénération du client → **preuves**. Ces preuves-ci, une seule rouge suffisant à tout arrêter :
+
+| Contrôle | Attendu |
+|---|---|
+| migration en attente | **exactement** celle nommée dans `argument` (+ `sha256` du fichier imprimé) — refus sinon |
+| table `CashMovement` présente | oui, et **propriétaire = `core_caisse_owner`** |
+| droits DML de `core_caisse_app` | `SELECT`/`INSERT`/`UPDATE`/`DELETE` — ils viennent des `DEFAULT PRIVILEGES` du propriétaire, qui ne jouent **que** si c'est bien lui qui a créé la table |
+| `relrowsecurity` **et** `relforcerowsecurity` | `t` sur **toute** table portant `tenantId`, pas seulement la neuve — c'est ce qui attrape une table oubliée dans `rls.sql` |
+| policy `tenant_isolation` | présente |
+| **lecture SANS contexte de tenant, sous le rôle APPLICATIF** | **0 ligne**, et le geste dit si la table est **peuplée** — seul cas où « 0 » veut dire *cloisonné* et non *vide* |
+
+> ⚠️ **Pourquoi la preuve se fait sous le rôle applicatif et jamais sous le propriétaire** (mesuré le
+> 2026-08-05) : sous `core_caisse_owner`, `SELECT count(*) FROM "Sale"` sans contexte de tenant rend
+> **13** lignes — non pas que la RLS manque (elle est `ENABLE` **et** `FORCE`, et le rôle n'a ni
+> `SUPERUSER` ni `BYPASSRLS`), mais parce que la policy `cron_sweep_read` (balayage de reprise,
+> légitime) est `PERMISSIVE` et **s'ajoute**. Sous `core_caisse_app`, la même lecture rend **0**.
+> Une preuve faite sous le propriétaire serait faussement rouge — ou, sur une table vide,
+> **faussement verte**.
+
+Si une seule échoue : `exit 1`, état rapporté, **et le code ne part pas**. Et si l'application
+échoue, le geste compare la structure à celle d'avant : identique ⇒ il **solde** la ligne restée en
+échec (`resolve --rolled-back`), qui sinon **bloquerait toutes les migrations suivantes** — c'est
+exactement ce qui a dû être réparé à la main le 05/08.
+
+**Ensuite seulement** : merger la PR #14, puis
+`ng-deploy.sh core-caisse deploy main --confirm-schema` (le `--confirm-schema` ne fait que **laisser
+passer le ship du code** : la base, elle, est déjà à jour à ce stade).
+
+### État réel de la base au 2026-08-05 07:52Z (mesuré, pas supposé)
+
+- `CashMovement` : **n'existe pas**. `to_regclass` → vide.
+- `_prisma_migrations` : 3 lignes appliquées + `20260805180000_cash_movement` en `rolled_back`
+  (trace de la tentative arrêtée, **soldée** — elle ne bloque rien, Prisma la ré-appliquera).
+- Les fichiers sur le VPS (`schema.prisma`, `rls.sql`, `migration.sql`) ont le **sha256 identique**
+  à ceux de la branche `claude/cash-movement-ecart-caisse`. Rien à re-copier.
+- ⚠️ Le commentaire en tête de `migration.sql` dit encore « à appliquer sous le rôle applicatif » :
+  **c'est faux** (cf. plus haut). Volontairement **non corrigé** — on ne touche pas au fichier qui
+  est sur le point d'être appliqué, et il est inerte. À corriger après application.
+
+### Sauvegarde — faite avant toute tentative
+
+`C:\dev\_backup\2026-08-05-core-caisse-cashmovement\` — structure (`pg_dump -s`) + relevé de
+l'état RLS des 5 tables **avant**.
+
+> 🔎 **Le dump des DONNÉES est impossible sous le rôle applicatif**, et c'est une bonne nouvelle :
+> `pg_dump` s'arrête sur *« query would be affected by row-level security policy for table
+> CashSession »*. **`FORCE ROW LEVEL SECURITY` fonctionne, constaté en direct.** Pour une migration
+> additive pure, la structure est de toute façon la sauvegarde pertinente — aucune ligne existante
+> n'est touchée et le rollback est un `DROP TABLE`.
+
+### Ce qui a été vérifié après le refus du hook
+
+La base est **intacte** : `CashMovement` n'existe pas, `_prisma_migrations` porte toujours ses
+**3** lignes. **Aucune DDL n'a tourné.**
+
+### Ce qui est livré dans la PR #14
+
+| Fichier | Rôle |
+|---|---|
+| `prisma/schema.prisma` | `enum CashMovementKind` + `model CashMovement`. `amountXpf` **toujours positif** : le sens vient du `kind`, jamais du signe — le reste du moteur suppose des montants positifs (`normalizePayments` écrase les ≤ 0) et on ne fabrique pas d'exception |
+| `prisma/migrations/20260805180000_cash_movement/` | additive pure. FK en `RESTRICT` et non `CASCADE` : emporter en silence les mouvements qui expliquent un écart serait la « mine désamorcée mais pas déminée » relevée ailleurs |
+| `prisma/rls.sql` | `'CashMovement'` ajouté à la liste → `ENABLE` + `FORCE` + policy, comme les 4 autres |
+| `lib/cash-movement.ts` | règles **pures** : sens, agrégation, validation |
+| `lib/caisse.ts` | `closeSession` agrège les mouvements · `ZReport` gagne 3 postes · `recordCashMovement` |
+| `app/api/movements/route.ts` | S2S. **409 `NO_OPEN_SESSION`** |
+
+**`@@unique([tenantId, ref])`** : un avoir ne se rembourse qu'**une** fois, garanti **en base** et
+pas seulement au clic — `P2002` rattrape la course et rend le mouvement existant. *(C'est
+exactement ce qui manque au garde anti-double-règlement des factures, trou n°5 de `MAP-ARGENT`.)*
+
+**Le 409 est le dispositif, pas une limitation.** Pas de session ouverte ⇒ pas de mouvement :
+l'écrire quand même le rendrait invisible de tout Z, ce qui **déplacerait** l'écart muet au lieu de
+le supprimer. Le refus force le bon geste (« ouvrez une session de caisse pour rembourser en
+espèces ») — c'est **lui** qui fait que le Z se ferme juste tout seul.
+
+### Les tests (22 neufs, 63/63 verts, `tsc` 0 erreur)
+
+Non-régression au franc près quand il n'y a aucun mouvement · le cas de Marco (3 000 F rendus →
+attendu qui baisse de 3 000, **écart nul** quand la caissière compte le tiroir réel) · apports et
+prélèvements dans le bon sens · `bigint`, au-delà de 2^31 · **le CA ne peut pas bouger** (il n'est
+même pas une entrée de la fonction — ce test fige la séparation) · zéro/négatif/centime refusés ·
+`ref` vide ⇒ `null`, sinon `@@unique` bloquerait au deuxième mouvement sans référence.
+
+> ✅ **3 mutations de contrôle** : sens du `REFUND` inversé (**6 tests tombent**), montant négatif
+> accepté (**1**), `ref` vide non normalisée (**1**).
+
+### ⚠️ Ce qui N'EST PAS fait, et qui demande une coordination
+
+**Le déclenchement depuis les surfaces n'est pas écrit.** Pour qu'un avoir remboursé en espèces
+crée le mouvement, il faut modifier `surface/lib/finance-actions.ts` — **le fichier même qu'un
+autre chantier est en train de modifier dans V-Cut** (remise / prix modifiable / droits staff,
+arbre sale constaté le 2026-08-05). Signalé plutôt que livré en se croisant.
+
+Il reste aussi une question de produit, **non tranchée** : comment sait-on qu'un avoir est remboursé
+**en espèces** ? Le déduire du moyen de paiement d'origine serait une déduction — donc à écarter.
+Il faut le **demander** à l'opératrice au moment de l'avoir (un choix : espèces / CB / virement).
+Seul le choix « espèces » écrit un mouvement ; les autres ne touchent pas le tiroir.
+
+---
+
+## 🎯 LA CONCEPTION QUI A MENÉ À CE CHOIX — l'écart de caisse d'un remboursement
+
+> **STATUT : l'option 2 a reçu le GO de Marco et elle est ÉCRITE** (PR #14, non mergée — la
+> migration n'est pas appliquée, cf. section ci-dessus). Cette section est conservée telle
+> qu'elle a été rendue : elle porte le raisonnement, et surtout **ce qui a été écarté et
+> pourquoi** — c'est ce qu'on regrette de ne pas retrouver six mois plus tard.
 
 ### Le problème, en une phrase
 

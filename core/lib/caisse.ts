@@ -19,6 +19,12 @@ import { withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
 import { log } from "./log";
 import { computeChange, lineTotalXpf, normalizePayments } from "./money";
+import {
+  expectedCashXpf,
+  summarizeMovements,
+  type CashMovementKind,
+  type CashMovementLike,
+} from "./cash-movement";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -72,6 +78,13 @@ export type ZReport = {
   salesCount: number;
   totalSalesXpf: number; // CA total de la session (tous moyens de paiement)
   byMethod: Record<string, number>;
+  // ── Mouvements de tiroir (chantier « ecart de caisse », 2026-08-05) ────────────────
+  // Trois postes SEPARES et POSITIFS : ils expliquent l'ecart, ils ne le noient pas dans
+  // un net opaque. Ils entrent dans `expectedXpf` et n'entrent PAS dans `totalSalesXpf` :
+  // un remboursement est de la tresorerie, pas du chiffre d'affaires.
+  refundsXpf: number; // remboursements d'avoirs sortis du tiroir
+  cashOutXpf: number; // prelevements (depot en banque, achat)
+  cashInXpf: number; // apports de fond en cours de journee
 };
 
 /**
@@ -104,7 +117,21 @@ export async function closeSession(
       }
     }
 
-    const expected = session.openingFloatXpf + cashSales;
+    // Les mouvements de tiroir de la session (remboursements, prelevements, apports).
+    // Sans eux, un avoir rendu en especes produisait un ecart MUET au Z.
+    const movements: CashMovementLike[] = (
+      await tx.cashMovement.findMany({
+        where: { tenantId, sessionId: session.id },
+        select: { kind: true, amountXpf: true },
+      })
+    ).map((m) => ({ kind: m.kind as CashMovementKind, amountXpf: m.amountXpf }));
+
+    const mv = summarizeMovements(movements);
+    const expected = expectedCashXpf({
+      openingFloatXpf: session.openingFloatXpf,
+      cashSalesXpf: cashSales,
+      movements,
+    });
 
     const buildReport = (counted: bigint, variance: bigint): ZReport => ({
       sessionId: session.id,
@@ -116,6 +143,9 @@ export async function closeSession(
       salesCount: sales.length,
       totalSalesXpf: Number(totalSales),
       byMethod: Object.fromEntries(Object.entries(byMethod).map(([k, v]) => [k, Number(v)])),
+      refundsXpf: Number(mv.refundsXpf),
+      cashOutXpf: Number(mv.cashOutXpf),
+      cashInXpf: Number(mv.cashInXpf),
     });
 
     if (session.status === "CLOSED") {
@@ -539,4 +569,118 @@ export async function voidSale(tenantId: string, saleId: string) {
     await tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } });
     return { ok: true as const };
   });
+}
+
+// ── MOUVEMENTS DE TIROIR ─────────────────────────────────────────────────────────────────────
+// Chantier « écart de caisse » (décision Marco 2026-08-05) : rendre le Z juste TOUT SEUL quand
+// un salon rembourse un avoir en espèces, sans toucher au chiffre d'affaires.
+
+export type RecordMovementInput = {
+  kind: CashMovementKind;
+  amountXpf: bigint; // TOUJOURS positif — le sens vient de `kind` (cf. lib/cash-movement.ts)
+  reason: string;
+  ref?: string | null; // n° d'avoir quand kind = REFUND ; porte l'unicité anti-double-remboursement
+  createdBy?: string | null;
+  createdByName?: string | null;
+};
+
+export type RecordMovementResult =
+  | { ok: false; error: "NO_OPEN_SESSION" }
+  | { ok: false; error: "SESSION_CLOSED" }
+  | { ok: true; alreadyExisted: boolean; movement: { id: string; sessionId: string; amountXpf: bigint; kind: CashMovementKind } };
+
+/**
+ * Enregistre un mouvement d'espèces sur la session de caisse OUVERTE du marchand.
+ *
+ * DEUX REFUS QUI SONT LE CŒUR DU DISPOSITIF, et non des détails d'implémentation :
+ *
+ * 1. `NO_OPEN_SESSION` — pas de session ouverte, pas de mouvement. Écrire quand même le rendrait
+ *    invisible de tout Z (celui-ci n'existe pas, et une session future ne le verrait pas) : on
+ *    aurait déplacé l'écart muet, pas supprimé. Le refus force le bon geste (« ouvrez une session
+ *    de caisse pour rembourser en espèces ») — c'est LUI qui fait que le Z se ferme juste seul.
+ *
+ * 2. `SESSION_CLOSED` — une session close a son `varianceXpf` FIGÉ et ne le recalcule jamais
+ *    (cf. closeSession). Y rattacher un mouvement produirait un Z dont l'écart affiché ne
+ *    correspondrait plus à ses propres lignes.
+ *
+ * IDEMPOTENT par `ref` : rejouer le même remboursement (double-clic, reprise réseau) rend le
+ * mouvement existant au lieu d'en créer un second. La garantie est EN BASE
+ * (`@@unique([tenantId, ref])`), pas seulement dans ce test applicatif : deux appels simultanés
+ * ne peuvent pas produire deux lignes — le second lève P2002 et on rend l'existant.
+ */
+export async function recordCashMovement(
+  tenantId: string,
+  input: RecordMovementInput,
+): Promise<RecordMovementResult> {
+  return withTenant(tenantId, async (tx) => {
+    const session = await tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN" },
+      orderBy: { openedAt: "desc" },
+    });
+    if (!session) return { ok: false as const, error: "NO_OPEN_SESSION" as const };
+
+    const ref = input.ref ?? null;
+    if (ref) {
+      const existing = await tx.cashMovement.findFirst({
+        where: { tenantId, ref },
+        select: { id: true, sessionId: true, amountXpf: true, kind: true },
+      });
+      if (existing) {
+        return {
+          ok: true as const,
+          alreadyExisted: true,
+          movement: { ...existing, kind: existing.kind as CashMovementKind },
+        };
+      }
+    }
+
+    try {
+      const created = await tx.cashMovement.create({
+        data: {
+          tenantId,
+          sessionId: session.id,
+          kind: input.kind,
+          amountXpf: input.amountXpf,
+          reason: input.reason,
+          ref,
+          createdBy: input.createdBy ?? null,
+          createdByName: input.createdByName ?? null,
+        },
+        select: { id: true, sessionId: true, amountXpf: true, kind: true },
+      });
+      return {
+        ok: true as const,
+        alreadyExisted: false,
+        movement: { ...created, kind: created.kind as CashMovementKind },
+      };
+    } catch (e) {
+      // P2002 = l'unique (tenantId, ref) a mordu : une course a créé le mouvement entre notre
+      // lecture et notre écriture. C'est le cas que la vérification applicative ci-dessus ne
+      // peut PAS couvrir, et c'est précisément pour lui que l'index existe.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002" && ref) {
+        const raced = await tx.cashMovement.findFirst({
+          where: { tenantId, ref },
+          select: { id: true, sessionId: true, amountXpf: true, kind: true },
+        });
+        if (raced) {
+          return {
+            ok: true as const,
+            alreadyExisted: true,
+            movement: { ...raced, kind: raced.kind as CashMovementKind },
+          };
+        }
+      }
+      throw e;
+    }
+  });
+}
+
+/** Les mouvements d'une session, pour l'écran de caisse et le Z. */
+export async function listCashMovements(tenantId: string, sessionId: string) {
+  return withTenant(tenantId, (tx) =>
+    tx.cashMovement.findMany({
+      where: { tenantId, sessionId },
+      orderBy: { createdAt: "asc" },
+    }),
+  );
 }
