@@ -1,5 +1,43 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ⚖️ REVUE TRANSVERSE « volet argent » — 2026-08-04 06:55Z (`t-20260804T0630-brcorecaisse`)
+
+Revue des 3 branches du chantier avoir (`PC-0016`), code lu et **tests exécutés** localement.
+Verdict pour ce dépôt : **PR #11 — MERGEABLE, MAIS BLOQUÉE PAR UNE DÉCISION** (celle de §A2, qui
+n'a **aucune réponse** de Marco ; ce dépôt ne bloque rien par lui-même).
+
+**Mesuré ici :** `origin/claude/sale-read-route` = `e6eaf1669756b6568b4806831b6c7236a8fc6043`.
+`main` (`3e722b11`) **n'a pas bougé** depuis : la branche est exactement à jour, zéro dérive.
+Sur la fusion locale : **35/35 tests verts**, `tsc --noEmit` **exit 0**, zéro migration.
+Route en lecture pure, sous RLS (`withTenant`), `X-Core-Key`, `xpf()` sur tous les `BigInt`.
+
+**⚠️ La branche n'ajoute AUCUN test.** Les 35 verts sont **exactement** les 35 de `main` (mesuré :
+`git diff --name-only main...branche | grep -c test` → **0**). `app/api/sales/[id]/route.ts` — le
+chaînon dont dépend toute la reprise de stock de l'avoir — est livré **sans une seule assertion**.
+Ce n'est pas rédhibitoire (66 lignes, lecture seule, aucun effet de bord) mais « 35/35 » ne dit rien
+de cette route : il faut le lire comme « rien n'a été cassé », pas comme « c'est couvert ».
+
+**Vérifié bon, contre un doute légitime :** `SaleLine.qty` est un `Int` (`prisma/schema.prisma:123`),
+pas un `Decimal` — le `qty` renvoyé brut par cette route est donc un vrai nombre JSON, et
+`Core-Stock recordMovement` (`Math.trunc`) le reçoit sans surprise. Pas de bug de sérialisation.
+
+**Écart (a) — CONFIRMÉ DANS LE CODE, et c'est le point dur du chantier.** Le Z se calcule
+exclusivement sur les `Sale` `PAID` de la session et leurs `SalePayment`
+(`lib/caisse.ts:88-105`). La chaîne d'avoir n'écrit **rien** ici : `Core-Compta createCreditNote`
+ne touche que `Invoice`/`InvoiceLine`, et `V-Cut creditInvoice` n'appelle que Compta puis Stock —
+**aucun appel en écriture vers ce moteur**. Donc : aucun `SalePayment`, aucun `Sale`, et
+`closeSession` est idempotent (une session `CLOSED` **renvoie son `varianceXpf` figé**, il n'est
+jamais recalculé). Le réglage « écart imputé sur la session du jour » de §A2 **n'est honoré nulle
+part** — ce n'est pas un oubli d'écriture, c'est structurel à l'option A.
+👉 **Conséquence concrète à porter à Marco** : si le salon rend l'argent en **espèces** au comptoir,
+le tiroir sera court d'autant au Z du jour, et l'app n'aura **aucune ligne pour l'expliquer** —
+l'écart apparaîtra comme une erreur de caisse anonyme. Honorer ce réglage exige une écriture ici,
+c'est-à-dire **l'option B**, qui n'est pas ce qui est écrit.
+
+**Ordre de livraison, corrigé sur pièce :** `core-auth` est déployé (`20260804-140514`) et
+Core-Compta **PR #20 est sur `main` et déployée** (`20260804-140657`) — les deux premières étapes
+sont FAITES. Reste : **Core-Compta #21 → #11 (ici) → V-Cut #201**.
+
 ## 🔎 `GET /api/sales/:id` — la lecture qui manquait, **NON déployée** (2026-08-04, `PC-0016`)
 
 > **PR #11** — https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/11 · branche
@@ -189,6 +227,40 @@ Signature escaladée : `[core-caisse] prisma:error Error in PostgreSQL connectio
 
 
 ## Dernières actions (2026-07-20)
+- 🧹 **Ménage des branches `claude/*`, 2ᵉ passe : 4 → 3 sur ce remote**
+  (2026-08-05, chantier écosystème ordonné par Marco. **Aucune ligne de code n'a quitté le dépôt**,
+  rien n'a été déployé, la branche par défaut n'a pas bougé.)
+  📐 Même méthode qu'au 04/08, à l'identique : miroir **jetable neuf**, mesure **sur le CONTENU** —
+  **T1** (tout chemin touché est byte-identique sur la base) ou **T2** (100 % des lignes ajoutées non
+  triviales retrouvées dans la version base du même fichier). Jamais le nom de la branche, jamais
+  `merge-base`, jamais `git branch --merged` : on merge en **squash**, ces deux-là répondent
+  « non mergée » sur du contenu absorbé. `git cherry`/patch-id mesuré mais **jamais décisif**.
+  🔢 **4 mesurées → 1 supprimée(s) · 1 conservée(s)** (au moins un fichier diverge)
+  **· 2 protégée(s)** (branche ouverte, interdiction explicite, ou sommet de moins de 24 h).
+  ↩️ **Réversible** : SHA consignés dans
+  `00-Archi-NextGen/_queue/branches/purge-20260805/manifeste-01-Core-Caisse-20260805.tsv`, script
+  `restaurer-01-Core-Caisse-20260805.sh`. Sauvegarde : miroir `C:\dev\_backup\branch-purge-20260805\01-Core-Caisse.git`.
+  ⚠️ Les miroirs du **04/08** sont la sauvegarde des 444 branches de la 1ʳᵉ passe : **ne pas les
+  `--refresh`**, cela les prune et rend ces branches irrécupérables depuis eux.
+
+- 🧹 **Ménage des branches `claude/*` : 8 → 4 sur ce remote, mesuré sur le CONTENU**
+  (2026-08-04, ordonné par Marco, chantier écosystème. **Aucune ligne de code n'a quitté le dépôt**,
+  rien n'a été déployé, `main`/`master` n'a pas bougé.)
+  📐 Une branche n'a été supprimée que si son contenu est **intégralement retrouvable sur la base** :
+  soit **T1** (tout chemin qu'elle a touché est byte-identique sur la base), soit **T2** (100 % de ses
+  lignes ajoutées non triviales sont présentes dans la version base du même fichier). **Jamais** sur le
+  nom de la branche, **jamais** sur `merge-base` ni `git branch --merged` — on merge en **squash**, et
+  après un squash ces deux-là répondent « non mergée » sur du contenu entièrement absorbé.
+  ⚠️ `git cherry` / patch-id a été mesuré mais **refusé comme critère** : il dit « absorbé » pour un
+  commit appliqué **puis reverté** en amont.
+  🔢 **8 mesurées → 4 supprimées · 1 conservées** (au moins un fichier diverge encore)
+  **· 3 protégées** (branche ouverte, interdiction explicite de merge, ou sommet de moins de 24 h).
+  ↩️ **Réversible** : chaque suppression est consignée avec son SHA dans
+  `00-Archi-NextGen/_queue/branches/purge-20260804/manifeste-01-Core-Caisse-20260804.tsv`, avec un script de
+  restauration (`restaurer-01-Core-Caisse-20260804.sh`). Sauvegarde intégrale : clone miroir
+  `C:\dev\_backup\branch-purge-20260804\01-Core-Caisse.git`. Rejouable :
+  `00-Archi-NextGen/_routine/branches-purge.py`.
+
 - 🔭 **Socle observabilité déployé** (standard `00-Archi-NextGen/_templates/observabilite/`, tag `[core-caisse]`) :
   `core/lib/log.ts` + `core/instrumentation.ts` + `core/app/global-error.tsx` ; `log.error` ajouté (aucun changement
   de comportement) sur : `tenant.resolve`, `catalog.fetch` (Stock injoignable), `caisse.saleSync` (pont Compta/Stock
