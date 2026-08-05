@@ -56,37 +56,76 @@ Deux constats, dans cet ordre :
    passer **le ship du code**. Vérifié : `grep -n "prisma" engine.sh` ne rend que des commentaires
    et le motif `MIGRATION_GLOB`.
 
-**Conclusion à porter plus haut : il n'existe aujourd'hui aucun chemin outillé qui applique une
-migration.** Le garde-fou est bon ; ce qui manque, c'est la porte qu'il désigne.
+**Conclusion portée plus haut — et traitée le 2026-08-05 (Marco a validé la construction) :** il
+n'existait aucun chemin outillé qui applique une migration. Le garde-fou était bon ; c'est la porte
+qu'il désignait qui manquait. **Elle existe maintenant.**
 
-### Le geste est prêt — une commande, sur le VPS
+### ✅ LE CHEMIN OUTILLÉ EXISTE — geste `migrate` du canal ops (2026-08-05)
 
-```bash
-ssh deploy@46.250.245.33
-bash /home/deploy/moteurs/01-Core-Caisse/core/prisma/manual/2026-08-05_cash_movement_APPLY.sh
-```
+`00-Archi-NextGen` PR **#664**, mergée sur `main`. `01-Core-Caisse` en est le **premier client**.
 
-*(Script versionné dans `core/prisma/manual/`, **déjà déposé** sur le VPS, syntaxe vérifiée par
-`bash -n`, **jamais exécuté**. Les fichiers dont il a besoin — migration, `schema.prisma`,
-`rls.sql` — sont eux aussi déjà en place.)*
+**Ce que Marco fait, et c'est tout :** GitHub > `00-Archi-NextGen` > **Actions** > **Ops** >
+*Run workflow* (branche `main`) :
 
-Il refuse de partir si la connexion est en `postgres`, sauvegarde la structure, applique la
-migration **sous le rôle applicatif**, rejoue `rls.sql`, régénère le client Prisma, puis **vérifie
-et n'affirme rien qu'il n'ait mesuré** :
+| champ | valeur |
+|---|---|
+| `geste` | `migrate` |
+| `cible` | `core-caisse` |
+| `argument` | `20260805180000_cash_movement` |
+| `raison` | écart de caisse — PR #14 |
+
+Puis **Review deployments → Approve** (le job d'écriture attend ; **aucune clé SSH n'est montée
+avant ce clic**). ⚠️ **Prérequis, une seule fois :** `Settings > Environments > production >
+Required reviewers` (s'ajouter). Tant que ce n'est pas fait, le geste **échoue** — comportement
+voulu, pas un bug.
+
+> 🔧 **Correction d'un point de ce brief, mesurée sur le VPS le 2026-08-05.** Il était écrit que le
+> script appliquait la migration « **sous le rôle applicatif** ». C'est faux, et ça n'aurait pas
+> marché : `core_caisse_app` **n'a pas `CREATE` sur `public`**. Le piège est **symétrique** de celui
+> qu'on connaissait — `postgres` crée une table que l'app ne peut pas lire, le rôle de l'app ne peut
+> rien créer. Le bon rôle est un **troisième**, `core_caisse_owner`, propriétaire de la base, et sa
+> connexion est **déjà déclarée** dans le `.env` (`DATABASE_URL_OWNER`). Le geste refuse de partir
+> sous tout autre rôle.
+
+Le geste : garde de rôle → **sauvegarde de structure** → application → rejeu de `rls.sql` →
+régénération du client → **preuves**. Ces preuves-ci, une seule rouge suffisant à tout arrêter :
 
 | Contrôle | Attendu |
 |---|---|
-| table `CashMovement` présente | oui |
-| `relrowsecurity` | `t` — sinon un salon voit les autres |
-| `relforcerowsecurity` | `t` — sinon le **propriétaire** contourne la policy en silence |
+| migration en attente | **exactement** celle nommée dans `argument` (+ `sha256` du fichier imprimé) — refus sinon |
+| table `CashMovement` présente | oui, et **propriétaire = `core_caisse_owner`** |
+| droits DML de `core_caisse_app` | `SELECT`/`INSERT`/`UPDATE`/`DELETE` — ils viennent des `DEFAULT PRIVILEGES` du propriétaire, qui ne jouent **que** si c'est bien lui qui a créé la table |
+| `relrowsecurity` **et** `relforcerowsecurity` | `t` sur **toute** table portant `tenantId`, pas seulement la neuve — c'est ce qui attrape une table oubliée dans `rls.sql` |
 | policy `tenant_isolation` | présente |
-| **lecture SANS contexte de tenant** | **0 ligne** — ce n'est pas « table vide », c'est le cloisonnement qui répond |
-| les 5 tables du moteur | toutes `ENABLE`+`FORCE`, aucune en écart |
+| **lecture SANS contexte de tenant, sous le rôle APPLICATIF** | **0 ligne**, et le geste dit si la table est **peuplée** — seul cas où « 0 » veut dire *cloisonné* et non *vide* |
 
-Si une seule échoue : `exit 1`, message de rollback affiché, **et le code ne part pas**.
+> ⚠️ **Pourquoi la preuve se fait sous le rôle applicatif et jamais sous le propriétaire** (mesuré le
+> 2026-08-05) : sous `core_caisse_owner`, `SELECT count(*) FROM "Sale"` sans contexte de tenant rend
+> **13** lignes — non pas que la RLS manque (elle est `ENABLE` **et** `FORCE`, et le rôle n'a ni
+> `SUPERUSER` ni `BYPASSRLS`), mais parce que la policy `cron_sweep_read` (balayage de reprise,
+> légitime) est `PERMISSIVE` et **s'ajoute**. Sous `core_caisse_app`, la même lecture rend **0**.
+> Une preuve faite sous le propriétaire serait faussement rouge — ou, sur une table vide,
+> **faussement verte**.
+
+Si une seule échoue : `exit 1`, état rapporté, **et le code ne part pas**. Et si l'application
+échoue, le geste compare la structure à celle d'avant : identique ⇒ il **solde** la ligne restée en
+échec (`resolve --rolled-back`), qui sinon **bloquerait toutes les migrations suivantes** — c'est
+exactement ce qui a dû être réparé à la main le 05/08.
 
 **Ensuite seulement** : merger la PR #14, puis
-`ng-deploy.sh core-caisse deploy main --confirm-schema`.
+`ng-deploy.sh core-caisse deploy main --confirm-schema` (le `--confirm-schema` ne fait que **laisser
+passer le ship du code** : la base, elle, est déjà à jour à ce stade).
+
+### État réel de la base au 2026-08-05 07:52Z (mesuré, pas supposé)
+
+- `CashMovement` : **n'existe pas**. `to_regclass` → vide.
+- `_prisma_migrations` : 3 lignes appliquées + `20260805180000_cash_movement` en `rolled_back`
+  (trace de la tentative arrêtée, **soldée** — elle ne bloque rien, Prisma la ré-appliquera).
+- Les fichiers sur le VPS (`schema.prisma`, `rls.sql`, `migration.sql`) ont le **sha256 identique**
+  à ceux de la branche `claude/cash-movement-ecart-caisse`. Rien à re-copier.
+- ⚠️ Le commentaire en tête de `migration.sql` dit encore « à appliquer sous le rôle applicatif » :
+  **c'est faux** (cf. plus haut). Volontairement **non corrigé** — on ne touche pas au fichier qui
+  est sur le point d'être appliqué, et il est inerte. À corriger après application.
 
 ### Sauvegarde — faite avant toute tentative
 
