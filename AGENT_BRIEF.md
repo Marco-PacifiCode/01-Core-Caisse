@@ -86,6 +86,15 @@ Créer une `Sale` de total négatif, `PAID`, rattachée à la session du jour, p
   une facture** — soit une seconde pièce comptable pour un avoir qui en a déjà une. Contournable
   en posant les dates de synchro à la création, mais c'est une chausse-trappe pour le prochain.
 
+> 📌 **`CashMovement` sert un SECOND chantier, découvert le 2026-08-06** (question de Marco sur le
+> bouton « Honoré » de V-Cut, conception dans `V-Cut/AGENT_BRIEF.md`). Marco veut matérialiser la
+> **cliente venue qui n'a pas payé** — « *un ticket en attente de paiement* ». Or la Caisse ne sait pas
+> faire de vente à crédit (`DRAFT|PAID|VOID` + `UNDERPAID` 409, `lib/caisse.ts:447-500`), et régler la
+> créance depuis l'écran Compta ferait entrer l'argent **hors du Z** — le trou décrit ici, à l'identique.
+> **Même cause, même remède** : un `kind` supplémentaire (encaissement d'une facture due) sur ce modèle
+> règle les deux. Argument de plus pour l'option 2 — elle n'est plus au service d'un seul cas.
+> *(Rien n'est engagé : la migration attend toujours le go de Marco.)*
+
 #### Option 2 — `CashMovement`, un vrai mouvement de tiroir · **une migration additive** ⭐ RECOMMANDÉE
 
 ```prisma
