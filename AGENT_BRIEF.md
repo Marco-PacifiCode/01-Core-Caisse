@@ -28,9 +28,31 @@ mouvement.** `expectedCashXpf` vaut `openingFloat + cashSales + net(movements)`
 celui d'hier**. C'est ce qui rend ce ship sûr : il n'y a pas de bascule de calcul, il y a
 l'apparition d'une capacité.
 
-⚠️ **Ce que la prod NE sert pas encore** (vérifié : aucun dossier `movements` dans le checkout
-serveur, HEAD `642a17c` = merge PR #8) — la route `POST /api/movements` et le Z à trois postes
-nommés. **C'est exactement ce que ce ship apporte.**
+### ✅ LIVRÉ — PR #14 mergée et déployée le 2026-08-10 09:32
+
+| | Mesuré, pas supposé |
+|---|---|
+| `main` | `c99b9b8` |
+| Release | `20260810-093227` · `.released_sha` = `c99b9b8…` |
+| Santé | `/api/health` → **200** `{ok:true, db:true, rlsEnabled:true, rlsForced:true, deps:{compta:"up", stock:"up"}}` |
+| La route | `GET /api/movements` → **405** (méthode refusée = **la route existe**, seul `POST` est défini) — contre **404** sur une route inventée, témoin de contrôle |
+| pm2 | `core-caisse` **online** |
+| Local avant ship | **63 tests verts** (dont **22** sur `cash-movement`), `tsc --noEmit` **0**, `next build` vert |
+
+⚠️ **Le gate de réversibilité a refusé le premier ship** (`IRREVERSIBLE (schema Prisma). Rien
+deploye.`) — il compare le diff `déployé..cible` et y voit `prisma/`. **C'est le gate qui a raison
+sur la forme** : il ne peut pas savoir qu'une migration a déjà tourné. Le passage en
+`--confirm-schema` n'a été fait **qu'après avoir mesuré la base** (tableau ci-dessus), pas pour
+faire taire l'alerte. ⚠️ **`--confirm-schema` n'applique RIEN** : son seul effet est de laisser
+passer le ship du code. Ne jamais le lire comme « le pipeline s'occupe de la migration ».
+
+⚠️ **Ce que la prod servait AVANT ce ship** : HEAD du checkout `642a17c` (merge PR #8), **aucune
+route `movements`**. La capacité est donc neuve à l'écran comme au réseau.
+
+🛑 **CE QUI RESTE, ET C'EST L'ESSENTIEL : AUCUNE SURFACE N'APPELLE ENCORE CETTE ROUTE.** Le moteur
+sait enregistrer un mouvement de tiroir ; **aucun écran ne le propose**. Tant que ce n'est pas fait,
+un remboursement en espèces produit toujours un écart muet au Z — le trou fonctionnel n'est pas
+refermé, il est seulement **devenu refermable**. Prochain lot : V-Cut, Onéiti, Ellément.
 
 🕳️ **La leçon, et elle vaut pour tout l'écosystème** : ce dépôt a porté simultanément trois états
 contradictoires — *un brief qui dit « rien n'est écrit »*, *une branche de 967 lignes qui
