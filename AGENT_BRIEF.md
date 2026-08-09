@@ -1,5 +1,43 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ ÉCART DE CAISSE — LA MIGRATION EST APPLIQUÉE EN PROD DEPUIS LE 2026-08-05, LE CODE PART MAINTENANT (2026-08-10)
+
+> 🗣️ **Marco, 2026-08-10, arbitrage `AskUserQuestion` sur le chantier caisse/compta : « GO —
+> appliquer et livrer ».** Mesure faite avant d'agir : **« appliquer » était déjà fait.** Il ne
+> restait que « livrer », qui est du **code**, donc **réversible**.
+
+**⛔ Le bloc « LA MIGRATION N'EST PAS APPLIQUÉE » plus bas est PÉRIMÉ.** Il décrivait l'état du
+2026-08-05 18:15 ; le geste `migrate` du canal ops a abouti **le même soir**. Ce brief l'a affirmé
+faux pendant cinq jours, et le brief de V-Cut a repris l'erreur — d'où un diagnostic qui classait
+`CashMovement` comme « à décider » alors que la partie irréversible était derrière nous.
+
+**Relevé en base de production, le 2026-08-10** *(rôle de lecture `core_caisse_app`)* :
+
+| Contrôle | Mesuré |
+|---|---|
+| `to_regclass('public."CashMovement"')` | **la table existe** |
+| Propriétaire | **`core_caisse_owner`** — pas `postgres` (le piège symétrique est évité) |
+| `relrowsecurity` / `relforcerowsecurity` | **`t` / `t`** — RLS active **et forcée** |
+| `pg_policies` | **`tenant_isolation`**, `cmd=ALL` |
+| `_prisma_migrations` | `20260805180000_cash_movement` — un essai **rolled_back** à 18:18:34, puis **`finished_at` 23:59:58** |
+| **Isolation PROUVÉE** | `select count(*)` **sans contexte de tenant** → **`0`**. Ce n'est pas « table vide », c'est **le cloisonnement qui répond**. |
+
+**Ce que le déploiement du code change aujourd'hui : RIEN, tant que personne n'enregistre un
+mouvement.** `expectedCashXpf` vaut `openingFloat + cashSales + net(movements)`
+(`core/lib/cash-movement.ts:68-74`) et la table est **vide** ⇒ `net = 0` ⇒ **le Z est identique à
+celui d'hier**. C'est ce qui rend ce ship sûr : il n'y a pas de bascule de calcul, il y a
+l'apparition d'une capacité.
+
+⚠️ **Ce que la prod NE sert pas encore** (vérifié : aucun dossier `movements` dans le checkout
+serveur, HEAD `642a17c` = merge PR #8) — la route `POST /api/movements` et le Z à trois postes
+nommés. **C'est exactement ce que ce ship apporte.**
+
+🕳️ **La leçon, et elle vaut pour tout l'écosystème** : ce dépôt a porté simultanément trois états
+contradictoires — *un brief qui dit « rien n'est écrit »*, *une branche de 967 lignes qui
+l'implémente*, *une base de prod où la migration est appliquée*. **Aucun des trois n'était
+mensonger au moment où il a été écrit ; deux n'ont jamais été relus.** Ne jamais conclure sur un
+brief : `_prisma_migrations` et `pg_class` sont l'autorité (règle 4).
+
 ## ✅ LIVRÉ — PR #11 mergée et déployée (2026-08-05 17:27)
 
 `GET /api/sales/:id` **tourne en production**. C'était le chaînon manquant : sans lui, l'avoir ne
