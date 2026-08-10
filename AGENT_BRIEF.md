@@ -1,5 +1,41 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ LIVRÉ 2026-08-10 — `GET /api/sales` rend la VENTILATION par moyen de paiement (PR #16)
+
+> 🗣️ Marco : **« il faut faire la ventilation ici »** — dans l'application, pas via une requête SQL
+> à la main sur le serveur.
+
+**Le blocage annoncé était FAUX, et c'est la leçon de ce lot.** Un rapport avait classé la
+ventilation comme « impossible sans un appel par ticket · capacité manquante du moteur ». Relecture
+de la route : `GET /api/sales` **chargeait déjà les paiements** —
+`include: { payments: { select: { method: true, amountXpf: true } } }` — et **jetait leur `method`** :
+seule leur somme (`paidXpf`) sortait. Le correctif tient en **un `map` dans le rendu**, sans une
+requête de plus.
+⚠️ **« Le moteur ne sait pas le faire » se vérifie DANS LA ROUTE, pas dans un rapport.**
+
+**Purement additif** : aucune requête supplémentaire (**pas de N+1**), aucun champ existant modifié,
+aucun appelant cassé — une surface qui ignore `payments` marche à l'identique.
+⚠️ On rend **la LISTE** des paiements, pas un moyen unique : une vente peut porter **plusieurs**
+paiements (part carte + part espèces). Réduire à un seul obligerait à en choisir un arbitrairement
+et ferait **mentir le total**. C'est à l'appelant d'agréger.
+
+**Preuves** : `main` = `d4f75a3` · release **`20260810-214639`** · `/api/health` **200** ·
+**71 tests** verts · `tsc` 0 · build vert · **vérifié en production** — la route rend
+`payments:[{"method":"CARD","amountXpf":3100}]`.
+
+**Nouveau test de contrat** : `core/lib/sales-list-route.test.ts` (8 assertions, même méthode que
+`sale-read-route.test.ts` — on lit le source, le runner ne peut pas exécuter un route handler).
+Il attrape : clé de service retirée · `withTenant` retiré (un salon lirait les tickets d'un autre) ·
+**`payments` retiré du rendu** (la ventilation redeviendrait muette **sans erreur**) · un
+`amountXpf` sans `xpf()` (un BigInt brut fait **LEVER** `NextResponse.json` → 500, le journal se
+vide **sans message**) · `paidXpf` conservé · **garde anti-N+1**.
+
+🛠️ **Lecture directe hors application**, pour un contrôle ou un doute :
+`ssh deploy@46.250.245.33 "bash /home/deploy/ventilation-paiements.sh v-cut"` (accepte aussi
+`oneiti` et `ellement`). Le `set_config` du tenant y est **obligatoire** : la RLS est FORCÉE, sans
+contexte la requête rend **zéro ligne** — ce qui ressemble à « pas de données » alors que c'est le
+cloisonnement qui répond.
+
 ## ✅ ÉCART DE CAISSE — LA MIGRATION EST APPLIQUÉE EN PROD DEPUIS LE 2026-08-05, LE CODE PART MAINTENANT (2026-08-10)
 
 > 🗣️ **Marco, 2026-08-10, arbitrage `AskUserQuestion` sur le chantier caisse/compta : « GO —
