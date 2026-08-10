@@ -119,6 +119,25 @@ export async function GET(req: NextRequest) {
       sourceType: s.sourceType,
       sourceId: s.sourceId,
       paidXpf: xpf(s.payments.reduce((t, p) => t + p.amountXpf, 0n)),
+      // VENTILATION PAR MOYEN DE PAIEMENT — ajoutée le 2026-08-10 (demande Marco).
+      //
+      // Les paiements étaient DÉJÀ chargés par l'`include` ci-dessus, et leur `method`
+      // était lu puis JETÉ : seule leur somme (`paidXpf`) sortait. Un journal de caisse
+      // ne pouvait donc pas dire « combien en espèces, combien en carte » — et la seule
+      // façon de le savoir était une requête SQL à la main sur le serveur.
+      //
+      // Cet ajout est PUREMENT ADDITIF : aucune requête de plus (pas de N+1), aucun
+      // champ existant modifié, aucun appelant cassé. Une surface qui ignore `payments`
+      // continue de marcher à l'identique.
+      //
+      // ⚠️ Une vente peut porter PLUSIEURS paiements (paiement mixte : une part carte,
+      // une part espèces). On rend donc la LISTE, pas un moyen unique — réduire à « le »
+      // moyen de paiement obligerait à en choisir un arbitrairement et ferait mentir le
+      // total. C'est à l'appelant d'agréger.
+      // ⚠️ `xpf()` est OBLIGATOIRE sur `amountXpf` : un BigInt laissé brut fait LEVER
+      // `NextResponse.json` (« Do not know how to serialize a BigInt ») et la route rend
+      // 500 — le journal de caisse deviendrait vide, sans message.
+      payments: s.payments.map((p) => ({ method: p.method, amountXpf: xpf(p.amountXpf) })),
       createdAt: s.createdAt,
       paidAt: s.paidAt,
     })),
