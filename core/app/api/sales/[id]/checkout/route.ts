@@ -36,9 +36,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   let body: {
     tenantId?: string;
     payments?: { method?: string; amountXpf?: number; tenderedXpf?: number }[];
-    // OPTIONNEL, et c'est structurant : une surface qui n'émet pas de bons cadeaux (V-Cut,
-    // Ellément) ne l'envoie pas, ce bloc reste inerte et la réponse est celle d'avant PC-0064,
-    // au champ près. Aucune de leurs requêtes ne change de forme.
+    // OPTIONNEL, et c'est structurant : ce moteur est MUTUALISÉ entre marchands, et toutes les
+    // surfaces n'émettent pas de bons cadeaux. Celles qui n'en émettent pas ne l'envoient pas,
+    // ce bloc reste inerte, et leur requête comme leur réponse sont celles d'avant PC-0064, au
+    // champ près. Une évolution du moteur ne doit jamais coûter une vérification à un marchand
+    // qui n'a rien demandé.
     giftCards?: GiftCardInput[];
   };
   try {

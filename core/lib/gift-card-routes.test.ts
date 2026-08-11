@@ -252,12 +252,15 @@ test("🔴 closeSession : le calcul de totalSales n'additionne jamais un bon cad
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
-// 8. 🔴 V-CUT ET ELLÉMENT SONT INCHANGÉS — VERROUILLE-LE
+// 8. 🔴 LES MARCHANDS QUI N'ONT RIEN DEMANDÉ SONT INCHANGÉS — VERROUILLE-LE
 // ══════════════════════════════════════════════════════════════════════════════════════════
 //
-// Ces marchands n'envoient pas ce champ. Ces assertions sont ce qui garantit que leur requête
-// ET leur réponse restent identiques à l'octet près : un jour quelqu'un rendra ce paramètre
-// obligatoire ou ce champ systématique, et ce test doit tomber ce jour-là.
+// Ce moteur est MUTUALISÉ. Les surfaces qui n'émettent pas de bons cadeaux n'envoient pas ce
+// champ, et rien de ce chantier ne doit leur arriver : ni une requête d'une autre forme, ni une
+// réponse d'une autre forme, ni une validation nouvelle sur un chemin qu'elles empruntent.
+// Ces assertions sont ce qui le garantit — un jour quelqu'un rendra ce paramètre obligatoire ou
+// ce champ systématique, et ce test doit tomber CE JOUR-LÀ, pas au premier appel de production
+// d'un marchand qui n'a jamais entendu parler de bons cadeaux.
 
 test("checkout route : giftCards est un champ du body OPTIONNEL", () => {
   assert.match(checkoutSrc(), /giftCards\?:/);

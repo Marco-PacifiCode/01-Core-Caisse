@@ -359,8 +359,8 @@ export type CheckoutResult = {
   syncError: string | null; // dernière erreur de synchro (trace exploitable)
   alreadyPaid: boolean;
   // Bons cadeaux nés de CETTE vente (PC-0064). ABSENT du résultat quand il n'y en a pas — et
-  // c'est délibéré : les surfaces qui n'émettent pas de bons (V-Cut, Ellément) reçoivent une
-  // réponse rigoureusement identique à celle d'avant ce chantier, au champ près.
+  // c'est délibéré : ce moteur est mutualisé, et les surfaces qui n'émettent pas de bons
+  // reçoivent une réponse rigoureusement identique à celle d'avant ce chantier, au champ près.
   giftCards?: GiftCardIssued[];
 };
 
