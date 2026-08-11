@@ -1,32 +1,61 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🎁 EN COURS 2026-08-11 — BONS CADEAUX (PC-0064) : code prêt, **PR #18**, migration à appliquer
+## ✅ 2026-08-11 — BONS CADEAUX (PC-0064) : **MIGRATION APPLIQUÉE ET CODE EN PRODUCTION** (`986ee21`)
 
 > 🔒 **L'invariant du module, et il commande tout le reste :**
 > **le montant d'un bon entre dans le chiffre d'affaires UNE SEULE FOIS, le jour de son achat.**
 > Un bon cadeau est une **prestation vendue à l'avance**, pas un moyen de paiement.
 
-**PR : https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/18** — branche `claude/gift-cards`.
+PR #18 mergée, moteur livré en `986ee21`, surface Onéiti en `df8028e`. Ordre respecté :
+**migration → moteur → surface**.
 
-### 🛑 CE QUI RESTE À FAIRE, ET C'EST MARCO QUI LE FAIT — LA MIGRATION AVANT LE CODE
+### Comment la migration est réellement passée — pas par le chemin annoncé
 
-**Ne pas merger la PR #18 avant que la migration soit appliquée.** Du code qui lit une table
-absente plante au démarrage.
+⚠️ **Le canal `Actions > Ops` était HORS SERVICE** : le quota GitHub Actions s'est épuisé vers 02 h
+le 2026-08-11 (dernier run vert à 01 h 55, puis des jobs `conclusion=failure` avec **`steps=0` et
+`2 s`** — la signature d'un job qui **n'a jamais démarré**, pas d'un code rouge).
 
-| champ du geste `Ops` | valeur |
-|---|---|
-| `geste` | `migrate` |
-| `cible` | `core-caisse` |
-| `argument` | `20260811120000_gift_card` |
-| `raison` | bons cadeaux — PC-0064 |
+🔴 **Ce brief a affirmé l'inverse quelques heures plus tôt** — « le chemin outillé est VIVANT,
+mesuré », en citant trois runs verts « le jour même ». Ils dataient de **la veille**. La leçon n'est
+pas « il faut mesurer » : elle est que **`aujourd'hui` se relit sur l'horodatage du run**, jamais sur
+la position dans une liste triée par date décroissante.
 
-*(`00-Archi-NextGen` > Actions > **Ops** > Run workflow sur `main`, puis Review deployments →
-Approve.)*
+**Ce qui a marché :** `ops.sh` est un script bash qui prévoit explicitement d'être joué depuis le
+poste (`# Sur le poste de Marco, VPS_KEY désigne une clé locale`). Il a donc été lancé en direct,
+avec **toutes ses gardes et toutes ses preuves** :
 
-✅ **Le chemin outillé est VIVANT — mesuré le 2026-08-11, pas supposé.** La crainte « les minutes
-GitHub Actions sont épuisées » ne tient plus : trois runs CI de ce chantier sont partis et sont
-revenus **verts** le jour même (`31451877702`, `31452401261`, `31452528221`). Le geste `migrate`
-est donc disponible. `targets/core-caisse.conf` porte bien `OPS_MIGRATE_URL_VAR=DATABASE_URL_OWNER`.
+```bash
+OPS_PHASE=ecriture bash 00-Archi-NextGen/_routine/ops/ops.sh migrate core-caisse 20260811120000_gift_card
+```
+
+⚠️ **Le geste ne transporte PAS les fichiers** (le checkout VPS n'est pas un dépôt git) : `migration.sql`,
+`rls.sql` et `schema.prisma` ont été copiés par `scp` **depuis les blobs git**, puis leur `sha256`
+vérifié sur le serveur. C'est indispensable : Prisma enregistre le sha du fichier appliqué, et un
+CRLF le change. *(Constaté au passage : `rls.sql` et `schema.prisma` traînaient en CRLF sur le VPS
+depuis une copie Windows antérieure — sans conséquence, ces deux-là n'ont pas de somme de contrôle.
+Les 4 `migration.sql` déjà appliquées, elles, étaient bien en LF et conformes à git.)*
+
+### Les preuves rendues par le geste — une seule rouge aurait suffi à tout arrêter
+
+- table **`GiftCard` créée**, propriétaire **`core_caisse_owner`** ✔
+- DML complet (S/I/U/D) pour **`core_caisse_app`** ✔
+- `ENABLE` + `FORCE` + policy `tenant_isolation` sur **les 6 tables** portant `tenantId` ✔
+- **isolation sous le rôle APPLICATIF** : 0 ligne sans contexte de tenant, sur des tables **peuplées**
+  (`Sale` ~47, `SaleLine` ~78, `CashSession` ~14) — donc **cloisonné**, pas « vide » ✔
+- migration enregistrée dans `_prisma_migrations`, aucune ligne en échec ✔
+
+**Bout en bout, sur la production servie :** `GET /api/gift-cards?tenantId=<uuid inconnu>` avec la
+clé S2S rend **`200 {"ok":true,"giftCards":[]}`**. C'est LA preuve qui compte : le client Prisma de
+`web-current/` connaît le modèle et la requête s'exécute sur la vraie table. Un `500` aurait signé un
+client périmé — le piège classique, puisqu'un redémarrage ne régénère rien.
+
+Sauvegarde de la structure d'avant, rapatriée hors du `/tmp` du serveur :
+`C:\dev\_backup\core-caisse\ops-migrate-core-caisse-20260811T032647Z-avant.sql`.
+
+⚠️ **Piège d'exploitation rencontré** : les valeurs du `.env` sont **entre guillemets**. Un
+`sed -n 's/^CLE=//p'` rend `"abc"` et l'appel part en 401 — nettoyer par `tr -d '\r"'`.
+
+`targets/core-caisse.conf` porte bien `OPS_MIGRATE_URL_VAR=DATABASE_URL_OWNER`.
 
 ⚠️ **Rôle : `core_caisse_owner`, jamais `postgres` ni `core_caisse_app`.** Le piège est symétrique
 et il a déjà été payé ici : une table créée en superuser appartient à `postgres` et l'application
@@ -39,14 +68,9 @@ par `prisma migrate diff` (pas écrite à la main) : une seule table neuve, **au
 (ni `PayMethod` ni `LineKind` ne bougent — une valeur d'enum PostgreSQL ne se retire jamais),
 aucune colonne sur une table existante, aucune contrainte sur une table en service.
 
-**La preuve d'isolation viendra du geste lui-même**, qui l'imprime : RLS **active ET forcée**,
-policy `tenant_isolation` présente, et une lecture **sans contexte de tenant, sous le rôle
-applicatif**, qui rend **zéro ligne**. `'GiftCard'` est ajouté au tableau de `prisma/rls.sql`, donc
-`db:rls` génère sa policy.
-⚠️ **Cette preuve n'a PAS pu être faite d'avance.** Un Postgres jetable a été monté en local pour
-la produire ; le harnais de permissions a refusé `prisma migrate deploy` — il ne distingue pas une
-base jetable d'une production. **Le contournement n'a pas été tenté**, le conteneur a été détruit.
-Donc : *la migration n'est pas appliquée, et personne ne l'a vue tourner.*
+`'GiftCard'` est dans le tableau de `prisma/rls.sql`, donc `db:rls` génère sa policy — **rejoué par
+le geste**, et l'isolation est **prouvée en production** (détail plus haut). Le paragraphe qui vivait
+ici disait « personne ne l'a vue tourner » : c'était vrai avant l'application, ça ne l'est plus.
 
 ### Ce que le code fait
 
