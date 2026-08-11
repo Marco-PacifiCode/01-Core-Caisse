@@ -1,5 +1,85 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎁 EN COURS 2026-08-11 — BONS CADEAUX (PC-0064) : code prêt, **PR #18**, migration à appliquer
+
+> 🔒 **L'invariant du module, et il commande tout le reste :**
+> **le montant d'un bon entre dans le chiffre d'affaires UNE SEULE FOIS, le jour de son achat.**
+> Un bon cadeau est une **prestation vendue à l'avance**, pas un moyen de paiement.
+
+**PR : https://github.com/Marco-PacifiCode/01-Core-Caisse/pull/18** — branche `claude/gift-cards`.
+
+### 🛑 CE QUI RESTE À FAIRE, ET C'EST MARCO QUI LE FAIT — LA MIGRATION AVANT LE CODE
+
+**Ne pas merger la PR #18 avant que la migration soit appliquée.** Du code qui lit une table
+absente plante au démarrage.
+
+| champ du geste `Ops` | valeur |
+|---|---|
+| `geste` | `migrate` |
+| `cible` | `core-caisse` |
+| `argument` | `20260811120000_gift_card` |
+| `raison` | bons cadeaux — PC-0064 |
+
+*(`00-Archi-NextGen` > Actions > **Ops** > Run workflow sur `main`, puis Review deployments →
+Approve.)*
+
+✅ **Le chemin outillé est VIVANT — mesuré le 2026-08-11, pas supposé.** La crainte « les minutes
+GitHub Actions sont épuisées » ne tient plus : trois runs CI de ce chantier sont partis et sont
+revenus **verts** le jour même (`31451877702`, `31452401261`, `31452528221`). Le geste `migrate`
+est donc disponible. `targets/core-caisse.conf` porte bien `OPS_MIGRATE_URL_VAR=DATABASE_URL_OWNER`.
+
+⚠️ **Rôle : `core_caisse_owner`, jamais `postgres` ni `core_caisse_app`.** Le piège est symétrique
+et il a déjà été payé ici : une table créée en superuser appartient à `postgres` et l'application
+récolte « permission denied » à la première lecture ; à l'inverse `core_caisse_app` n'a pas
+`CREATE`. Les droits DML de l'app viennent des DEFAULT PRIVILEGES du propriétaire, qui ne jouent
+**que** si c'est bien lui qui a créé la table.
+
+**Réversibilité : `DROP TABLE "GiftCard";`** — rien d'autre. Migration **additive pure**, générée
+par `prisma migrate diff` (pas écrite à la main) : une seule table neuve, **aucun `ALTER TYPE`**
+(ni `PayMethod` ni `LineKind` ne bougent — une valeur d'enum PostgreSQL ne se retire jamais),
+aucune colonne sur une table existante, aucune contrainte sur une table en service.
+
+**La preuve d'isolation viendra du geste lui-même**, qui l'imprime : RLS **active ET forcée**,
+policy `tenant_isolation` présente, et une lecture **sans contexte de tenant, sous le rôle
+applicatif**, qui rend **zéro ligne**. `'GiftCard'` est ajouté au tableau de `prisma/rls.sql`, donc
+`db:rls` génère sa policy.
+⚠️ **Cette preuve n'a PAS pu être faite d'avance.** Un Postgres jetable a été monté en local pour
+la produire ; le harnais de permissions a refusé `prisma migrate deploy` — il ne distingue pas une
+base jetable d'une production. **Le contournement n'a pas été tenté**, le conteneur a été détruit.
+Donc : *la migration n'est pas appliquée, et personne ne l'a vue tourner.*
+
+### Ce que le code fait
+
+- **Achat** = jumeau d'une vente au comptoir (argent encaissé, Z qui le compte, facture au nom de
+  l'**acheteur**) → `checkoutSale` gagne un **4ᵉ paramètre optionnel** `options.giftCards`. Les
+  bons naissent **dans la transaction du passage à `PAID`** : aucune fenêtre entre « l'argent est
+  pris » et « le bon existe ». Les deux refus tombent **avant** tout encaissement.
+- **Consommation = AUCUNE COMPTABILITÉ** : ni vente, ni paiement, ni mouvement de tiroir, ni
+  facture. Un test interdit sept chaînes dans le corps de `redeemGiftCard`.
+- **Atomicité** : `updateMany` avec `redeemedAt: null` dans le `WHERE` → un unique
+  `UPDATE … WHERE "redeemedAt" IS NULL`. **Jamais** `SELECT` puis `UPDATE`. 0 ligne ⇒
+  `ALREADY_REDEEMED`. La relecture n'existe qu'**après** l'échec, pour *nommer* le refus.
+- **Z** : `giftCardRedeemedCount` / `giftCardRedeemedXpf`, **informatifs**, hors de `totalSalesXpf`
+  et de `expectedXpf`. L'invariant tient par la **signature** (`expectedCashXpf` ne reçoit pas de
+  bons) — pour le casser il faut changer un prototype, pas oublier une ligne. Rattachement par
+  **fenêtre `redeemedAt`**, **aucune FK vers `CashSession`**.
+- **Statut « expiré » dérivé à la lecture**, jamais stocké. Et l'expiration **ne bloque pas** la
+  consommation : accepter un bon périmé est une décision **du commerce**, pas du moteur.
+
+**Preuves** : **71 → 169 tests** verts sous `TZ=UTC` **et** `TZ=Pacific/Noumea` · `tsc` 0 · CI
+verte · **zéro nom de marchand** dans les 2006 lignes ajoutées (contrôle par tokens).
+**Et ces tests mordent** — deux régressions injectées puis annulées : remplacer l'`UPDATE`
+conditionnel par un `findFirst`-puis-`update` ⇒ **1 rouge** ; rendre le champ `giftCards`
+systématique dans la réponse ⇒ **1 rouge**.
+
+**Les marchands qui n'ont rien demandé sont inchangés, et c'est verrouillé par test** : champ
+optionnel de bout en bout, clé **omise** de la requête et de la réponse quand il n'y a pas de bon.
+
+❓ **Un point non tranché** : `POST /api/gift-cards` crée un bon **sans encaissement** (geste
+commercial, remplacement d'un bon papier abîmé, reprise d'historique). Il était dans la conception,
+il est documenté comme n'étant **pas** le chemin d'achat, et **aucune surface ne l'appelle**. Si ce
+cas n'est pas voulu, il se retire en supprimant un fichier.
+
 ## ✅ LIVRÉ 2026-08-10 — `GET /api/sales` rend la VENTILATION par moyen de paiement (PR #16)
 
 > 🗣️ Marco : **« il faut faire la ventilation ici »** — dans l'application, pas via une requête SQL
