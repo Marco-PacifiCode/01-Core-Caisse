@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { checkoutSale, type PaymentInput } from "@/lib/caisse";
+import type { GiftCardInput } from "@/lib/gift-card";
 import type { PayMethod } from "@prisma/client";
 
 export const runtime = "nodejs";
@@ -35,6 +36,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   let body: {
     tenantId?: string;
     payments?: { method?: string; amountXpf?: number; tenderedXpf?: number }[];
+    // OPTIONNEL, et c'est structurant : une surface qui n'émet pas de bons cadeaux (V-Cut,
+    // Ellément) ne l'envoie pas, ce bloc reste inerte et la réponse est celle d'avant PC-0064,
+    // au champ près. Aucune de leurs requêtes ne change de forme.
+    giftCards?: GiftCardInput[];
   };
   try {
     body = await req.json();
@@ -60,7 +65,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     });
   }
 
-  const result = await checkoutSale(tenantId, saleId, parsed);
+  // `giftCards` n'est PAS validé ici : la validation est dans le moteur (`validateGiftCards`),
+  // pour qu'elle tombe AVANT que le moindre franc soit acté et qu'aucun chemin d'appel ne puisse
+  // la contourner. La route se contente de transmettre ; elle omet même la clé quand il n'y a
+  // rien à transmettre, pour que l'appel soit à l'octet près celui d'avant PC-0064.
+  const giftCards = Array.isArray(body.giftCards) && body.giftCards.length > 0 ? body.giftCards : undefined;
+  const result = await checkoutSale(tenantId, saleId, parsed, giftCards ? { giftCards } : undefined);
 
   if (!result.ok) {
     const map: Record<string, number> = {
@@ -69,6 +79,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       NO_PAYMENT: 409,
       UNDERPAID: 409,
       OVERPAID: 409,
+      // Refus de bon cadeau : ils tombent AVANT tout encaissement, rien n'a été pris.
+      GIFT_CARD_INVALID: 409,
+      GIFT_CARD_CODE_TAKEN: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

@@ -195,3 +195,113 @@ model CashMovement {
   @@index([tenantId, sessionId])
   @@index([tenantId, createdAt])
 }
+
+// ── BON CADEAU ─────────────────────────────────────────────────────────────────────────────
+//
+// 🔒 L'INVARIANT, ET IL N'Y EN A QU'UN : LE MONTANT D'UN BON ENTRE DANS LE CA UNE SEULE FOIS,
+//    LE JOUR DE SON ACHAT.
+//
+// Un bon cadeau est une PRESTATION VENDUE À L'AVANCE, pas un moyen de paiement. C'est ce qui
+// dicte tout le reste :
+//
+//  · ACHAT — c'est le jumeau exact d'une vente au comptoir : l'argent est encaissé, le Z le
+//    compte, une facture part au nom de l'ACHETEUR. Il passe donc par `checkoutSale` comme
+//    n'importe quel ticket, et surtout PAS par un chemin d'encaissement parallèle. Les bons
+//    naissent DANS la transaction qui fait passer la vente à PAID : zéro fenêtre entre
+//    « l'argent est pris » et « le bon existe ».
+//
+//  · CONSOMMATION — AUCUNE COMPTABILITÉ. Aucune facture, aucun paiement, aucun mouvement de
+//    tiroir, aucun total du Z. Encaisser à nouveau les francs du bon le jour où il est présenté
+//    compterait le même argent DEUX FOIS. C'est l'erreur que cette table entière sert à rendre
+//    impossible. Le Z ne porte que deux champs INFORMATIFS (compte + montant), volontairement
+//    hors de `totalSalesXpf` et de `expectedXpf`.
+//
+//  · PAS DE NOUVELLE VALEUR D'ENUM. Ni `PayMethod`, ni `LineKind` ne gagnent de valeur : une
+//    valeur d'enum PostgreSQL ne se retire JAMAIS. Un complément à payer est une ligne libre
+//    `OTHER` ordinaire, réglée par un moyen de paiement ordinaire.
+//
+// LES DEUX FORMES, UN SEUL MODÈLE. Un bon en VALEUR (« 10 000 F ») et un bon NOMINATIF
+// (« un soin du visage ») ne sont pas deux mécaniques : c'est le même objet, avec un champ
+// `serviceLabel` optionnel. Un bon nominatif COUVRE la prestation désignée quel que soit le
+// tarif du jour — c'est sa raison d'être, la cliente a offert LA PRESTATION, pas une somme.
+// `amountXpf` reste renseigné dans les deux cas : c'est ce qui a été encaissé à la vente, donc
+// ce qui est déjà entré dans le CA.
+//
+// BINAIRE, RELIQUAT PERDU. Un bon de 10 000 F utilisé sur une prestation à 6 000 F est brûlé en
+// entier. Il n'existe donc aucun solde ici, et il ne faut pas en réintroduire un : `redeemedAt`
+// renseigné = consommé, point. `redeemedForXpf` ne calcule rien, il enregistre le prix affiché
+// le jour de l'échange, pour recouper après coup.
+//
+// LE STATUT « EXPIRÉ » N'EST PAS STOCKÉ. Il se DÉRIVE à la lecture de `expiresAt`. Un statut
+// stocké imposerait un travail de fond qui fait muter la production toute seule ; on n'en veut
+// pas.
+model GiftCard {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  // Code recopié à la main d'un bon papier vers un écran, souvent par une autre personne que
+  // celle qui l'a écrit. Unique PAR MARCHAND (@@unique ci-dessous) : deux salons peuvent porter
+  // le même code sans se voir, c'est le cloisonnement qui l'exige.
+  code String
+
+  // Ce qui a été ENCAISSÉ à la vente du bon — donc ce qui est déjà entré dans le CA ce jour-là.
+  // TOUJOURS POSITIF, en francs entiers (XPF n'a pas de centime), comme partout dans ce moteur.
+  amountXpf BigInt
+
+  // ── La forme NOMINATIVE, optionnelle ──────────────────────────────────────────────────────
+  // Renseignée, elle dit que le bon couvre CETTE prestation, quel que soit son tarif au jour de
+  // l'échange. Absente, le bon vaut `amountXpf`. Un seul modèle, pas deux mécaniques.
+  serviceLabel String? // libellé lisible, celui qui sera lu au comptoir
+  serviceId    String? @db.Uuid // référence catalogue quand la surface en a une
+
+  // ── Acheteur : celui qui a payé, et à qui la facture d'achat est adressée ─────────────────
+  buyerName  String?
+  buyerPhone String?
+  buyerEmail String?
+
+  // ── Bénéficiaire : celle qui présentera le bon ────────────────────────────────────────────
+  // LES TROIS IDENTIFIANTS SONT STOCKÉS, ET C'EST DÉLIBÉRÉ. Il n'existe AUCUNE table « cliente »
+  // dans l'écosystème : une fiche est un regroupement de rendez-vous par clé de dédup, et cette
+  // clé CHANGE quand la cliente donne son e-mail après coup. Un bon rattaché à une clé figée
+  // décrocherait silencieusement de sa fiche. Le rapprochement se fait donc À LA LECTURE, sur
+  // les trois identifiants (cf. lib/gift-card.ts).
+  beneficiaryName  String?
+  beneficiaryPhone String?
+  beneficiaryEmail String?
+
+  issuedAt  DateTime  @default(now())
+  expiresAt DateTime? // NULL = sans limite. Le statut « expiré » se dérive, il ne se stocke pas.
+
+  // ── Rattachement à la vente d'achat ───────────────────────────────────────────────────────
+  // Scalaires SANS clé étrangère, exactement comme `Sale.sourceId` : le bon ne doit jamais
+  // pouvoir bloquer une opération sur la vente, et la trace suffit au rapprochement.
+  saleId        String? @db.Uuid
+  invoiceNumber String? // facture d'achat, au nom de l'ACHETEUR
+
+  // ── Consommation ──────────────────────────────────────────────────────────────────────────
+  // 🔴 `redeemedAt` est LA sentinelle d'unicité : la consommation s'écrit par un UPDATE
+  //    conditionné à `redeemedAt IS NULL`, jamais par un SELECT suivi d'un UPDATE. Zéro ligne
+  //    affectée ⇒ refus `ALREADY_REDEEMED`. C'est la seule chose qui doit être irréprochable ici.
+  redeemedAt     DateTime?
+  redeemedBy     String?   @db.Uuid
+  redeemedByName String?
+  // Prix affiché de la prestation le jour de l'échange. N'ENTRE DANS AUCUN CALCUL de solde (il
+  // n'y a pas de solde) : il sert uniquement à recouper la caisse après coup.
+  redeemedForXpf BigInt?
+
+  // ── Annulation (ADMIN seule) ──────────────────────────────────────────────────────────────
+  cancelledAt     DateTime?
+  cancelReason    String?
+  cancelledBy     String?   @db.Uuid
+  cancelledByName String?
+
+  // Le code ne vaut QUE dans son marchand. Sans le tenantId, deux salons se voleraient leurs
+  // codes — et l'unicité est garantie EN BASE, pas au clic.
+  @@unique([tenantId, code])
+  // Le Z rattache les consommations par FENÊTRE de temps [openedAt, closedAt] — il n'y a
+  // délibérément AUCUNE clé étrangère vers CashSession, parce qu'une consommation n'est pas une
+  // opération de caisse. Cet index est ce qui rend ce filtrage tenable.
+  @@index([tenantId, redeemedAt])
+  @@index([tenantId, issuedAt])
+  @@index([tenantId, saleId])
+}

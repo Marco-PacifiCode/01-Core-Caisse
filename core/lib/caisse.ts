@@ -25,6 +25,16 @@ import {
   type CashMovementKind,
   type CashMovementLike,
 } from "./cash-movement";
+import {
+  summarizeRedeemedGiftCards,
+  validateGiftCard,
+  validateGiftCards,
+  type GiftCardCancelRefusal,
+  type GiftCardData,
+  type GiftCardInput,
+  type GiftCardRedeemRefusal,
+  type GiftCardRefusal,
+} from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -85,6 +95,17 @@ export type ZReport = {
   refundsXpf: number; // remboursements d'avoirs sortis du tiroir
   cashOutXpf: number; // prelevements (depot en banque, achat)
   cashInXpf: number; // apports de fond en cours de journee
+  // ── Bons cadeaux consommés (PC-0064, 2026-08-11) ───────────────────────────────────
+  // 🔒 DEUX CHAMPS PUREMENT INFORMATIFS. Ils n'entrent NI dans `totalSalesXpf`, NI dans
+  // `expectedXpf` — et ce n'est pas une discipline de relecture, c'est une propriete des
+  // SIGNATURES : `expectedCashXpf` ne recoit pas de bons, `summarizeRedeemedGiftCards` ne
+  // rend rien qui puisse y entrer. Consommer un bon n'a AUCUNE comptabilite : ni facture,
+  // ni paiement, ni mouvement de tiroir. Le montant d'un bon est entre dans le CA UNE
+  // SEULE FOIS, le jour ou le bon a ete VENDU. Le rappeler ici sert a expliquer pourquoi
+  // des prestations ont ete rendues sans qu'un franc entre dans le tiroir — pas a les
+  // compter une seconde fois.
+  giftCardRedeemedCount: number; // combien de prestations reglees par un bon
+  giftCardRedeemedXpf: number; // leur valeur faciale, DEJA encaissee a la vente des bons
 };
 
 /**
@@ -133,6 +154,24 @@ export async function closeSession(
       movements,
     });
 
+    // Bons cadeaux CONSOMMES pendant la fenetre de la session — information seule.
+    // ⚠️ Le rattachement se fait par FENETRE DE TEMPS sur `redeemedAt`, et il n'existe
+    // deliberement AUCUNE cle etrangere de `GiftCard` vers `CashSession` : une consommation
+    // n'est PAS une operation de caisse, elle n'a aucune comptabilite. Une FK laisserait
+    // croire le contraire, et rendrait tentant de l'additionner quelque part.
+    // Borne haute = `closedAt` s'il existe (une session deja close doit rendre le MEME
+    // rapport a chaque relecture) ; sinon aucune, rien n'est consomme dans le futur.
+    const redeemedCards = await tx.giftCard.findMany({
+      where: {
+        tenantId,
+        redeemedAt: session.closedAt
+          ? { gte: session.openedAt, lte: session.closedAt }
+          : { gte: session.openedAt },
+      },
+      select: { amountXpf: true },
+    });
+    const gc = summarizeRedeemedGiftCards(redeemedCards);
+
     const buildReport = (counted: bigint, variance: bigint): ZReport => ({
       sessionId: session.id,
       openingFloatXpf: Number(session.openingFloatXpf),
@@ -146,6 +185,10 @@ export async function closeSession(
       refundsXpf: Number(mv.refundsXpf),
       cashOutXpf: Number(mv.cashOutXpf),
       cashInXpf: Number(mv.cashInXpf),
+      // Informatifs, et volontairement absents de `expectedXpf` comme de `totalSalesXpf`
+      // (les deux lignes ci-dessus, `expected` et `totalSales`, ne les ont jamais vus).
+      giftCardRedeemedCount: gc.giftCardRedeemedCount,
+      giftCardRedeemedXpf: Number(gc.giftCardRedeemedXpf),
     });
 
     if (session.status === "CLOSED") {
@@ -285,6 +328,22 @@ export type PaymentInput = {
   tenderedXpf?: bigint; // remis par le client (espèces) → sert au rendu monnaie
 };
 
+/**
+ * Options d'encaissement. TOUT y est facultatif, et ce paramètre l'est lui-même : un appel
+ * `checkoutSale(tenantId, saleId, payments)` se comporte exactement comme avant PC-0064.
+ */
+export type CheckoutOptions = {
+  /**
+   * Bons cadeaux à faire naître DANS la transaction du passage à PAID.
+   *
+   * Un bon cadeau est une PRESTATION VENDUE À L'AVANCE : son achat est le jumeau d'une vente
+   * au comptoir (argent encaissé, Z qui le compte, facture au nom de l'acheteur). Il n'y a
+   * donc pas de chemin d'encaissement parallèle — c'est ce même `checkoutSale`, avec ce
+   * champ en plus.
+   */
+  giftCards?: GiftCardInput[];
+};
+
 export type CheckoutResult = {
   ok: true;
   saleId: string;
@@ -299,6 +358,20 @@ export type CheckoutResult = {
   syncPending: boolean; // true = Compta/Stock pas encore convergés (reprise auto par cron/repair)
   syncError: string | null; // dernière erreur de synchro (trace exploitable)
   alreadyPaid: boolean;
+  // Bons cadeaux nés de CETTE vente (PC-0064). ABSENT du résultat quand il n'y en a pas — et
+  // c'est délibéré : les surfaces qui n'émettent pas de bons (V-Cut, Ellément) reçoivent une
+  // réponse rigoureusement identique à celle d'avant ce chantier, au champ près.
+  giftCards?: GiftCardIssued[];
+};
+
+/** Un bon tel que la surface a besoin de le voir pour l'imprimer ou l'afficher. */
+export type GiftCardIssued = {
+  id: string;
+  code: string;
+  amountXpf: number;
+  serviceLabel: string | null;
+  expiresAt: string | null;
+  beneficiaryName: string | null;
 };
 
 export type CheckoutError =
@@ -309,7 +382,12 @@ export type CheckoutError =
   // Excédent sur une méthode qui ne rend pas la monnaie (carte/virement/chèque) : c'est
   // une saisie fausse, pas un rendu. Les espèces en trop, elles, ne sont JAMAIS une
   // erreur — le moteur impute le dû et rend la différence.
-  | { ok: false; error: "OVERPAID"; method: string; excessXpf: number; totalXpf: number };
+  | { ok: false; error: "OVERPAID"; method: string; excessXpf: number; totalXpf: number }
+  // Bons cadeaux (PC-0064) : les DEUX refus tombent AVANT que le moindre franc soit acté.
+  // C'est la seule place tenable — un bon refusé après l'encaissement laisserait une vente
+  // payée sans le bon qu'elle a vendu, c'est-à-dire de l'argent pris pour rien.
+  | { ok: false; error: "GIFT_CARD_INVALID"; reason: GiftCardRefusal | "DUPLICATE_CODE"; index: number }
+  | { ok: false; error: "GIFT_CARD_CODE_TAKEN"; code: string };
 
 // ─── Synchronisation Compta/Stock (moteur lib/sync.ts branché sur Prisma) ───
 
@@ -440,11 +518,26 @@ export async function checkoutSale(
   tenantId: string,
   saleId: string,
   payments: PaymentInput[],
+  options?: CheckoutOptions,
 ): Promise<CheckoutResult | CheckoutError> {
   // 1. Charger le ticket + lignes + paiements déjà enregistrés
   const sale = await getSale(tenantId, saleId);
   if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
   if (sale.status === "VOID") return { ok: false, error: "ALREADY_VOID" };
+
+  // ── Bons cadeaux : validation de FORME, avant tout le reste ────────────────────────────
+  // Un panier absent ou vide laisse ce bloc entièrement inerte : `giftCardsToIssue` reste
+  // vide et pas une seule requête n'est faite. C'est ce qui garantit aux surfaces qui
+  // n'émettent pas de bons un comportement rigoureusement inchangé.
+  const giftCardInputs = options?.giftCards ?? [];
+  let giftCardsToIssue: GiftCardData[] = [];
+  if (giftCardInputs.length > 0) {
+    const validated = validateGiftCards(giftCardInputs);
+    if (!validated.ok) {
+      return { ok: false, error: "GIFT_CARD_INVALID", reason: validated.error, index: validated.index };
+    }
+    giftCardsToIssue = validated.data;
+  }
 
   const compta = comptaClient();
 
@@ -476,6 +569,21 @@ export async function checkoutSale(
   // Paiements : soit fournis maintenant, soit déjà persistés (rejeu). On persiste ceux fournis d'abord.
   if ((!payments || payments.length === 0) && sale.payments.length === 0) {
     return { ok: false, error: "NO_PAYMENT" };
+  }
+
+  // ── Bons cadeaux : le code est-il libre ? ──────────────────────────────────────────────
+  // Cette lecture est faite AVANT de persister le moindre paiement, et elle n'est pas
+  // redondante avec l'index unique : l'index protège la base, ce contrôle protège la
+  // CLIENTE. Sans lui, un code déjà pris ferait échouer la transaction du passage à PAID
+  // APRÈS que les paiements sont enregistrés — l'argent serait pris et la vente resterait
+  // en attente. L'index reste le dernier mot (deux comptoirs à la même seconde) ; il ne
+  // devrait jamais avoir à parler.
+  if (giftCardsToIssue.length > 0) {
+    const codes = giftCardsToIssue.map((g) => g.code);
+    const taken = await withTenant(tenantId, (tx) =>
+      tx.giftCard.findFirst({ where: { tenantId, code: { in: codes } }, select: { code: true } }),
+    );
+    if (taken) return { ok: false, error: "GIFT_CARD_CODE_TAKEN", code: taken.code };
   }
 
   // « J'encaisse, puis je rends » : c'est LE moteur qui impute, pas l'appelant. On ne
@@ -535,13 +643,55 @@ export async function checkoutSale(
   }))));
 
   // 2. ENCAISSEMENT ACTÉ : le ticket passe PAID AVANT la synchro (l'argent est dans le tiroir).
-  await withTenant(tenantId, (tx) =>
-    tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: new Date() } }),
-  );
+  //
+  // 🔴 LES BONS NAISSENT ICI, DANS LA MÊME TRANSACTION QUE LE PASSAGE À PAID. Il n'existe
+  //    donc AUCUNE fenêtre entre « l'argent est pris » et « le bon existe » : soit les deux,
+  //    soit ni l'un ni l'autre. Un bon créé après coup, dans un second appel, c'est la
+  //    cliente qui repart les mains vides parce qu'un réseau a coupé entre deux requêtes.
+  //    ⚠️ Ne PAS déplacer ces créations hors de ce `withTenant`, et ne PAS leur donner un
+  //    `skipDuplicates` : perdre silencieusement un bon vendu serait pire que l'échec.
+  const issued = await withTenant(tenantId, async (tx) => {
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: new Date() } });
+    if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
+    const rows: GiftCardIssued[] = [];
+    for (const g of giftCardsToIssue) {
+      const row = await tx.giftCard.create({
+        data: { tenantId, saleId, ...g },
+        select: { id: true, code: true, amountXpf: true, serviceLabel: true, expiresAt: true, beneficiaryName: true },
+      });
+      rows.push({
+        id: row.id,
+        code: row.code,
+        amountXpf: Number(row.amountXpf),
+        serviceLabel: row.serviceLabel,
+        expiresAt: row.expiresAt ? row.expiresAt.toISOString() : null,
+        beneficiaryName: row.beneficiaryName,
+      });
+    }
+    return rows;
+  });
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
   const reloaded = await getSale(tenantId, saleId);
   const outcome = await syncLoadedSale(reloaded!);
+
+  // Numéro de la facture d'ACHAT (au nom de l'acheteur) reporté sur les bons : simple
+  // annotation de rapprochement, faite APRÈS la synchro parce que le numéro n'existe pas
+  // avant. BEST-EFFORT ASSUMÉ : un échec ici ne remet en cause ni l'encaissement ni les
+  // bons, qui sont déjà l'un et l'autre acquis. Un bon sans numéro de facture reste un bon
+  // parfaitement valable — il est juste moins commode à rapprocher.
+  if (issued.length > 0 && outcome.invoiceNumber) {
+    try {
+      await withTenant(tenantId, (tx) =>
+        tx.giftCard.updateMany({
+          where: { tenantId, id: { in: issued.map((g) => g.id) } },
+          data: { invoiceNumber: outcome.invoiceNumber },
+        }),
+      );
+    } catch (e) {
+      log.error("giftCard.invoiceNumber", e, { saleId, count: issued.length });
+    }
+  }
 
   return {
     ok: true,
@@ -557,6 +707,8 @@ export async function checkoutSale(
     syncPending: !outcome.synced,
     syncError: outcome.failure ? `${outcome.failure.core}:${outcome.failure.op} ${outcome.failure.detail}` : null,
     alreadyPaid: false,
+    // Absent quand il n'y a pas de bon : réponse inchangée pour les surfaces qui n'en émettent pas.
+    ...(issued.length > 0 ? { giftCards: issued } : {}),
   };
 }
 
@@ -683,4 +835,274 @@ export async function listCashMovements(tenantId: string, sessionId: string) {
       orderBy: { createdAt: "asc" },
     }),
   );
+}
+
+// ─── Bons cadeaux (PC-0064) ──────────────────────────────────────────────────
+//
+// 🔒 RAPPEL DE L'INVARIANT, parce que c'est ici qu'on serait tenté de l'oublier :
+//    LE MONTANT D'UN BON ENTRE DANS LE CA UNE SEULE FOIS, LE JOUR DE SON ACHAT.
+//    L'achat passe par `checkoutSale` (au-dessus). La CONSOMMATION, elle, n'écrit
+//    RIEN d'autre que la date sur le bon : pas de Sale, pas de SalePayment, pas de
+//    CashMovement, pas de facture. Si un jour une de ces trois écritures apparaît
+//    dans `redeemGiftCard`, l'argent du salon est compté deux fois.
+
+/** Un bon tel que le lit une surface. Montants en `number` (le JSON ne porte pas de BigInt). */
+export type GiftCardView = {
+  id: string;
+  code: string;
+  amountXpf: number;
+  serviceLabel: string | null;
+  serviceId: string | null;
+  buyerName: string | null;
+  beneficiaryName: string | null;
+  beneficiaryPhone: string | null;
+  beneficiaryEmail: string | null;
+  issuedAt: string;
+  expiresAt: string | null;
+  saleId: string | null;
+  invoiceNumber: string | null;
+  redeemedAt: string | null;
+  redeemedByName: string | null;
+  redeemedForXpf: number | null;
+  cancelledAt: string | null;
+  cancelReason: string | null;
+};
+
+type GiftCardRow = {
+  id: string;
+  code: string;
+  amountXpf: bigint;
+  serviceLabel: string | null;
+  serviceId: string | null;
+  buyerName: string | null;
+  beneficiaryName: string | null;
+  beneficiaryPhone: string | null;
+  beneficiaryEmail: string | null;
+  issuedAt: Date;
+  expiresAt: Date | null;
+  saleId: string | null;
+  invoiceNumber: string | null;
+  redeemedAt: Date | null;
+  redeemedByName: string | null;
+  redeemedForXpf: bigint | null;
+  cancelledAt: Date | null;
+  cancelReason: string | null;
+};
+
+const GIFT_CARD_SELECT = {
+  id: true,
+  code: true,
+  amountXpf: true,
+  serviceLabel: true,
+  serviceId: true,
+  buyerName: true,
+  beneficiaryName: true,
+  beneficiaryPhone: true,
+  beneficiaryEmail: true,
+  issuedAt: true,
+  expiresAt: true,
+  saleId: true,
+  invoiceNumber: true,
+  redeemedAt: true,
+  redeemedByName: true,
+  redeemedForXpf: true,
+  cancelledAt: true,
+  cancelReason: true,
+} as const;
+
+/**
+ * ⚠️ AUCUN statut n'est calculé ici, et c'est voulu : « expiré » se DÉRIVE à la lecture, par
+ * `giftCardStatus` (lib/gift-card.ts), à partir de `expiresAt`. Un statut renvoyé par le moteur
+ * serait figé à l'instant de la requête, donc faux la minute d'après.
+ */
+function toGiftCardView(row: GiftCardRow): GiftCardView {
+  return {
+    id: row.id,
+    code: row.code,
+    amountXpf: Number(row.amountXpf),
+    serviceLabel: row.serviceLabel,
+    serviceId: row.serviceId,
+    buyerName: row.buyerName,
+    beneficiaryName: row.beneficiaryName,
+    beneficiaryPhone: row.beneficiaryPhone,
+    beneficiaryEmail: row.beneficiaryEmail,
+    issuedAt: row.issuedAt.toISOString(),
+    expiresAt: row.expiresAt ? row.expiresAt.toISOString() : null,
+    saleId: row.saleId,
+    invoiceNumber: row.invoiceNumber,
+    redeemedAt: row.redeemedAt ? row.redeemedAt.toISOString() : null,
+    redeemedByName: row.redeemedByName,
+    redeemedForXpf: row.redeemedForXpf === null ? null : Number(row.redeemedForXpf),
+    cancelledAt: row.cancelledAt ? row.cancelledAt.toISOString() : null,
+    cancelReason: row.cancelReason,
+  };
+}
+
+/**
+ * Liste les bons d'un marchand. `code` fourni → recherche exacte sur le code NORMALISÉ (majuscules,
+ * sans séparateur) : « bc 4k7q-p2 » retrouve « BC4K7QP2 », parce qu'un code se recopie à la main.
+ * La limite est bornée côté route.
+ */
+export async function listGiftCards(
+  tenantId: string,
+  filter: { code?: string; take?: number } = {},
+): Promise<GiftCardView[]> {
+  const take = Math.min(Math.max(filter.take ?? 200, 1), 500);
+  const rows = await withTenant(tenantId, (tx) =>
+    tx.giftCard.findMany({
+      where: { tenantId, ...(filter.code ? { code: filter.code } : {}) },
+      orderBy: { issuedAt: "desc" },
+      take,
+      select: GIFT_CARD_SELECT,
+    }),
+  );
+  return rows.map(toGiftCardView);
+}
+
+/**
+ * Fait naître un bon SANS ENCAISSEMENT — geste commercial, remplacement d'un bon papier abîmé,
+ * reprise d'un historique.
+ *
+ * ⚠️ CE N'EST PAS LE CHEMIN D'ACHAT. Un bon acheté naît dans la transaction du passage à PAID de
+ * `checkoutSale` (champ `options.giftCards`), pour qu'il n'existe aucune fenêtre entre « l'argent
+ * est pris » et « le bon existe ». Ici, rien n'est encaissé : `saleId` et `invoiceNumber` restent
+ * vides, aucune écriture comptable n'est faite, et le montant du bon n'entre dans AUCUN chiffre
+ * d'affaires — ce qui est juste, puisque personne ne l'a payé.
+ */
+export async function createGiftCardWithoutSale(
+  tenantId: string,
+  input: GiftCardInput,
+): Promise<{ ok: true; card: GiftCardView } | { ok: false; error: GiftCardRefusal | "CODE_TAKEN" }> {
+  const validated = validateGiftCard(input);
+  if (!validated.ok) return { ok: false, error: validated.error };
+  try {
+    const row = await withTenant(tenantId, (tx) =>
+      tx.giftCard.create({ data: { tenantId, ...validated.data }, select: GIFT_CARD_SELECT }),
+    );
+    return { ok: true, card: toGiftCardView(row) };
+  } catch (e) {
+    // P2002 = violation de @@unique(tenantId, code). L'unicité est garantie EN BASE : deux
+    // créations simultanées du même code ne peuvent pas passer toutes les deux.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      return { ok: false, error: "CODE_TAKEN" };
+    }
+    throw e;
+  }
+}
+
+export type RedeemGiftCardInput = {
+  redeemedBy?: string | null;
+  redeemedByName?: string | null;
+  redeemedForXpf?: bigint | null;
+};
+
+export type RedeemGiftCardResult =
+  | { ok: true; card: GiftCardView }
+  | { ok: false; error: GiftCardRedeemRefusal };
+
+/**
+ * CONSOMME un bon. C'est la seule opération de ce module qui doive être irréprochable en base.
+ *
+ * 🔴 UN SEUL `UPDATE`, CONDITIONNÉ. La condition `redeemedAt: null` est DANS la clause `WHERE`
+ *    de l'ordre SQL, pas dans un `if` applicatif : `updateMany` produit
+ *        UPDATE "GiftCard" SET "redeemedAt" = … WHERE … AND "redeemedAt" IS NULL
+ *    et PostgreSQL sérialise les écritures concurrentes sur une même ligne. Deux comptoirs qui
+ *    scannent le même bon à la même seconde : le premier affecte 1 ligne, le second en affecte 0.
+ *
+ * ⛔ CE QU'IL NE FAUT JAMAIS FAIRE ICI : un `findFirst` pour vérifier que le bon est libre, puis
+ *    un `update`. Entre les deux lectures il y a un intervalle, et dans cet intervalle le bon
+ *    part deux fois — c'est-à-dire deux prestations rendues pour un seul encaissement. La forme
+ *    « lire puis écrire » est exactement le bug que cette fonction existe pour ne pas avoir.
+ *
+ * La relecture ci-dessous n'intervient qu'APRÈS un échec, et uniquement pour NOMMER le refus
+ * (introuvable ? annulé ? déjà consommé ?). Elle ne décide de rien : la décision est déjà prise,
+ * par la base, au moment où elle a répondu « 0 ligne ».
+ *
+ * 🔒 ET SURTOUT : aucune écriture comptable. Pas de vente, pas de paiement, pas de mouvement de
+ *    tiroir, pas de facture. Les francs de ce bon sont entrés dans le CA le jour de son achat.
+ */
+export async function redeemGiftCard(
+  tenantId: string,
+  giftCardId: string,
+  input: RedeemGiftCardInput = {},
+): Promise<RedeemGiftCardResult> {
+  return withTenant(tenantId, async (tx) => {
+    const { count } = await tx.giftCard.updateMany({
+      where: { id: giftCardId, tenantId, redeemedAt: null, cancelledAt: null },
+      data: {
+        redeemedAt: new Date(),
+        redeemedBy: input.redeemedBy ?? null,
+        redeemedByName: input.redeemedByName ?? null,
+        redeemedForXpf: input.redeemedForXpf ?? null,
+      },
+    });
+
+    if (count === 0) {
+      // La base a tranché. On relit seulement pour DIRE POURQUOI — au comptoir, « refusé » sans
+      // motif est inutilisable : l'employée doit pouvoir répondre à la cliente qui est en face.
+      const existing = await tx.giftCard.findFirst({
+        where: { id: giftCardId, tenantId },
+        select: { redeemedAt: true, cancelledAt: true },
+      });
+      if (!existing) return { ok: false as const, error: "NOT_FOUND" as const };
+      if (existing.cancelledAt) return { ok: false as const, error: "CANCELLED" as const };
+      return { ok: false as const, error: "ALREADY_REDEEMED" as const };
+    }
+
+    const card = await tx.giftCard.findFirstOrThrow({
+      where: { id: giftCardId, tenantId },
+      select: GIFT_CARD_SELECT,
+    });
+    return { ok: true as const, card: toGiftCardView(card) };
+  });
+}
+
+export type CancelGiftCardResult =
+  | { ok: true; card: GiftCardView }
+  | { ok: false; error: GiftCardCancelRefusal };
+
+/**
+ * ANNULE un bon. Réservé à l'ADMIN — le contrôle du droit est à la charge de la surface, comme
+ * pour toutes les routes S2S de ce moteur (le moteur ne connaît ni rôles ni sessions).
+ *
+ * Même forme atomique que la consommation, et pour la même raison : un bon DÉJÀ CONSOMMÉ ne
+ * s'annule pas. Sans la condition `redeemedAt IS NULL` dans le `WHERE`, une annulation lancée
+ * pendant qu'une consommation aboutit effacerait la trace de la prestation rendue.
+ *
+ * ⚠️ Annuler ne rembourse RIEN et n'écrit AUCUNE comptabilité. L'argent du bon est entré dans le
+ *    CA le jour de l'achat ; s'il doit ressortir, c'est un avoir — une décision du commerce, une
+ *    autre pièce, un autre geste.
+ */
+export async function cancelGiftCard(
+  tenantId: string,
+  giftCardId: string,
+  input: { reason?: string | null; cancelledBy?: string | null; cancelledByName?: string | null } = {},
+): Promise<CancelGiftCardResult> {
+  return withTenant(tenantId, async (tx) => {
+    const { count } = await tx.giftCard.updateMany({
+      where: { id: giftCardId, tenantId, redeemedAt: null, cancelledAt: null },
+      data: {
+        cancelledAt: new Date(),
+        cancelReason: input.reason ?? null,
+        cancelledBy: input.cancelledBy ?? null,
+        cancelledByName: input.cancelledByName ?? null,
+      },
+    });
+
+    if (count === 0) {
+      const existing = await tx.giftCard.findFirst({
+        where: { id: giftCardId, tenantId },
+        select: { redeemedAt: true, cancelledAt: true },
+      });
+      if (!existing) return { ok: false as const, error: "NOT_FOUND" as const };
+      if (existing.redeemedAt) return { ok: false as const, error: "ALREADY_REDEEMED" as const };
+      return { ok: false as const, error: "ALREADY_CANCELLED" as const };
+    }
+
+    const card = await tx.giftCard.findFirstOrThrow({
+      where: { id: giftCardId, tenantId },
+      select: GIFT_CARD_SELECT,
+    });
+    return { ok: true as const, card: toGiftCardView(card) };
+  });
 }
