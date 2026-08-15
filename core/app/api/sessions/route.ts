@@ -7,15 +7,16 @@ import { xpf } from "@/lib/serialize";
 /**
  * POST /api/sessions
  * Ouvre une session de caisse (S2S, X-Core-Key) avec un fond de caisse (espèces).
- * Une seule session OPEN à la fois par tenant.
+ * Une seule session OPEN à la fois PAR POSTE — par tenant si `posteId` est omis,
+ * ce qui est le comportement d'origine des marchands mono-caisse.
  *
- * Body : { tenantId, openedBy, openingFloatXpf?, note? }
+ * Body : { tenantId, openedBy, openingFloatXpf?, note?, posteId? }
  * Réponse 200 : { ok, session } · 409 { ok:false, error:"SESSION_ALREADY_OPEN", sessionId }
  */
 export async function POST(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  let body: { tenantId?: string; openedBy?: string; openedByName?: string; openingFloatXpf?: number; note?: string };
+  let body: { tenantId?: string; openedBy?: string; openedByName?: string; openingFloatXpf?: number; note?: string; posteId?: string };
   try {
     body = await req.json();
   } catch {
@@ -32,6 +33,7 @@ export async function POST(req: NextRequest) {
     openedByName: body.openedByName?.trim() || undefined,
     openingFloatXpf: BigInt(Math.round(body.openingFloatXpf ?? 0)),
     note: body.note,
+    posteId: body.posteId?.trim() || null,
   });
 
   if (!result.ok) return NextResponse.json(result, { status: 409 });

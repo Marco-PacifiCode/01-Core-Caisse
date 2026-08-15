@@ -66,6 +66,18 @@ model CashSession {
   varianceXpf      BigInt? // écart = compté - attendu (négatif = manquant, positif = excédent)
   note             String?
   status           SessionStatus @default(OPEN)
+  // Poste (caisse physique) qui tient cette session. NULL = marchand
+  // mono-caisse : c'est le cas des trois marchands d'origine, et leur
+  // comportement est inchangé.
+  // Ajouté le 2026-08-15 pour la Rôtisserie de Pouembout, qui a DEUX comptoirs
+  // hors ligne. `String` et non une relation : l'identifiant est tiré par la
+  // tablette elle-même, sans réseau, donc le serveur ne le connaît pas d'avance.
+  //
+  // ⚠️ L'unicité « une seule session OUVERTE par poste » est garantie en BASE
+  // par l'index partiel `uniq_session_open_par_poste`
+  // (prisma/manual/2026-08-15_postes_de_caisse.sql) — Prisma ne sait pas
+  // modéliser un index partiel, il n'apparaît donc pas ici.
+  posteId          String?
 
   sales     Sale[]
   movements CashMovement[]
@@ -73,6 +85,7 @@ model CashSession {
   @@index([tenantId])
   @@index([tenantId, status])
   @@index([tenantId, openedAt])
+  @@index([tenantId, posteId])
 }
 
 // Ticket de vente (panier au comptoir).
@@ -89,6 +102,9 @@ model Sale {
   // Lien source externe optionnel (ex : RDV honoré) — souple, sans FK.
   sourceType  String?
   sourceId    String?
+  // Poste ayant émis la vente. NULL = marchand mono-caisse (comportement
+  // d'origine, inchangé). Ajouté le 2026-08-15 : voir CashSession.posteId.
+  posteId     String?
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
@@ -110,6 +126,7 @@ model Sale {
   @@index([tenantId, status])
   @@index([tenantId, sessionId])
   @@index([tenantId, createdAt])
+  @@index([tenantId, posteId])
 }
 
 // Ligne de ticket.

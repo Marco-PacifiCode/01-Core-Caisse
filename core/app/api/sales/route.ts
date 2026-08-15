@@ -14,8 +14,13 @@ const VALID_KINDS: LineKind[] = ["SERVICE", "PRODUCT", "OTHER"];
  * (sourceType, sourceId) quand fournis.
  *
  * Body : { tenantId, cashierId?, sessionId?, clientName?, sourceType?, sourceId?,
+ *          posteId?, occurredAt?,
  *          lines: { kind, label, productId?, qty, unitXpf }[] }
  *   unitXpf : XPF entier (number).  productId : requis si kind=PRODUCT.
+ *   posteId : caisse physique émettrice. Omis = marchand mono-caisse.
+ *   occurredAt : date ISO de la vente RÉELLE, pour une remontée différée
+ *     (caisse hors ligne). Omis = maintenant. Une date future donne 400
+ *     FUTURE_DATE — elle ne peut venir que d'une tablette mal réglée.
  *
  * Réponse 200 : { ok, saleId, totalXpf, alreadyExisted }
  */
@@ -29,6 +34,8 @@ export async function POST(req: NextRequest) {
     clientName?: string;
     sourceType?: string;
     sourceId?: string;
+    posteId?: string;
+    occurredAt?: string;
     lines?: { kind?: string; label?: string; productId?: string; qty?: number; unitXpf?: number }[];
   };
   try {
@@ -59,12 +66,25 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // Date fournie : on refuse ce qui n'est pas une date lisible plutôt que de
+  // laisser passer un `Invalid Date` qui deviendrait silencieusement « maintenant ».
+  let occurredAt: Date | null = null;
+  if (body.occurredAt) {
+    const d = new Date(body.occurredAt);
+    if (Number.isNaN(d.getTime())) {
+      return NextResponse.json({ error: "occurredAt : date ISO invalide" }, { status: 400 });
+    }
+    occurredAt = d;
+  }
+
   const result = await createSale(tenantId, {
     cashierId: body.cashierId,
     sessionId: body.sessionId ?? null,
     clientName: body.clientName ?? null,
     sourceType: body.sourceType ?? null,
     sourceId: body.sourceId ?? null,
+    posteId: body.posteId?.trim() || null,
+    occurredAt,
     lines: parsed,
   });
 
