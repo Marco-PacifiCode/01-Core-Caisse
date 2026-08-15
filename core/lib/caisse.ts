@@ -48,33 +48,69 @@ export { CAISSE_SOURCE_TYPE } from "./sync";
 
 export async function openSession(
   tenantId: string,
-  input: { openedBy: string; openedByName?: string; openingFloatXpf: bigint; note?: string },
+  input: {
+    openedBy: string;
+    openedByName?: string;
+    openingFloatXpf: bigint;
+    note?: string;
+    /** Poste (caisse physique) qui ouvre. Omis = marchand mono-caisse :
+     *  comportement d'origine, une seule session ouverte pour tout le tenant. */
+    posteId?: string | null;
+  },
 ) {
+  const posteId = input.posteId ?? null;
   return withTenant(tenantId, async (tx) => {
-    // Une seule session OPEN à la fois par tenant (garde métier simple).
+    // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
+    // règle reste identique à avant : une seule pour le marchand.
     const existing = await tx.cashSession.findFirst({
-      where: { tenantId, status: "OPEN" },
+      where: { tenantId, status: "OPEN", posteId },
       select: { id: true },
     });
     if (existing) return { ok: false as const, error: "SESSION_ALREADY_OPEN" as const, sessionId: existing.id };
 
-    const session = await tx.cashSession.create({
-      data: {
-        tenantId,
-        openedBy: input.openedBy,
-        openedByName: input.openedByName ?? null,
-        openingFloatXpf: input.openingFloatXpf,
-        note: input.note ?? null,
-      },
-    });
-    return { ok: true as const, session };
+    try {
+      const session = await tx.cashSession.create({
+        data: {
+          tenantId,
+          openedBy: input.openedBy,
+          openedByName: input.openedByName ?? null,
+          openingFloatXpf: input.openingFloatXpf,
+          note: input.note ?? null,
+          posteId,
+        },
+      });
+      return { ok: true as const, session };
+    } catch (e) {
+      // Course sur `uniq_session_open_par_poste` : deux ouvertures simultanées
+      // du même poste passent toutes deux le findFirst ci-dessus, et c'est la
+      // base qui tranche. On retombe sur la session gagnante au lieu de
+      // remonter une erreur technique au comptoir.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+        const gagnante = await tx.cashSession.findFirst({
+          where: { tenantId, status: "OPEN", posteId },
+          select: { id: true },
+        });
+        if (gagnante) {
+          return { ok: false as const, error: "SESSION_ALREADY_OPEN" as const, sessionId: gagnante.id };
+        }
+      }
+      throw e;
+    }
   });
 }
 
 /** Session OPEN courante du tenant (ou null). */
-export async function currentSession(tenantId: string) {
+export async function currentSession(tenantId: string, posteId?: string | null) {
+  // Sans poste précisé, on cherche la session SANS poste (`posteId: null`) et
+  // non « n'importe laquelle » : sur un marchand multi-postes, rendre la
+  // session d'un autre comptoir ferait rattacher des ventes au mauvais tiroir.
+  // Pour les marchands mono-caisse, dont les sessions ont `posteId = NULL`, le
+  // résultat est exactement celui d'avant.
   return withTenant(tenantId, (tx) =>
-    tx.cashSession.findFirst({ where: { tenantId, status: "OPEN" }, orderBy: { openedAt: "desc" } }),
+    tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN", posteId: posteId ?? null },
+      orderBy: { openedAt: "desc" },
+    }),
   );
 }
 
@@ -235,6 +271,20 @@ export type CreateSaleInput = {
   lines: SaleLineInput[];
   sourceType?: string | null;
   sourceId?: string | null;
+  /** Poste ayant émis la vente. Omis = marchand mono-caisse (inchangé). */
+  posteId?: string | null;
+  /** Date RÉELLE de la vente, quand elle diffère de son enregistrement ici.
+   *
+   *  Indispensable aux caisses hors ligne : la Rôtisserie de Pouembout n'a pas
+   *  de réseau sur place et remonte ses ventes une fois par jour, parfois après
+   *  plusieurs jours d'oubli. Sans ce champ, `createdAt` prenait la date de la
+   *  SYNCHRONISATION — le chiffre d'affaires du jour et la ventilation de TGC
+   *  s'en trouvaient faussés.
+   *
+   *  Omis = maintenant, comme avant. Une date FUTURE est refusée : elle ne peut
+   *  venir que d'une tablette mal réglée, et daterait une vente d'un exercice
+   *  qui n'a pas commencé. */
+  occurredAt?: Date | null;
 };
 
 /**
@@ -245,10 +295,16 @@ export async function createSale(
   tenantId: string,
   input: CreateSaleInput,
 ): Promise<
-  | { ok: false; error: "EMPTY" | "PRODUCT_LINE_WITHOUT_PRODUCT" | "INVALID_QTY" }
+  | { ok: false; error: "EMPTY" | "PRODUCT_LINE_WITHOUT_PRODUCT" | "INVALID_QTY" | "FUTURE_DATE" }
   | { ok: true; saleId: string; totalXpf: number; alreadyExisted: boolean }
 > {
   if (!input.lines || input.lines.length === 0) return { ok: false, error: "EMPTY" };
+  // Une vente ne peut pas avoir eu lieu demain. Une minute de tolérance couvre
+  // le décalage d'horloge d'une tablette sans pour autant laisser passer une
+  // date manifestement fausse.
+  if (input.occurredAt && input.occurredAt.getTime() > Date.now() + 60_000) {
+    return { ok: false, error: "FUTURE_DATE" };
+  }
   for (const l of input.lines) {
     if (l.kind === "PRODUCT" && !l.productId) return { ok: false, error: "PRODUCT_LINE_WITHOUT_PRODUCT" };
     if (!Number.isFinite(l.qty) || Math.trunc(l.qty) <= 0) return { ok: false, error: "INVALID_QTY" };
@@ -286,6 +342,10 @@ export async function createSale(
           clientName: input.clientName ?? null,
           sourceType: input.sourceType ?? null,
           sourceId: input.sourceId ?? null,
+          posteId: input.posteId ?? null,
+          // Sans `occurredAt`, Prisma applique le @default(now()) du schéma :
+          // strictement le comportement d'avant.
+          ...(input.occurredAt ? { createdAt: input.occurredAt } : {}),
           subtotalXpf: total,
           totalXpf: total,
           lines: { create: linesData },
@@ -333,6 +393,13 @@ export type PaymentInput = {
  * `checkoutSale(tenantId, saleId, payments)` se comporte exactement comme avant PC-0064.
  */
 export type CheckoutOptions = {
+  /**
+   * Date RÉELLE de l'encaissement, quand elle diffère de son enregistrement.
+   * Pendant du `occurredAt` de `createSale` : une caisse hors ligne remonte des
+   * encaissements de la veille, et `paidAt` doit porter le moment où le client
+   * a payé — pas celui où la tablette a retrouvé du réseau. Omis = maintenant.
+   */
+  paidAt?: Date | null;
   /**
    * Bons cadeaux à faire naître DANS la transaction du passage à PAID.
    *
@@ -651,7 +718,20 @@ export async function checkoutSale(
   //    ⚠️ Ne PAS déplacer ces créations hors de ce `withTenant`, et ne PAS leur donner un
   //    `skipDuplicates` : perdre silencieusement un bon vendu serait pire que l'échec.
   const issued = await withTenant(tenantId, async (tx) => {
-    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: new Date() } });
+    // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
+    // Une date future est ignorée plutôt que refusée : le ticket est déjà
+    // encaissé au comptoir, on ne bloque pas sa remontée pour une horloge mal
+    // réglée — on retombe sur l'heure du serveur.
+    //
+    // ⚠️ Calculé AVANT, et l'update tient sur UNE ligne : un test structurel
+    // (gift-card-routes.test.ts) isole ce bloc entre « const issued = await
+    // withTenant » et la première fermeture « }); » pour prouver que le passage
+    // à PAID et la création des bons cadeaux sont dans la MÊME transaction. Un
+    // update multiligne introduit une fermeture intermédiaire qui tronque son
+    // extraction, et le test échoue sur du code pourtant correct.
+    const datePaiement =
+      options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement } });
     if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
     const rows: GiftCardIssued[] = [];
     for (const g of giftCardsToIssue) {

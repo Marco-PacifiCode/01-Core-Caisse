@@ -36,6 +36,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   let body: {
     tenantId?: string;
     payments?: { method?: string; amountXpf?: number; tenderedXpf?: number }[];
+    /** Date ISO de l'encaissement réel (remontée différée d'une caisse hors ligne). */
+    paidAt?: string;
     // OPTIONNEL, et c'est structurant : ce moteur est MUTUALISÉ entre marchands, et toutes les
     // surfaces n'émettent pas de bons cadeaux. Celles qui n'en émettent pas ne l'envoient pas,
     // ce bloc reste inerte, et leur requête comme leur réponse sont celles d'avant PC-0064, au
@@ -72,7 +74,23 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // la contourner. La route se contente de transmettre ; elle omet même la clé quand il n'y a
   // rien à transmettre, pour que l'appel soit à l'octet près celui d'avant PC-0064.
   const giftCards = Array.isArray(body.giftCards) && body.giftCards.length > 0 ? body.giftCards : undefined;
-  const result = await checkoutSale(tenantId, saleId, parsed, giftCards ? { giftCards } : undefined);
+
+  // `paidAt` : encaissement rejoué depuis une caisse hors ligne (2026-08-15).
+  // Une date illisible est refusée ici plutôt que transformée en « maintenant »
+  // sans le dire.
+  let paidAt: Date | undefined;
+  if (body.paidAt) {
+    const d = new Date(body.paidAt);
+    if (Number.isNaN(d.getTime())) {
+      return NextResponse.json({ error: "paidAt : date ISO invalide" }, { status: 400 });
+    }
+    paidAt = d;
+  }
+
+  // On n'ajoute la clé d'options QUE si elle porte quelque chose : sans
+  // `giftCards` ni `paidAt`, l'appel reste à l'octet près celui d'avant.
+  const options = giftCards || paidAt ? { ...(giftCards ? { giftCards } : {}), ...(paidAt ? { paidAt } : {}) } : undefined;
+  const result = await checkoutSale(tenantId, saleId, parsed, options);
 
   if (!result.ok) {
     const map: Record<string, number> = {
