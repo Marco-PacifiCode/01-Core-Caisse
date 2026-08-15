@@ -1,5 +1,55 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ 2026-08-15 — PLUSIEURS POSTES PAR MARCHAND + HORODATAGE FOURNI (`3e9cbcf`, PR #20)
+
+**Migration appliquée en production et code déployé.** Décision Marco : la **Rôtisserie de
+Pouembout** (première surface « snacking ») a **deux caisses et pas d'internet sur place**.
+Deux blocages rendaient le branchement impossible :
+
+1. Aucune notion de poste, et **une seule session ouverte par marchand** → deux comptoirs ne
+   pouvaient pas tenir chacun la sienne.
+2. **`createdAt`/`paidAt` posés par le serveur** → des ventes remontées le lendemain auraient
+   été datées du jour de la synchronisation, faussant le CA quotidien et la ventilation TGC.
+
+### Ce qui a changé — tout est ADDITIF
+
+| | Avant | Après |
+|---|---|---|
+| `CashSession.posteId`, `Sale.posteId` | — | `text` **nullable**. NULL = mono-caisse |
+| Unicité session ouverte | une par **tenant**, garde applicative | une par **(tenant, poste)**, garantie **en BASE** |
+| `createdAt` d'une vente | `@default(now())` | idem, **sauf si** `occurredAt` est fourni |
+| `paidAt` | `new Date()` en dur | idem, **sauf si** `paidAt` est fourni |
+
+🔑 **`COALESCE("posteId", '')` dans l'index unique partiel est indispensable** : dans un index
+unique, deux `NULL` sont **DISTINCTS**. Sans cette normalisation, un marchand mono-caisse
+aurait pu ouvrir plusieurs sessions — la règle actuelle aurait été **relâchée** au lieu d'être
+préservée.
+
+⚠️ **`currentSession(tenantId)` cherche désormais la session dont `posteId IS NULL`**, et non
+« n'importe quelle session ouverte ». Pour les trois marchands d'origine le résultat est
+identique ; sur un marchand multi-postes, rendre la session d'un autre comptoir rattacherait
+des ventes au mauvais tiroir.
+
+**Dates** : une vente datée dans le futur est refusée (`FUTURE_DATE`, 400) ; un `paidAt` futur
+est en revanche **ignoré** et retombe sur l'heure du serveur — le ticket est déjà encaissé au
+comptoir, on ne bloque pas sa remontée pour une horloge mal réglée.
+
+🕳️ **Piège à connaître avant de retoucher `checkoutSale`** : un test structurel
+(`gift-card-routes.test.ts`) isole le bloc du passage à `PAID` entre `const issued = await
+withTenant` et la **première** fermeture `});`, pour prouver son atomicité avec la création des
+bons cadeaux. L'`update` doit donc rester **sur une seule ligne** — un update multiligne
+introduit une fermeture intermédiaire qui tronque l'extraction, et le test échoue sur du code
+pourtant correct. La date est calculée avant, pour cette raison.
+
+**Vérifié** : 180 tests (169 d'origine + 11 sur la rétrocompatibilité), typecheck, migration
+posée avec **0 session ouverte** en base (donc aucun conflit d'index), `/api/health` →
+`rlsForced:true` et dépendances Compta/Stock `up`, et les trois marchands répondent après
+déploiement.
+
+**Reste à faire** côté rôtisserie : la surface n'envoie encore rien — le lot 4 (file d'attente
+locale et synchronisation différée) est à écrire. Voir
+`Rotisserie-Pouembout/AUDIT-ET-ROADMAP.md`.
+
 ## ✅ 2026-08-11 — BONS CADEAUX (PC-0064) : **MIGRATION APPLIQUÉE ET CODE EN PRODUCTION** (`986ee21`)
 
 > 🔒 **L'invariant du module, et il commande tout le reste :**
