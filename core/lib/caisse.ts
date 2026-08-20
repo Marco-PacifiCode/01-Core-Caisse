@@ -464,6 +464,7 @@ function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
   return {
     id: sale.id,
     tenantId: sale.tenantId,
+    sourceId: sale.sourceId,
     clientName: sale.clientName,
     cashierId: sale.cashierId,
     invoiceId: sale.invoiceId,

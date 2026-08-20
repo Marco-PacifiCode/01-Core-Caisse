@@ -1,5 +1,23 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🧾 LA FACTURE PORTE LA RÉFÉRENCE DU TICKET (2026-08-21) — NON DÉPLOYÉ
+
+Changement minuscule, sans lequel rien du circuit « qui a payé » ne fonctionne : `createInvoice` reçoit
+désormais **`ticketRef: sale.sourceId`** — l'identifiant tiré par la tablette.
+
+**Pourquoi `sourceId` ne suffisait pas** : la facture est créée avec `sourceId = sale.id` (l'uuid de la
+VENTE), tandis que le circuit de paiement ne connaît que le **ticket**. Les deux références existaient,
+elles ne se rencontraient nulle part. `SyncSaleSnapshot` porte donc `sourceId`, et le client Compta
+l'accepte.
+
+⚠️ **La caisse ne reçoit toujours AUCUN e-mail de client** — et ne doit pas en recevoir. C'est
+core_paiement qui dépose l'attribution chez Compta, de serveur à serveur.
+
+✅ `tsc` vert · **180 tests** ✔ (aucun cassé). ❌ Pas de test neuf sur ce passage — à écrire.
+
+🔗 **Ce lot ne vaut rien seul** — il va avec `01-Core-Paiement` (qui sait qui paie), `01-Core-Compta`
+(qui attribue) et `PacifiClic` (qui déclare). Les quatre se déploient ensemble, migrations d'abord.
+
 ## ✅ 2026-08-15 — PLUSIEURS POSTES PAR MARCHAND + HORODATAGE FOURNI (`3e9cbcf`, PR #20)
 
 **Migration appliquée en production et code déployé.** Décision Marco : la **Rôtisserie de

@@ -42,6 +42,9 @@ export type SyncPayment = {
 export type SyncSaleSnapshot = {
   id: string;
   tenantId: string;
+  /** Reference externe de la vente — pour une vente de comptoir, l'identifiant
+   *  du ticket tire par la tablette. Transmis a Compta pour l'attribution. */
+  sourceId: string | null;
   clientName: string | null;
   cashierId: string | null;
   invoiceId: string | null;
@@ -127,6 +130,7 @@ export async function runSaleSync(
           tenantId: sale.tenantId,
           sourceType: CAISSE_SOURCE_TYPE,
           sourceId: sale.id,
+          ticketRef: sale.sourceId,
           clientName: sale.clientName,
           lines: sale.lines.map((l) => ({ label: l.label, qty: l.qty, unitXpf: Number(l.unitXpf) })),
         });
