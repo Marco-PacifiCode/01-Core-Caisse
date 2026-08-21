@@ -40,6 +40,10 @@ export type CreateInvoiceInput = {
   tenantId: string;
   sourceType: string;
   sourceId: string;
+  /** Reference du TICKET d'origine (Sale.sourceId), distincte de `sourceId` qui
+   *  porte l'id de la VENTE. C'est par elle que Compta retrouve qui a paye :
+   *  c'est la seule reference partagee avec le circuit de paiement. */
+  ticketRef?: string | null;
   clientName?: string | null;
   lines: InvoiceLineInput[];
 };
@@ -165,6 +169,7 @@ const httpCompta: ComptaClient = {
       tenantId: input.tenantId,
       sourceType: input.sourceType,
       sourceId: input.sourceId,
+      ticketRef: input.ticketRef ?? undefined,
       clientName: input.clientName ?? undefined,
       lines: input.lines,
     });
