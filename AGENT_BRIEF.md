@@ -15,6 +15,11 @@ core_paiement qui dépose l'attribution chez Compta, de serveur à serveur.
 
 ✅ `tsc` vert · **180 tests** ✔ (aucun cassé). ❌ Pas de test neuf sur ce passage — à écrire.
 
+🚀 **EN PRODUCTION le 2026-08-21** — `ng-deploy core-caisse deploy claude/qui-a-paye`, PR **#21**
+(`0bcfb6e`), release `20260821-152725`, **WEB OK**. Aucune migration : ce lot ne touche pas le schéma.
+Livré **après** core_compta, qui devait savoir accepter `ticketRef` avant qu'on le lui envoie — l'ordre
+inverse n'aurait rien cassé (l'ancien code ignore un champ inconnu), mais n'aurait rien attribué non plus.
+
 🔗 **Ce lot ne vaut rien seul** — il va avec `01-Core-Paiement` (qui sait qui paie), `01-Core-Compta`
 (qui attribue) et `PacifiClic` (qui déclare). Les quatre se déploient ensemble, migrations d'abord.
 
