@@ -1,5 +1,33 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 📥 IMPORT DE CLÔTURE Z HORS LIGNE + TGC PAR LIGNE — ÉCRIT, **RIEN D'APPLIQUÉ** (2026-08-23)
+
+Branche `claude/import-z-et-tgc-ligne` (2 commits), poussée, **PR non ouverte, migration non
+jouée, aucun déploiement** — tâche d'exécution cadrée, pas de décision prise sur le périmètre.
+
+**Lot A — `POST /api/sessions/import`** : la Rôtisserie de Pouembout encaisse hors ligne, remonte
+ses ventes une fois par jour (`sessionId=null`) mais **archive son Z EN LOCAL** — il n'atteignait
+jamais ce moteur. Route **SÉPARÉE** du chemin vivant (`openSession`/`closeSession`, **intouchés**,
+qui servent Ellément/V-Cut/Onéiti en temps réel) : la tablette est la source de vérité, son Z est
+une **pièce déjà établie** qu'on importe telle quelle — pas de rattachement de ventes, pas de
+recalcul serveur. `varianceXpf` est **toujours** `closingCountedXpf − expectedXpf` recalculé
+serveur, **jamais** repris de l'appelant. Logique pure dans `lib/import-cloture.ts` (même schéma
+que `lib/void-sale.ts`) ; persistance idempotente `(tenantId, sourceType, sourceId)` dans
+`caisse.ts::importerCloture` (même schéma P2002/relecture qu'`openSession`).
+
+**Lot B — `tgcRatePpm` de ligne traverse jusqu'à Compta.** Il était jeté à 4 endroits (route
+`/api/sales`, `SaleLineInput`/`linesData`, `toSnapshot`/`SyncLine`, `runSaleSync`→
+`compta.createInvoice`/`InvoiceLineInput`) — Compta l'acceptait déjà côté producteur (Phase 2,
+vérifié en frais). Optionnel partout : absent ⇒ `undefined` (champ **absent** du JSON, jamais
+`0`, qui signifierait « hors champ TGC »). `contracts.test.ts` complété.
+
+**Migration additive** (à passer par Marco, non jouée) :
+`core/prisma/manual/2026-08-23_import_cloture_z.sql` — `CashSession.sourceType`/`sourceId` +
+index unique partiel `uniq_session_external_source`, `SaleLine.tgcRatePpm`.
+
+✅ **207 tests** (189 avant, **+18**) · `tsc --noEmit` vert · aucune régression sur les 3
+marchands en production (0 ligne existante touchée par le diff de code).
+
 ## 🚫 ANNULER UNE VENTE — `POST /api/sales/:id/void` (2026-08-22)
 
 🗣️ Demandé par Marco pour la Rôtisserie de Pouembout : une vente déjà remontée ne pouvait
