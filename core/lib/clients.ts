@@ -34,7 +34,15 @@ export function coreClientTargets(): { compta: string; stock: string; mocked: bo
 }
 
 // ─── Contrats (types) ────────────────────────────────────────────────────────
-export type InvoiceLineInput = { label: string; qty: number; unitXpf: number };
+export type InvoiceLineInput = {
+  label: string;
+  qty: number;
+  unitXpf: number;
+  /** Taux de TGC PROPRE à cette ligne (ppm), 2026-08-23 — vérifié en frais côté producteur
+   *  (01-Core-Compta/core/app/api/invoices/route.ts l.41,74-80 : optionnel, entier [0,1_000_000]).
+   *  Optionnel : absent = comportement inchangé côté Compta. */
+  tgcRatePpm?: number;
+};
 
 export type CreateInvoiceInput = {
   tenantId: string;

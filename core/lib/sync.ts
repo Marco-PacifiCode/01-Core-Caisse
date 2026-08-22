@@ -29,6 +29,10 @@ export type SyncLine = {
   productId: string | null;
   qty: number;
   unitXpf: bigint;
+  /** Taux de TGC PROPRE à cette ligne (ppm), 2026-08-23. Optionnel : `null`/absent → NE PAS
+   *  transmettre le champ à Compta (cf. l.135 plus bas) — jamais 0, qui signifierait « hors
+   *  champ TGC » côté Compta et n'est pas la même chose que « non renseigné ». */
+  tgcRatePpm?: number | null;
 };
 
 export type SyncPayment = {
@@ -132,7 +136,13 @@ export async function runSaleSync(
           sourceId: sale.id,
           ticketRef: sale.sourceId,
           clientName: sale.clientName,
-          lines: sale.lines.map((l) => ({ label: l.label, qty: l.qty, unitXpf: Number(l.unitXpf) })),
+          lines: sale.lines.map((l) => ({
+            label: l.label,
+            qty: l.qty,
+            unitXpf: Number(l.unitXpf),
+            // Omis quand non renseigné — PAS 0 (0 signifierait « hors champ TGC » côté Compta).
+            ...(l.tgcRatePpm !== undefined && l.tgcRatePpm !== null ? { tgcRatePpm: l.tgcRatePpm } : {}),
+          })),
         });
         invoiceId = inv.invoiceId;
         invoiceNumber = inv.number;
