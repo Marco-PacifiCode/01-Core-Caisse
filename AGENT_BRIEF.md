@@ -1,5 +1,51 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🗃️ IMPORTER UNE CLÔTURE Z + TAUX DE TGC PAR LIGNE (2026-08-22) — ✅ APPLIQUÉ ET EN PRODUCTION
+
+Migration `20260823090000_import_cloture_z` **appliquée le 2026-08-22** sur autorisation explicite de
+Marco, puis **PR #24 mergée et déployée** (release `20260822-193445`, healthcheck vert).
+
+**Route `POST /api/sessions/import`, SÉPARÉE du chemin vivant.** `openSession`/`closeSession`
+servent trois marchands en temps réel et **n'ont pas bougé d'une ligne** : l'import est un second
+chemin, isolé. C'est ce qui rend la non-régression structurelle plutôt que statistique.
+
+**Pourquoi importer plutôt que recalculer.** Les ventes de la Rôtisserie arrivent **sans session**
+(`sessionId` nul) — elles n'ont jamais transité par le parcours temps réel. Un Z ne peut donc pas
+être recalculé ici : il n'y a rien à quoi le rattacher. Ce qu'il apporte, et que les ventes ne
+donnent pas, c'est le **rapprochement de caisse** : fond, comptage du tiroir, écart.
+⚠️ **L'écart est RECALCULÉ**, jamais repris de l'appelant — un écart qu'on accepte tel quel n'est
+plus un contrôle. Les dates d'ouverture et de clôture, elles, sont **fournies** : sans elles une
+journée du 3 août archivée le 20 apparaîtrait au 20.
+
+**Le taux de TGC par ligne traverse enfin.** Il était **silencieusement jeté à quatre endroits**
+entre la route et l'appel à Compta ; les quatre sont ouverts. Optionnel partout : absent ⇒
+comportement inchangé (`undefined`, **pas** `0` — `0` signifie « hors champ TGC » côté Compta, ce
+qui n'est pas « non renseigné »).
+
+**Preuves AVANT / APRÈS** par `information_schema` (`prisma migrate status` ne fait pas foi) :
+
+| | AVANT | APRÈS |
+|---|---|---|
+| `CashSession.sourceType` / `sourceId` | absentes | **text** |
+| `SaleLine.tgcRatePpm` | absente | **integer** |
+| `uniq_session_external_source` | absent | **présent** |
+| propriétaires · RLS | `core_caisse_owner` · enable+force | **inchangés** |
+
+Appliquée en rôle `core_caisse_owner` (`superuser = f` vérifié avant), sauvegarde de structure dans
+`/home/deploy/_backup/migrations-20260822/`, enregistrée par `prisma migrate resolve --applied`,
+`rls.sql` rejoué.
+
+🔎 **Non-régression prouvée après coup** : `GET /api/sales` → **200** pour tous les tenants,
+V-Cut et Onéiti rendent bien leurs ventes (2 261 octets chacun). `POST /api/sales/<inconnu>/void`
+→ **404 SALE_NOT_FOUND**, la route d'annulation répond.
+
+🕳️ **À SAVOIR AVANT TOUTE SONDE SUR CE MOTEUR** : les valeurs du `.env` de Core-Caisse sont
+**entre guillemets** (celles de Core-Compta ne le sont pas). Une extraction
+`sed -n 's/^X=//p' .env` sans `| tr -d '\"'` rend une valeur inutilisable, et **tout échoue en
+silence** — y compris les témoins de contrôle. C'est ce qui m'a fait conclure une première fois que
+`Sale.posteId` n'existait pas, alors qu'elle est bien là. **Encadrez toujours une sonde d'un témoin
+positif ET d'un témoin négatif.**
+
 ## 📥 IMPORT DE CLÔTURE Z HORS LIGNE + TGC PAR LIGNE — ÉCRIT, **RIEN D'APPLIQUÉ** (2026-08-23)
 
 Branche `claude/import-z-et-tgc-ligne` (2 commits), poussée, **PR non ouverte, migration non
