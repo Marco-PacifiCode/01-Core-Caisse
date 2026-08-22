@@ -1,6 +1,37 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🧾 LA FACTURE PORTE LA RÉFÉRENCE DU TICKET (2026-08-21) — NON DÉPLOYÉ
+## 🚫 ANNULER UNE VENTE — `POST /api/sales/:id/void` (2026-08-22)
+
+🗣️ Demandé par Marco pour la Rôtisserie de Pouembout : une vente déjà remontée ne pouvait
+plus être annulée depuis aucune caisse. `voidSale` existait dans `lib/caisse.ts` depuis l'origine
+mais **n'était exposée nulle part** — du code mort — et elle **refuse une vente `PAID`**, donc
+justement le seul cas qui se pose en pratique.
+
+**Le geste comptable d'une vente payée n'est pas un statut, c'est un AVOIR.** La route émet donc
+un avoir côté Core-Compta (`POST /api/invoices/:id/credit-note`) **avant** de passer la vente à
+`VOID`. Trois propriétés à connaître :
+
+- 🛑 **Si l'avoir échoue, la vente NE PASSE PAS à `VOID`.** Une caisse qui dit « annulé »
+  pendant que la comptabilité encaisse encore est le pire des deux états. → `502
+  CREDIT_NOTE_FAILED`, et la vente reste telle quelle.
+- 🔁 **Rejouer est sûr.** L'avoir de Compta est idempotent par `(tenantId, "avoir", invoiceId)` :
+  si `markVoid` échouait après l'émission, un second appel récupère l'avoir déjà émis
+  (`alreadyExisted:true`, 200) puis termine le passage à `VOID`. Aucun état coincé.
+  *(Le `409 ALREADY_CREDIT_NOTE` de Compta ne concerne QUE la tentative d'avoir sur un avoir.)*
+- ⛔ **REFUS si du stock a été décrémenté** (ligne `PRODUCT` + `stockSyncedAt`) → `409
+  STOCK_DECREMENTED`, rien n'est touché. **Ce moteur est mutualisé** : remettre du stock est un
+  geste distinct qu'on ne devine pas ici, et un stock faux se paie plus cher qu'un refus. La
+  Rôtisserie n'est pas concernée (ses lignes sont `OTHER`, sans `productId`) ; V-Cut et Onéiti
+  le seraient.
+
+`DRAFT` → `VOID` direct, aucun appel externe. `VOID` → idempotent (`alreadyVoid:true`).
+La logique est **pure et sans DB** (`lib/void-sale.ts`, même schéma d'injection que `lib/sync.ts`) :
+c'est ce qui permet de tester « l'avoir échoue → la vente reste `PAID` » sans base.
+
+✅ **189 tests** (180 avant, **+9**) · `tsc --noEmit` vert · **aucune migration, aucun changement
+de schéma Prisma** — le déploiement est réversible par simple bascule de symlink.
+
+## 🧾 LA FACTURE PORTE LA RÉFÉRENCE DU TICKET (2026-08-21) — ✅ EN PRODUCTION
 
 Changement minuscule, sans lequel rien du circuit « qui a payé » ne fonctionne : `createInvoice` reçoit
 désormais **`ticketRef: sale.sourceId`** — l'identifiant tiré par la tablette.
