@@ -22,7 +22,7 @@ vérifié en frais). Optionnel partout : absent ⇒ `undefined` (champ **absent*
 `0`, qui signifierait « hors champ TGC »). `contracts.test.ts` complété.
 
 **Migration additive** (à passer par Marco, non jouée) :
-`core/prisma/manual/2026-08-23_import_cloture_z.sql` — `CashSession.sourceType`/`sourceId` +
+`core/prisma/migrations/20260823090000_import_cloture_z/migration.sql` — `CashSession.sourceType`/`sourceId` +
 index unique partiel `uniq_session_external_source`, `SaleLine.tgcRatePpm`.
 
 ✅ **207 tests** (189 avant, **+18**) · `tsc --noEmit` vert · aucune régression sur les 3

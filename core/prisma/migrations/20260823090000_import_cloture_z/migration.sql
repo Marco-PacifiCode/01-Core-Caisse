@@ -1,3 +1,17 @@
+-- ⚠️ PLACÉE DANS `prisma/migrations/` ET NON DANS `prisma/manual/`, contrairement
+-- à `2026-08-15_postes_de_caisse.sql` qui l'a précédée.
+--
+-- La convention `manual/` datait d'une époque où AUCUN chemin outillé n'existait
+-- pour appliquer une migration : on la jouait à la main, hors canal. Ce chemin
+-- existe depuis le 2026-08-05 — le geste `migrate` du canal ops (Actions > Ops)
+-- se connecte en rôle propriétaire, sauvegarde la structure, applique, rejoue
+-- `rls.sql` et PROUVE l'isolation. Or ce geste ne regarde QUE
+-- `prisma/migrations/` : une migration rangée dans `manual/` lui est invisible,
+-- et il refuse en disant « aucune migration en attente ».
+--
+-- Une migration qui ne peut pas emprunter le seul canal outillé finit par être
+-- appliquée hors de lui. D'où ce déplacement.
+
 -- 2026-08-23_import_cloture_z.sql — core_caisse — import d'une clôture Z déjà faite hors ligne
 --
 -- À PASSER PAR MARCO (le rôle runtime n'a pas le DDL) :
