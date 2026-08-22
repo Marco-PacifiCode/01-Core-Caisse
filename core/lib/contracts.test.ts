@@ -257,3 +257,40 @@ test("contrat Caisse : les réponses documentées de Compta/Stock sont correctem
   assert.equal(mv.qtyOnHand, 3);
   assert.equal(mv.alreadyExisted, false);
 });
+
+// ─── Test 4 : tgcRatePpm de LIGNE (2026-08-23) — optionnel, jamais 0 par défaut ────────────────
+//
+// Vérifié en frais côté producteur Compta (01-Core-Compta/core/app/api/invoices/route.ts l.41,
+// 74-80) : `lines[].tgcRatePpm` est optionnel, entier borné [0, 1_000_000] — Phase 2 déjà en
+// place côté Compta, ce test verrouille ce que la Caisse ÉMET.
+
+test("contrat Caisse→Compta : tgcRatePpm de ligne est optionnel — absent n'émet PAS le champ, présent l'émet exactement", async () => {
+  const comptaReqs: Captured[] = [];
+  const stockReqs: Captured[] = [];
+  const comptaPort = await startComptaCapture(comptaReqs);
+  const stockPort = await startStockCapture(stockReqs);
+  process.env.CORE_COMPTA_URL = `http://127.0.0.1:${comptaPort}`;
+  process.env.CORE_STOCK_URL = `http://127.0.0.1:${stockPort}`;
+
+  const sale = makeSale({
+    lines: [
+      { id: "l-svc", kind: "SERVICE", label: "Soin", productId: null, qty: 1, unitXpf: 5000n, tgcRatePpm: 90_000 },
+      // Pas de taux sur cette ligne — comportement d'origine, doit rester silencieux.
+      { id: "l-prd", kind: "PRODUCT", label: "Crème", productId: "prod-1", qty: 2, unitXpf: 1500n },
+    ],
+  });
+  await runSaleSync(sale, comptaClient(), stockClient(), noopPersist());
+
+  const invoiceReq = comptaReqs.find((c) => c.path === "/api/invoices");
+  assert.ok(invoiceReq, "une requête POST /api/invoices doit être émise");
+
+  // Ligne AVEC taux : le champ est émis, valeur exacte.
+  assert.deepEqual(invoiceReq!.body.lines[0], { label: "Soin", qty: 1, unitXpf: 5000, tgcRatePpm: 90_000 });
+
+  // Ligne SANS taux : le champ est ABSENT du JSON émis — ni `tgcRatePpm: undefined`, ni
+  // `tgcRatePpm: 0` (0 signifierait « hors champ TGC » côté Compta, ce n'est pas la même chose
+  // que « non renseigné »). `deepEqual` avec une forme EXACTE fait échouer ce test si une clé en
+  // trop apparaît demain — c'est la garantie recherchée.
+  assert.deepEqual(invoiceReq!.body.lines[1], { label: "Crème", qty: 2, unitXpf: 1500 });
+  assert.equal("tgcRatePpm" in invoiceReq!.body.lines[1], false, "le champ ne doit même pas exister sur l'objet reçu");
+});

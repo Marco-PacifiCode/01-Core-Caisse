@@ -15,12 +15,14 @@ const VALID_KINDS: LineKind[] = ["SERVICE", "PRODUCT", "OTHER"];
  *
  * Body : { tenantId, cashierId?, sessionId?, clientName?, sourceType?, sourceId?,
  *          posteId?, occurredAt?,
- *          lines: { kind, label, productId?, qty, unitXpf }[] }
+ *          lines: { kind, label, productId?, qty, unitXpf, tgcRatePpm? }[] }
  *   unitXpf : XPF entier (number).  productId : requis si kind=PRODUCT.
  *   posteId : caisse physique émettrice. Omis = marchand mono-caisse.
  *   occurredAt : date ISO de la vente RÉELLE, pour une remontée différée
  *     (caisse hors ligne). Omis = maintenant. Une date future donne 400
  *     FUTURE_DATE — elle ne peut venir que d'une tablette mal réglée.
+ *   tgcRatePpm (par ligne) : taux de TGC, entier ppm dans [0, 1000000], optionnel.
+ *     Omis = comportement inchangé (traverse jusqu'à Compta, jamais recalculé ici).
  *
  * Réponse 200 : { ok, saleId, totalXpf, alreadyExisted }
  */
@@ -36,7 +38,7 @@ export async function POST(req: NextRequest) {
     sourceId?: string;
     posteId?: string;
     occurredAt?: string;
-    lines?: { kind?: string; label?: string; productId?: string; qty?: number; unitXpf?: number }[];
+    lines?: { kind?: string; label?: string; productId?: string; qty?: number; unitXpf?: number; tgcRatePpm?: number }[];
   };
   try {
     body = await req.json();
@@ -57,12 +59,20 @@ export async function POST(req: NextRequest) {
     if (l.qty === undefined || l.unitXpf === undefined) {
       return NextResponse.json({ error: "qty et unitXpf requis sur chaque ligne" }, { status: 400 });
     }
+    // tgcRatePpm : optionnel, entier XPF-ppm dans [0, 1_000_000]. Absent = comportement inchangé
+    // (transmis undefined, jamais 0 — cf. lib/sync.ts).
+    if (l.tgcRatePpm !== undefined) {
+      if (!Number.isInteger(l.tgcRatePpm) || l.tgcRatePpm < 0 || l.tgcRatePpm > 1_000_000) {
+        return NextResponse.json({ error: "lines[].tgcRatePpm : entier entre 0 et 1000000" }, { status: 400 });
+      }
+    }
     parsed.push({
       kind: l.kind as LineKind,
       label: l.label,
       productId: l.productId ?? null,
       qty: l.qty,
       unitXpf: BigInt(Math.round(l.unitXpf)),
+      tgcRatePpm: l.tgcRatePpm ?? null,
     });
   }
 
