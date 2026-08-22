@@ -70,6 +70,21 @@ export type SettleResult = {
   remaining: number;
 };
 
+export type CreditNoteInput = {
+  tenantId: string;
+  invoiceId: string;
+  /** Motif facultatif de l'annulation, transmis tel quel à Compta. */
+  reason?: string;
+};
+
+export type CreditNoteResult = {
+  creditNoteId: string;
+  number: string;
+  totalXpf: number;
+  alreadyExisted: boolean;
+  origin: { id: string; number: string };
+};
+
 export type MovementInput = {
   tenantId: string;
   productId: string;
@@ -119,6 +134,8 @@ export class CoreClientError extends Error {
 export interface ComptaClient {
   createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult>;
   settle(input: SettleInput): Promise<SettleResult>;
+  /** Émet la facture d'AVOIR compensant `invoiceId` — seul moyen d'annuler une pièce (cf. lib/void-sale.ts). */
+  creditNote(input: CreditNoteInput): Promise<CreditNoteResult>;
   /** URL S2S du reçu/ticket PDF (à imprimer côté caisse). */
   receiptUrl(invoiceId: string, tenantId: string): string;
 }
@@ -187,6 +204,17 @@ const httpCompta: ComptaClient = {
     return (await res.json()) as SettleResult;
   },
 
+  async creditNote(input) {
+    const res = await postJson(
+      "compta",
+      "creditNote",
+      `${comptaUrl()}/api/invoices/${input.invoiceId}/credit-note`,
+      comptaKey(),
+      { tenantId: input.tenantId, reason: input.reason },
+    );
+    return (await res.json()) as CreditNoteResult;
+  },
+
   receiptUrl(invoiceId, tenantId) {
     return `${comptaUrl()}/api/invoices/${invoiceId}/receipt?tenantId=${encodeURIComponent(tenantId)}`;
   },
@@ -219,6 +247,7 @@ async function safeText(res: Response): Promise<string> {
 const mockInvoices = new Map<string, CreateInvoiceResult>(); // clé: tenantId|sourceType|sourceId
 const mockSettled = new Map<string, number>(); // clé: paymentRef → montant (idempotence)
 const mockMovements = new Map<string, MovementResult>(); // clé: tenantId|sourceType|sourceId|productId
+const mockCreditNotes = new Map<string, CreditNoteResult>(); // clé: invoiceId (idempotence)
 let mockSeq = 0;
 const nextId = (p: string) => `${p}-mock-${(++mockSeq).toString().padStart(6, "0")}`;
 
@@ -249,6 +278,20 @@ const mockCompta: ComptaClient = {
     mockSettledByInvoice(input.invoiceId).push(input.amountXpf);
     const paid = sumSettledForInvoice(input.invoiceId);
     return { ok: true, invoiceId: input.invoiceId, paid, remaining: 0 };
+  },
+
+  async creditNote(input) {
+    const existing = mockCreditNotes.get(input.invoiceId);
+    if (existing) return { ...existing, alreadyExisted: true };
+    const created: CreditNoteResult = {
+      creditNoteId: nextId("cn"),
+      number: `AVOIR-MOCK-${(++mockSeq).toString().padStart(4, "0")}`,
+      totalXpf: 0,
+      alreadyExisted: false,
+      origin: { id: input.invoiceId, number: "MOCK" },
+    };
+    mockCreditNotes.set(input.invoiceId, created);
+    return created;
   },
 
   receiptUrl(invoiceId, tenantId) {

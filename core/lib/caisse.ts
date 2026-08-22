@@ -36,6 +36,7 @@ import {
   type GiftCardRefusal,
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
+import { runVoidSale, type VoidPersist } from "./void-sale";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
@@ -802,6 +803,57 @@ export async function voidSale(tenantId: string, saleId: string) {
     await tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } });
     return { ok: true as const };
   });
+}
+
+export type AnnulerVenteResult =
+  | { ok: true; alreadyVoid: true }
+  | { ok: true; alreadyVoid: false; creditNoteId: string | null }
+  | { ok: false; error: "SALE_NOT_FOUND" }
+  | { ok: false; error: "STOCK_DECREMENTED" }
+  | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string };
+
+/**
+ * ANNULE une vente, quel que soit son état (DRAFT/PAID/VOID) — distincte de `voidSale` ci-dessus
+ * (qui refuse tout PAID). Logique pure dans lib/void-sale.ts (testable sans DB) :
+ *
+ *   VOID  → idempotent, `alreadyVoid:true`, rejouer ne doit JAMAIS échouer.
+ *   DRAFT → VOID direct, aucun appel externe (rien n'a jamais été encaissé/facturé).
+ *   PAID  → refus `STOCK_DECREMENTED` si du stock a été décrémenté (ligne PRODUCT + stockSyncedAt) :
+ *           remettre du stock est un geste distinct qu'on ne devine pas ici (moteur mutualisé entre
+ *           marchands) → on échoue fermé plutôt que de laisser un stock faux.
+ *         → sinon, facture existante (invoiceId) : émission d'un AVOIR côté Compta AVANT le passage
+ *           à VOID. Si l'avoir échoue, la vente NE PASSE PAS à VOID (`CREDIT_NOTE_FAILED`) : une
+ *           caisse qui dit « annulé » pendant que la compta encaisse encore est le pire des deux états.
+ *         → pas de facture (jamais synchronisée) : VOID direct, `creditNoteId:null`.
+ */
+export async function annulerVente(
+  tenantId: string,
+  saleId: string,
+  opts?: { reason?: string },
+): Promise<AnnulerVenteResult> {
+  const sale = await getSale(tenantId, saleId);
+  if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
+
+  const persist: VoidPersist = {
+    markVoid: () =>
+      withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } })).then(
+        () => undefined,
+      ),
+  };
+
+  return runVoidSale(
+    {
+      id: sale.id,
+      status: sale.status,
+      invoiceId: sale.invoiceId,
+      stockSyncedAt: sale.stockSyncedAt,
+      lines: sale.lines.map((l) => ({ kind: l.kind, productId: l.productId })),
+    },
+    tenantId,
+    comptaClient(),
+    persist,
+    opts,
+  );
 }
 
 // ── MOUVEMENTS DE TIROIR ─────────────────────────────────────────────────────────────────────
