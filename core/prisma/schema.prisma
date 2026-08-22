@@ -79,6 +79,19 @@ model CashSession {
   // modéliser un index partiel, il n'apparaît donc pas ici.
   posteId          String?
 
+  // Origine externe d'une session IMPORTÉE (2026-08-23, Rôtisserie de
+  // Pouembout) : une clôture Z faite hors ligne sur une tablette, remontée
+  // telle quelle via lib/import-cloture.ts — jamais via openSession/
+  // closeSession, qui restent le chemin vivant, inchangé, des 3 autres
+  // marchands. NULL = session du chemin vivant (comportement d'origine).
+  //
+  // ⚠️ L'unicité « un même (tenantId, sourceType, sourceId) ne crée qu'une
+  // session » est garantie en BASE par l'index unique partiel
+  // `uniq_session_external_source` (prisma/manual/2026-08-23_import_cloture_z.sql)
+  // — Prisma ne modélise pas un index partiel, il n'apparaît donc pas ici.
+  sourceType       String?
+  sourceId         String?
+
   sales     Sale[]
   movements CashMovement[]
 
@@ -141,6 +154,12 @@ model SaleLine {
   qty       Int      @default(1) // quantité (entier — un article = 1 unité stock)
   unitXpf   BigInt   @default(0) // prix unitaire XPF entier
   lineXpf   BigInt   @default(0) // = unitXpf * qty (stocké, figé à la validation)
+  // Taux de TGC PROPRE à cette ligne, en ppm (2026-08-23) — traverse jusqu'à
+  // Core-Compta (lignes de facture) sans être recalculé ici. Optionnel : absent
+  // = comportement inchangé (Compta ne reçoit pas le champ, PAS 0 — 0
+  // signifierait « hors champ TGC », ce qui n'est pas la même chose que « non
+  // renseigné »).
+  tgcRatePpm Int?
   createdAt DateTime @default(now())
 
   @@index([tenantId, saleId])

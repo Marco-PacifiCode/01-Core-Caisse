@@ -37,6 +37,7 @@ import {
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { runVoidSale, type VoidPersist } from "./void-sale";
+import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
@@ -255,6 +256,98 @@ export async function closeSession(
   });
 }
 
+// ─── Import de clôture Z hors ligne (2026-08-23, Rôtisserie de Pouembout) ───
+
+export type ImporterClotureInput = ImportClotureInput & {
+  // NOT NULL sur CashSession — l'appelant DOIT le fournir (la route l'exige déjà en 400
+  // avant d'arriver ici, comme pour POST /api/sessions).
+  openedBy: string;
+  openedByName?: string | null;
+};
+
+export type ImporterClotureResult =
+  | { ok: false; error: ImportClotureError }
+  | { ok: true; alreadyExisted: boolean; sessionId: string; varianceXpf: number };
+
+/**
+ * IMPORTE une clôture Z déjà faite hors ligne — ROUTE SÉPARÉE du chemin vivant
+ * (openSession/closeSession, INCHANGÉS, qui servent les 3 autres marchands en temps réel).
+ * La tablette est la source de vérité : son Z est une PIÈCE DÉJÀ ÉTABLIE, importée telle
+ * quelle (pas de rattachement de ventes, pas de recalcul du Z côté serveur). La session est
+ * créée directement CLOSED — validation/calcul de l'écart dans lib/import-cloture.ts (pur).
+ *
+ * IDEMPOTENT sur (tenantId, sourceType, sourceId) : rejouer le même import (renvoi réseau,
+ * double appel) rend la session EXISTANTE SANS LA MODIFIER — `alreadyExisted:true` — une pièce
+ * déjà établie ne se réécrit pas sur un renvoi. Même schéma qu'`openSession` pour la course sur
+ * l'index unique concurrent (P2002 → relecture, cf. `uniq_session_external_source`).
+ */
+export async function importerCloture(tenantId: string, input: ImporterClotureInput): Promise<ImporterClotureResult> {
+  const prepared = prepareClotureImport(input);
+  if (!prepared.ok) return prepared;
+
+  return withTenant(tenantId, async (tx) => {
+    const existing = await tx.cashSession.findFirst({
+      where: { tenantId, sourceType: prepared.sourceType, sourceId: prepared.sourceId },
+      select: { id: true, varianceXpf: true },
+    });
+    if (existing) {
+      return {
+        ok: true as const,
+        alreadyExisted: true,
+        sessionId: existing.id,
+        varianceXpf: Number(existing.varianceXpf ?? 0n),
+      };
+    }
+
+    try {
+      const session = await tx.cashSession.create({
+        data: {
+          tenantId,
+          openedBy: input.openedBy,
+          openedByName: input.openedByName ?? null,
+          openedAt: prepared.openedAt,
+          openingFloatXpf: prepared.openingFloatXpf,
+          status: "CLOSED",
+          closedAt: prepared.closedAt,
+          closingCountedXpf: prepared.closingCountedXpf,
+          expectedXpf: prepared.expectedXpf,
+          varianceXpf: prepared.varianceXpf,
+          note: prepared.note,
+          posteId: prepared.posteId,
+          sourceType: prepared.sourceType,
+          sourceId: prepared.sourceId,
+        },
+        select: { id: true, varianceXpf: true },
+      });
+      return {
+        ok: true as const,
+        alreadyExisted: false,
+        sessionId: session.id,
+        varianceXpf: Number(session.varianceXpf ?? 0n),
+      };
+    } catch (e) {
+      // Course sur uniq_session_external_source : deux imports simultanés de la même
+      // (sourceType, sourceId) passent tous deux le findFirst ci-dessus, et c'est la base qui
+      // tranche. On retombe sur la session gagnante — même schéma qu'openSession/P2002.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+        const gagnante = await tx.cashSession.findFirst({
+          where: { tenantId, sourceType: prepared.sourceType, sourceId: prepared.sourceId },
+          select: { id: true, varianceXpf: true },
+        });
+        if (gagnante) {
+          return {
+            ok: true as const,
+            alreadyExisted: true,
+            sessionId: gagnante.id,
+            varianceXpf: Number(gagnante.varianceXpf ?? 0n),
+          };
+        }
+      }
+      throw e;
+    }
+  });
+}
+
 // ─── Tickets ─────────────────────────────────────────────────────────────────
 
 export type SaleLineInput = {
@@ -263,6 +356,10 @@ export type SaleLineInput = {
   productId?: string | null; // requis si kind=PRODUCT
   qty: number;
   unitXpf: bigint;
+  /** Taux de TGC PROPRE à cette ligne (ppm), 2026-08-23. Optionnel : omis = comportement
+   *  inchangé (traverse jusqu'à Compta tel quel, cf. toSnapshot/lib/sync.ts — jamais recalculé
+   *  ici, jamais substitué par 0, qui signifierait « hors champ TGC » côté Compta). */
+  tgcRatePpm?: number | null;
 };
 
 export type CreateSaleInput = {
@@ -319,6 +416,8 @@ export async function createSale(
     qty: Math.trunc(l.qty),
     unitXpf: l.unitXpf,
     lineXpf: lineTotalXpf(l.unitXpf, l.qty),
+    // Omis/undefined/null → NULL en base (Prisma) : comportement inchangé, jamais 0.
+    tgcRatePpm: l.tgcRatePpm ?? null,
   }));
   const total = linesData.reduce((t, l) => t + l.lineXpf, 0n);
 
@@ -479,6 +578,7 @@ function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
       productId: l.productId,
       qty: l.qty,
       unitXpf: l.unitXpf,
+      tgcRatePpm: l.tgcRatePpm,
     })),
     payments: sale.payments.map((p) => ({
       id: p.id,
