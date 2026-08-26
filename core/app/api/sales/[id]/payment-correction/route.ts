@@ -15,8 +15,12 @@ export const runtime = "nodejs";
  * (les trois derniers ne servent QUE le log ci-dessous — aucun champ en base pour eux.)
  * Réponse 200 : { ok:true, alreadyCorrected, payments }
  * Erreurs : 400 champs manquants/INVALID · 404 SALE_NOT_FOUND ·
- *           409 NOT_PAID/NO_INVOICE/NOT_SYNCED/NO_SESSION/SESSION_CLOSED/NOTHING_TO_CORRECT ·
+ *           409 NOT_PAID/NO_INVOICE/NOT_SYNCED/TOO_OLD/NOTHING_TO_CORRECT ·
  *           502 COMPTA_CORRECTION_FAILED.
+ *
+ * ⚠️ Une session CLOTURÉE ne bloque PLUS la correction (décision Marco, 2026-08-26) : le Z d'une
+ * journée close n'est pas réécrit, l'écart se constate au recomptage. Seule l'ANCIENNETÉ du
+ * paiement (>1 mois calendaire, cf. lib/fenetre-correction.ts) refuse désormais — TOO_OLD.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -55,8 +59,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       NOT_PAID: 409,
       NO_INVOICE: 409,
       NOT_SYNCED: 409,
-      NO_SESSION: 409,
-      SESSION_CLOSED: 409,
+      TOO_OLD: 409,
       NOTHING_TO_CORRECT: 409,
       COMPTA_CORRECTION_FAILED: 502,
     };

@@ -44,6 +44,7 @@ import {
   type SaleSnapshotForCorrection,
 } from "./payment-correction";
 import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
+import { expectedXpfPourRapport } from "./z-report";
 import { lockSaleRow } from "./sale-lock";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -156,7 +157,9 @@ export type ZReport = {
 /**
  * Clôture Z d'une session : calcule l'attendu (fond + encaissements ESPÈCES des ventes PAID de la
  * session) vs le compté (saisie caissier), enregistre l'écart, passe la session CLOSED.
- * Idempotent : une session déjà CLOSED renvoie son rapport figé.
+ * Idempotent : une session déjà CLOSED renvoie son `expectedXpf`/`closingCountedXpf`/`varianceXpf`
+ * FIGÉS (relus en base, jamais recalculés — cf. lib/z-report.ts#expectedXpfPourRapport) ; sa
+ * ventilation des ventes (`cashSalesXpf`/`byMethod`/`totalSalesXpf`), elle, reste recalculée.
  */
 export async function closeSession(
   tenantId: string,
@@ -217,11 +220,20 @@ export async function closeSession(
     });
     const gc = summarizeRedeemedGiftCards(redeemedCards);
 
-    const buildReport = (counted: bigint, variance: bigint): ZReport => ({
+    // `expected` (calculé ci-dessus) recalcule TOUJOURS l'attendu à chaud depuis les `SalePayment`
+    // CASH actuels — nécessaire pour une session encore OUVERTE (elle n'a pas fini sa journée), mais
+    // FAUX pour une session déjà CLOSED depuis que la correction du moyen de paiement peut modifier
+    // ces mêmes `SalePayment` après clôture (décision Marco, 2026-08-26 : la caisse clôturée ne
+    // bloque plus la correction, cf. lib/payment-correction.ts). LE TIROIR DU SOIR EST FIGÉ, LA
+    // VENTILATION DES VENTES RESTE VIVANTE : `cashSalesXpf`/`byMethod`/`totalSalesXpf` ci-dessous
+    // restent volontairement recalculés (ils décrivent les VENTES, pas le tiroir — c'est précisément
+    // la ventilation qu'on veut voir suivre la correction) ; seul `expectedXpf` doit, lui, sortir de
+    // la base une fois la session close — cf. lib/z-report.ts#expectedXpfPourRapport.
+    const buildReport = (counted: bigint, variance: bigint, expectedForReport: bigint): ZReport => ({
       sessionId: session.id,
       openingFloatXpf: Number(session.openingFloatXpf),
       cashSalesXpf: Number(cashSales),
-      expectedXpf: Number(expected),
+      expectedXpf: Number(expectedForReport),
       countedXpf: Number(counted),
       varianceXpf: Number(variance),
       salesCount: sales.length,
@@ -237,11 +249,16 @@ export async function closeSession(
     });
 
     if (session.status === "CLOSED") {
-      // déjà clôturée : renvoyer l'écart figé enregistré
+      // déjà clôturée : renvoyer l'écart FIGÉ enregistré — et l'attendu figé avec lui (jamais le
+      // recalcul `expected` ci-dessus, cf. commentaire de `buildReport`).
       return {
         ok: true as const,
         alreadyClosed: true,
-        report: buildReport(session.closingCountedXpf ?? 0n, session.varianceXpf ?? 0n),
+        report: buildReport(
+          session.closingCountedXpf ?? 0n,
+          session.varianceXpf ?? 0n,
+          expectedXpfPourRapport(session, expected),
+        ),
       };
     }
 
@@ -259,7 +276,13 @@ export async function closeSession(
       },
     });
 
-    return { ok: true as const, alreadyClosed: false, report: buildReport(input.closingCountedXpf, variance) };
+    // Cette clôture VIENT d'écrire `expected` en base (ci-dessus) : le recalcul et la base sont
+    // identiques ici, `expected` convient donc tel quel (pas besoin de relire la session).
+    return {
+      ok: true as const,
+      alreadyClosed: false,
+      report: buildReport(input.closingCountedXpf, variance, expected),
+    };
   });
 }
 
@@ -993,6 +1016,8 @@ export async function corrigerMoyenPaiement(
         sessionStatus: sale.session?.status ?? null,
         comptaSyncedAt: sale.comptaSyncedAt,
         invoiceId: sale.invoiceId,
+        paidAt: sale.paidAt,
+        createdAt: sale.createdAt,
         payments: sale.payments.map((p) => ({
           method: p.method,
           amountXpf: p.amountXpf,
