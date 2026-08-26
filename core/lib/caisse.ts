@@ -37,7 +37,14 @@ import {
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { runVoidSale, type VoidPersist } from "./void-sale";
+import {
+  runPaymentCorrection,
+  type PaymentCorrectionDeps,
+  type CorrectionResult,
+  type SaleSnapshotForCorrection,
+} from "./payment-correction";
 import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
+import { lockSaleRow } from "./sale-lock";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
@@ -954,6 +961,95 @@ export async function annulerVente(
     persist,
     opts,
   );
+}
+
+// ─── Correction du moyen de paiement ────────────────────────────────────────────────────────
+// Chantier « correction moyen de paiement » (2026-08-26) : une gérante s'est trompée de moyen en
+// encaissant (« espèces » au lieu de « carte »). Logique pure dans lib/payment-correction.ts
+// (testable sans DB) : contre-écriture (un `SalePayment` négatif sur l'ancien moyen, un positif
+// sur le nouveau) — `SalePayment` n'est JAMAIS modifié. Voir ce fichier pour le détail des refus.
+
+/**
+ * Corrige le moyen de paiement d'un ticket déjà encaissé, par contre-écriture.
+ * `Sale.totalXpf` n'est JAMAIS touché : seule la répartition par moyen change.
+ */
+export async function corrigerMoyenPaiement(
+  tenantId: string,
+  input: { saleId: string; fromMethod: string; toMethod: string; amountXpf: number },
+): Promise<CorrectionResult> {
+  const deps: PaymentCorrectionDeps = {
+    async loadSale(saleId): Promise<SaleSnapshotForCorrection | null> {
+      const sale = await withTenant(tenantId, (tx) =>
+        tx.sale.findFirst({
+          where: { id: saleId, tenantId },
+          include: { payments: true, session: true },
+        }),
+      );
+      if (!sale) return null;
+      return {
+        id: sale.id,
+        status: sale.status,
+        sessionId: sale.sessionId,
+        sessionStatus: sale.session?.status ?? null,
+        comptaSyncedAt: sale.comptaSyncedAt,
+        invoiceId: sale.invoiceId,
+        payments: sale.payments.map((p) => ({
+          method: p.method,
+          amountXpf: p.amountXpf,
+          settleRef: p.settleRef,
+        })),
+      };
+    },
+
+    async comptaCorrection(args) {
+      return comptaClient().paymentCorrection(args);
+    },
+
+    async insertCorrectionPayments(args) {
+      return withTenant(tenantId, async (tx) => {
+        // VERROU DE LIGNE EN PREMIER — AVANT le `count`, pas après (cf. lib/sale-lock.ts).
+        // `SalePayment` n'a aucune contrainte d'unicité sur `settleRef` : sans ce verrou,
+        // deux transactions concurrentes lisent le même `count = 0` en READ COMMITTED et
+        // écrivent chacune son couple, doublant la correction sur le ticket. `FOR UPDATE`
+        // fait attendre la seconde transaction jusqu'au COMMIT de la première, qui relit
+        // alors un `count` à jour au lieu d'un instantané périmé. Verrouiller APRÈS avoir
+        // compté ne fermerait rien : le compte lu serait déjà obsolète.
+        // Le verrou ne porte que sur cette transaction d'écriture — la comptabilité a déjà
+        // été appelée par `runPaymentCorrection` AVANT, hors de toute transaction (cf.
+        // l'avertissement en tête de lib/sale-lock.ts).
+        await lockSaleRow(tx, args.saleId, tenantId);
+
+        const already = await tx.salePayment.count({
+          where: { tenantId, saleId: args.saleId, settleRef: args.sortie },
+        });
+        if (already > 0) return { inserted: false };
+
+        await tx.salePayment.create({
+          data: {
+            tenantId,
+            saleId: args.saleId,
+            method: args.fromMethod as PayMethod, // sûr : estMoyenAdmis (verifierCorrection)
+            amountXpf: -BigInt(args.amountXpf),
+            tenderedXpf: null,
+            settleRef: args.sortie,
+          },
+        });
+        await tx.salePayment.create({
+          data: {
+            tenantId,
+            saleId: args.saleId,
+            method: args.toMethod as PayMethod, // sûr : estMoyenAdmis (verifierCorrection)
+            amountXpf: BigInt(args.amountXpf),
+            tenderedXpf: null,
+            settleRef: args.entree,
+          },
+        });
+        return { inserted: true };
+      });
+    },
+  };
+
+  return runPaymentCorrection(deps, { saleId: input.saleId, tenantId, fromMethod: input.fromMethod, toMethod: input.toMethod, amountXpf: input.amountXpf });
 }
 
 // ── MOUVEMENTS DE TIROIR ─────────────────────────────────────────────────────────────────────

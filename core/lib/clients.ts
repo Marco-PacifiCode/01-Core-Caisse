@@ -93,6 +93,22 @@ export type CreditNoteResult = {
   origin: { id: string; number: string };
 };
 
+export type PaymentCorrectionInput = {
+  tenantId: string;
+  invoiceId: string;
+  fromMethod: string;
+  toMethod: string;
+  amountXpf: number;
+  correctionKey: string;
+};
+
+export type PaymentCorrectionResult = {
+  ok: boolean;
+  alreadyCorrected?: boolean;
+  paidXpf?: number;
+  parMoyen?: { method: string; amountXpf: number }[];
+};
+
 export type MovementInput = {
   tenantId: string;
   productId: string;
@@ -144,6 +160,8 @@ export interface ComptaClient {
   settle(input: SettleInput): Promise<SettleResult>;
   /** Émet la facture d'AVOIR compensant `invoiceId` — seul moyen d'annuler une pièce (cf. lib/void-sale.ts). */
   creditNote(input: CreditNoteInput): Promise<CreditNoteResult>;
+  /** Corrige le MOYEN de paiement d'une facture déjà réglée, par contre-écriture — cf. lib/payment-correction.ts. */
+  paymentCorrection(input: PaymentCorrectionInput): Promise<PaymentCorrectionResult>;
   /** URL S2S du reçu/ticket PDF (à imprimer côté caisse). */
   receiptUrl(invoiceId: string, tenantId: string): string;
 }
@@ -223,6 +241,23 @@ const httpCompta: ComptaClient = {
     return (await res.json()) as CreditNoteResult;
   },
 
+  async paymentCorrection(input) {
+    const res = await postJson(
+      "compta",
+      "paymentCorrection",
+      `${comptaUrl()}/api/invoices/${input.invoiceId}/payment-correction`,
+      comptaKey(),
+      {
+        tenantId: input.tenantId,
+        fromMethod: input.fromMethod,
+        toMethod: input.toMethod,
+        amountXpf: input.amountXpf,
+        correctionKey: input.correctionKey,
+      },
+    );
+    return (await res.json()) as PaymentCorrectionResult;
+  },
+
   receiptUrl(invoiceId, tenantId) {
     return `${comptaUrl()}/api/invoices/${invoiceId}/receipt?tenantId=${encodeURIComponent(tenantId)}`;
   },
@@ -256,6 +291,7 @@ const mockInvoices = new Map<string, CreateInvoiceResult>(); // clé: tenantId|s
 const mockSettled = new Map<string, number>(); // clé: paymentRef → montant (idempotence)
 const mockMovements = new Map<string, MovementResult>(); // clé: tenantId|sourceType|sourceId|productId
 const mockCreditNotes = new Map<string, CreditNoteResult>(); // clé: invoiceId (idempotence)
+const mockPaymentCorrections = new Map<string, PaymentCorrectionResult>(); // clé: correctionKey (idempotence)
 let mockSeq = 0;
 const nextId = (p: string) => `${p}-mock-${(++mockSeq).toString().padStart(6, "0")}`;
 
@@ -299,6 +335,14 @@ const mockCompta: ComptaClient = {
       origin: { id: input.invoiceId, number: "MOCK" },
     };
     mockCreditNotes.set(input.invoiceId, created);
+    return created;
+  },
+
+  async paymentCorrection(input) {
+    const existing = mockPaymentCorrections.get(input.correctionKey);
+    if (existing) return { ...existing, alreadyCorrected: true };
+    const created: PaymentCorrectionResult = { ok: true, alreadyCorrected: false };
+    mockPaymentCorrections.set(input.correctionKey, created);
     return created;
   },
 
