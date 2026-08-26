@@ -19,18 +19,26 @@ test("15 mars 2026, 09:00 NC → limite 15 avril 2026, 09:00 NC (un mois calenda
 
 // ─── Débordement de quantième : 31 janvier → dernier jour de février ──────────────────────────
 
-test("31 janvier 2026 (année NON bissextile), 23h NC → limite 28 février 2026, 23h NC (jamais le 3 mars)", () => {
-  // 31 janvier 23:00 NC = 31 janvier 12:00 UTC (23-11=12, même jour UTC).
-  const origine = new Date("2026-01-31T12:00:00.000Z");
-  // 28 février 23:00 NC = 28 février 12:00 UTC. 2026 n'est pas bissextile : février a 28 jours.
-  const attendu = new Date("2026-02-28T12:00:00.000Z");
+test("31 janvier 2026 : le quantieme DEBORDE sur mars (28 fev + 3), il n'est pas rabote", () => {
+  // 🗣️ Marco, 2026-08-26 : « une erreur faite le 31 n'est pas recuperee le 1er. »
+  // Raboter au dernier jour de fevrier donnait 28 jours de fenetre a un paiement
+  // du 31 — moins qu'un mois, et moins que le 1er du meme mois. On deborde donc.
+  const origine = new Date("2026-01-31T12:00:00.000Z"); // 31 janvier 23:00 NC
+  const attendu = new Date("2026-03-03T12:00:00.000Z"); // 3 mars 23:00 NC (31 fev = 28 + 3)
   assert.equal(limiteDeCorrection(origine).getTime(), attendu.getTime());
 });
 
-test("31 janvier 2028 (année BISSEXTILE), 23h NC → limite 29 février 2028, 23h NC", () => {
-  const origine = new Date("2028-01-31T12:00:00.000Z"); // = 2028-01-31T23:00 NC
-  const attendu = new Date("2028-02-29T12:00:00.000Z"); // = 2028-02-29T23:00 NC (2028 est bissextile)
+test("31 janvier 2028 (BISSEXTILE) : deborde au 2 mars (29 fev + 2)", () => {
+  const origine = new Date("2028-01-31T12:00:00.000Z"); // 31 janvier 23:00 NC
+  const attendu = new Date("2028-03-02T12:00:00.000Z"); // 2 mars 23:00 NC
   assert.equal(limiteDeCorrection(origine).getTime(), attendu.getTime());
+});
+
+test("LE CAS DE MARCO : une erreur du 31 mars se rattrape encore le 1er mai", () => {
+  const origine = new Date("2026-03-31T01:00:00.000Z"); // 31 mars 12:00 NC
+  const attendu = new Date("2026-05-01T01:00:00.000Z"); // 1er mai 12:00 NC (31 avril = 30 + 1)
+  assert.equal(limiteDeCorrection(origine).getTime(), attendu.getTime());
+  assert.equal(estDansLaFenetre(origine, new Date("2026-04-30T22:00:00.000Z")), true);
 });
 
 test("29 février 2028 (bissextile), 11h NC → limite 29 mars 2028, 11h NC (pas de débordement à clamper)", () => {
@@ -67,10 +75,12 @@ test("un encaissement à 00:30 heure NC (donc 13:30 UTC la VEILLE) est daté du 
   );
 });
 
-test("un encaissement à 23h heure NC ne perd pas un jour (aucun décalage de fuseau sur la limite)", () => {
-  // 2026-01-31T23:00 NC = 2026-01-31T12:00 UTC (23-11=12, même jour calendaire des deux côtés ici).
-  const origine = new Date("2026-01-31T12:00:00.000Z");
-  const attendu = new Date("2026-02-28T12:00:00.000Z"); // 2026-02-28T23:00 NC
+test("un encaissement a 23h heure NC ne perd pas un jour (aucun decalage de fuseau)", () => {
+  // Meme heure locale de part et d'autre : on prend un quantieme QUI EXISTE dans
+  // le mois cible (le 15), pour que ce test ne mesure QUE le fuseau — le
+  // debordement de quantieme a ses propres tests ci-dessus.
+  const origine = new Date("2026-01-15T12:00:00.000Z"); // 15 janvier 23:00 NC
+  const attendu = new Date("2026-02-15T12:00:00.000Z"); // 15 fevrier 23:00 NC
   assert.equal(limiteDeCorrection(origine).getTime(), attendu.getTime());
 });
 

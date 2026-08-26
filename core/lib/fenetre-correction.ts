@@ -86,8 +86,14 @@ export function limiteDeCorrection(origine: Date): Date {
     mois = 0;
     annee += 1;
   }
-  const jour = Math.min(c.jour, joursDansLeMois(annee, mois));
-  return composerNC({ ...c, annee, mois, jour });
+  // QUANTIÈME QUI DÉBORDE : on DÉBORDE sur le mois suivant, on ne rabote pas.
+  // 🗣️ Marco, 2026-08-26 : « une erreur faite le 31 n'est pas récupérée le 1er. »
+  // Raboter donnait au 31 mars une limite au 30 avril — moins d'un mois, alors
+  // qu'un paiement du 1er avril avait jusqu'au 1er mai. La fenêtre est « au moins
+  // un mois », jamais moins. `composerNC` s'appuie sur `Date.UTC`, qui normalise
+  // un quantième hors bornes (31 avril → 1er mai). Jumeau de
+  // `01-Core-Compta/core/lib/fenetre-correction.ts` : les deux changent ENSEMBLE.
+  return composerNC({ ...c, annee, mois, jour: c.jour });
 }
 
 /**
