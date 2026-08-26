@@ -14,6 +14,7 @@
 // deux états. Si l'écriture comptable échoue, on n'écrit rien côté caisse.
 
 import type { ComptaClient } from "./clients";
+import { estDansLaFenetre } from "./fenetre-correction.ts";
 
 export type CorrectionMethod = "CASH" | "CARD" | "TRANSFER" | "CHEQUE" | "OTHER";
 
@@ -36,6 +37,11 @@ export type SaleSnapshotForCorrection = {
   sessionStatus: "OPEN" | "CLOSED" | null; // null = la vente n'est rattachée à aucune session
   comptaSyncedAt: Date | null;
   invoiceId: string | null;
+  /** Date RÉELLE de l'encaissement — sert de point de départ à la fenêtre de correction (1 mois
+   *  calendaire, cf. lib/fenetre-correction.ts). `paidAt` peut être `null` sur une très vieille
+   *  vente antérieure à l'ajout du champ : `loadSale` retombe alors sur `createdAt`. */
+  paidAt: Date | null;
+  createdAt: Date;
   payments: { method: string; amountXpf: bigint; settleRef: string | null }[];
 };
 
@@ -44,8 +50,7 @@ export type CorrectionRefusal =
   | "NOT_PAID"
   | "NO_INVOICE"
   | "NOT_SYNCED"
-  | "NO_SESSION"
-  | "SESSION_CLOSED"
+  | "TOO_OLD"
   | "NOTHING_TO_CORRECT"
   | "INVALID";
 
@@ -117,6 +122,7 @@ export function repartitionNette(payments: { method: string; amountXpf: bigint }
 export function verifierCorrection(
   sale: SaleSnapshotForCorrection | null,
   input: { fromMethod: string; toMethod: string; amountXpf: number },
+  maintenant: Date = new Date(),
 ): { ok: false; error: CorrectionRefusal; detail?: string } | { ok: true } {
   if (sale == null) return { ok: false, error: "SALE_NOT_FOUND" };
 
@@ -143,16 +149,25 @@ export function verifierCorrection(
   // avant qu'on corrige quoi que ce soit (sinon la correction partirait sur une facture qui n'existe
   // pas encore côté Compta).
   if (sale.comptaSyncedAt == null) return { ok: false, error: "NOT_SYNCED" };
-  if (sale.sessionId == null || sale.sessionStatus == null) return { ok: false, error: "NO_SESSION" };
 
-  // 🛑 GARDE DE PRUDENCE — NON NÉGOCIABLE. `closeSession` (lib/caisse.ts ~l.241-253) FIGE
-  // `expectedXpf`/`varianceXpf` en base à la clôture, mais `buildReport` (lib/caisse.ts ~l.213-230)
-  // réaffiche un attendu RECALCULÉ À CHAUD depuis les `SalePayment` de méthode CASH quand la session
-  // est encore ouverte. Corriger le moyen de paiement d'un ticket APRÈS clôture ferait donc dire au
-  // même écran un `expectedXpf` figé et un `varianceXpf` figé qui ne correspondraient plus à ses
-  // propres lignes — le même défaut que le chantier « écart de caisse » a justement corrigé pour les
-  // mouvements de tiroir (cf. lib/caisse.ts, recordCashMovement, refus SESSION_CLOSED).
-  if (sale.sessionStatus === "CLOSED") return { ok: false, error: "SESSION_CLOSED" };
+  // 🔓 LA CAISSE CLÔTURÉE NE BLOQUE PLUS LA CORRECTION (décision Marco, 2026-08-26, verbatim) :
+  // « le moyen de paiement n'est pas très important. tant que le montant ne change pas. corrections
+  // jusqu'à 1 mois plus tard. ça se voit au recomptage de la caisse de toute façon. »
+  //
+  // Le Z d'une journée close N'EST PAS RÉÉCRIT : il reste tel qu'il a été arrêté (`closingCountedXpf`
+  // et `varianceXpf` figés à la clôture, `expectedXpf` figé lui aussi depuis ce chantier — cf.
+  // lib/z-report.ts#expectedXpfPourRapport) ; un écart révélé par une correction tardive se CONSTATE
+  // au recomptage suivant, il ne se corrige pas rétroactivement sur un Z déjà arrêté. Une session
+  // encore OUVERTE, elle, voit son attendu se recalculer normalement à sa prochaine clôture
+  // (`closeSession` resomme les `SalePayment` de méthode CASH) : ce comportement ne change pas.
+  //
+  // Ce qui remplace la garde de prudence retirée ici : la fenêtre de temps ci-dessous (TOO_OLD).
+
+  // FENÊTRE DE CORRECTION — 1 mois calendaire depuis l'encaissement (lib/fenetre-correction.ts).
+  // `paidAt` peut être `null` sur une très vieille vente (antérieure au champ) : `createdAt` sert
+  // alors de repère, comme point de départ le plus proche disponible de l'encaissement réel.
+  const origineCorrection = sale.paidAt ?? sale.createdAt;
+  if (!estDansLaFenetre(origineCorrection, maintenant)) return { ok: false, error: "TOO_OLD" };
 
   const net = repartitionNette(sale.payments);
   const fromNet = net.find((p) => p.method === input.fromMethod)?.amountXpf ?? 0;
@@ -197,6 +212,8 @@ export type PaymentCorrectionInput = {
   fromMethod: string;
   toMethod: string;
   amountXpf: number;
+  /** Injecté (défaut `new Date()`) — sert la fenêtre de correction (TOO_OLD, cf. verifierCorrection). */
+  maintenant?: Date;
 };
 
 /**
@@ -211,7 +228,7 @@ export async function runPaymentCorrection(
   input: PaymentCorrectionInput,
 ): Promise<CorrectionResult> {
   const sale = await deps.loadSale(input.saleId);
-  const verif = verifierCorrection(sale, input);
+  const verif = verifierCorrection(sale, input, input.maintenant ?? new Date());
   if (!verif.ok) return verif;
 
   const generation = generationCorrection(sale!.payments);

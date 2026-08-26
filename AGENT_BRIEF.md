@@ -1,5 +1,35 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ⚖️ MARCO TRANCHE : la caisse close ne bloque plus, fenêtre d'1 MOIS (2026-08-26, soir)
+
+🗣️ **Verbatim** : *« le moyen de paiement n'est pas très important. tant que le montant ne change
+pas. corrections jusqu'à 1 mois plus tard. ça se voit au recomptage de la caisse de toute façon. »*
+
+- 🔓 **`SESSION_CLOSED` et `NO_SESSION` sont RETIRÉS.** Une correction reste possible après le Z, et
+  sur une vente hors session. Le Z de la journée **n'est pas réécrit** : l'écart se constate au
+  recomptage. Session **ouverte** : l'attendu se recalcule normalement (comportement inchangé) ;
+  session **close** : figé, on n'y touche pas. Les deux cas sont testés.
+- 🐛 **BUG DORMANT SORTI PAR CETTE DÉCISION — `closeSession` mentait.** Il annonce « une session déjà
+  CLOSED renvoie son rapport figé », mais `buildReport` posait `expectedXpf` **recalculé à chaud**
+  (seuls `closingCountedXpf` et `varianceXpf` venaient de la base). Tant que rien ne bougeait après
+  la clôture, l'erreur était invisible. Maintenant qu'une correction peut changer les paiements
+  d'une session close, le même écran aurait affiché un attendu et un écart qui ne se répondent plus.
+  → `lib/z-report.ts` (`expectedXpfPourRapport`, pure et testée — `closeSession` importe
+  `next/headers` via `./tenant` et n'est pas exécutable sous `node --test`). **Le tiroir du soir est
+  figé ; `cashSalesXpf`, `byMethod` et `totalSalesXpf` restent recalculés**, et c'est voulu : ils
+  décrivent les VENTES, pas le tiroir — c'est cette ventilation-là qu'on veut voir suivre la
+  correction. Repli sur le recalcul si `expectedXpf` est `null` (vieille session).
+- ⏳ **`TOO_OLD` : fenêtre d'1 MOIS** sur `sale.paidAt ?? sale.createdAt` (`lib/fenetre-correction.ts`).
+  **Mois CALENDAIRE** et non 31 jours (« un mois plus tard » se lit sur un calendrier) ; débordement
+  de quantième géré (31 janv. → 28/29 fév.) ; **heure NC = UTC+11 FIXE** — compter en UTC décalait la
+  limite d'un jour pour une partie des encaissements ; borne **incluse**. `maintenant` est **injecté**,
+  sans quoi les bornes ne se testent pas. ⚠️ **Module JUMEAU dans `01-Core-Compta`** (dépôts séparés,
+  aucun paquet partagé) : le modifier ici oblige à le modifier là-bas.
+- ✅ **254 tests** (234 avant), `tsc` 0, build OK. Mutations prouvées : `TOO_OLD` retiré → 3 rouges ;
+  31 jours au lieu du mois → 5 rouges ; attendu recalculé sur session close → 1 rouge.
+- 📌 `tsconfig.json` gagne `allowImportingTsExtensions` (même raison que côté Compta : un module pur
+  qui en importe un autre doit satisfaire `node --test --experimental-strip-types` ET `tsc`).
+
 ## 🔁 CORRIGER LE MOYEN DE PAIEMENT D'UN TICKET — `POST /api/sales/:id/payment-correction` (2026-08-26) — ✅ **en production**
 
 🚀 **PR #26 · `main 30ddcd3` · release `20260826-180052` · WEB OK.** Livré **après** Core-Compta

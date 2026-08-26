@@ -34,12 +34,17 @@ function makeSale(overrides: Partial<SaleSnapshotForCorrection> = {}): SaleSnaps
     sessionStatus: "OPEN",
     comptaSyncedAt: new Date("2026-08-20T08:00:00Z"),
     invoiceId: "inv-1",
+    paidAt: new Date("2026-08-20T08:00:00Z"),
+    createdAt: new Date("2026-08-20T08:00:00Z"),
     payments: [{ method: "CASH", amountXpf: 5000n, settleRef: "caisse:sale-1:0" }],
     ...overrides,
   };
 }
 
-const INPUT = { fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000 };
+/** `maintenant` par défaut des tests : dans la fenêtre de tous les `paidAt` ci-dessus. */
+const MAINTENANT = new Date("2026-08-26T00:00:00Z");
+
+const INPUT = { fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000, maintenant: MAINTENANT };
 
 /** Fake deps — état en mémoire, comme void-route.test.ts. */
 function makeDeps(opts: {
@@ -119,30 +124,97 @@ test("la part CASH baisse exactement du montant corrigé, CARD monte d'autant, e
   assert.equal(expectedAvant - expectedApres, 3000n, "l'attendu du Z baisse exactement du montant corrigé");
 });
 
-// ─── 3. Session CLOSED → refus, aucune écriture ───────────────────────────────────────────────
+// ─── 3. Session CLOSE : la correction est ACCEPTÉE (décision Marco, 2026-08-26) ───────────────
+//
+// Avant ce chantier, une session CLOSED refusait toute correction (SESSION_CLOSED). Marco a tranché
+// le contraire, verbatim : « le moyen de paiement n'est pas très important. tant que le montant ne
+// change pas. corrections jusqu'à 1 mois plus tard. ça se voit au recomptage de la caisse de toute
+// façon. » Le Z d'une session close n'est de toute manière plus réécrit par une correction
+// (cf. lib/z-report.test.ts) — plus rien ne justifie de bloquer ici.
 
-test("session CLOSED → refus SESSION_CLOSED, comptaCorrection jamais appelée, aucune écriture", async () => {
+test("session CLOSE : la correction est ACCEPTÉE (l'ancien refus SESSION_CLOSED a disparu, décision Marco 26/08)", async () => {
   const sale = makeSale({ sessionStatus: "CLOSED" });
   const { deps, calls } = makeDeps({ sale });
 
   const out = await runPaymentCorrection(deps, { saleId: sale.id, tenantId: TENANT, ...INPUT });
 
-  assert.deepEqual(out, { ok: false, error: "SESSION_CLOSED" });
-  assert.equal(calls.comptaCorrection, 0);
-  assert.equal(calls.insertCorrectionPayments, 0);
+  assert.equal(out.ok, true, "une session close ne bloque plus la correction");
+  assert.equal(calls.comptaCorrection, 1);
+  assert.equal(calls.insertCorrectionPayments, 1);
 });
 
-// ─── 4. Vente sans session → NO_SESSION, rien d'appelé ────────────────────────────────────────
+// ─── 4. Vente sans session : la correction est ACCEPTÉE (l'ancien refus NO_SESSION a disparu) ──
 
-test("vente sans session → NO_SESSION, rien d'appelé", async () => {
+test("vente sans session : la correction est ACCEPTÉE (l'ancien refus NO_SESSION a disparu)", async () => {
   const sale = makeSale({ sessionId: null, sessionStatus: null });
   const { deps, calls } = makeDeps({ sale });
 
   const out = await runPaymentCorrection(deps, { saleId: sale.id, tenantId: TENANT, ...INPUT });
 
-  assert.deepEqual(out, { ok: false, error: "NO_SESSION" });
-  assert.equal(calls.comptaCorrection, 0);
-  assert.equal(calls.insertCorrectionPayments, 0);
+  assert.equal(out.ok, true);
+  assert.equal(calls.comptaCorrection, 1);
+  assert.equal(calls.insertCorrectionPayments, 1);
+});
+
+// ─── 4 bis. TOO_OLD — fenêtre d'un mois calendaire (décision Marco, 2026-08-26) ────────────────
+
+test("TOO_OLD : paiement encaissé il y a plus d'un mois calendaire → refus, aucune écriture", async () => {
+  // paidAt par défaut de makeSale() : 2026-08-20T08:00:00Z. Limite : 2026-09-20T08:00:00Z.
+  const sale = makeSale();
+  const { deps, calls } = makeDeps({ sale });
+  const maintenant = new Date("2026-09-20T08:00:00.001Z"); // 1 ms après la limite
+
+  const out = await runPaymentCorrection(deps, { saleId: sale.id, tenantId: TENANT, ...INPUT, maintenant });
+
+  assert.deepEqual(out, { ok: false, error: "TOO_OLD" });
+  assert.equal(calls.comptaCorrection, 0, "TOO_OLD : comptaCorrection jamais invoquée");
+  assert.equal(calls.insertCorrectionPayments, 0, "TOO_OLD : aucune dépendance d'écriture appelée");
+});
+
+test("TOO_OLD : à la limite exacte (1 mois calendaire), la correction est encore ACCEPTÉE (borne incluse)", async () => {
+  const sale = makeSale();
+  const { deps } = makeDeps({ sale });
+  const maintenant = new Date("2026-09-20T08:00:00.000Z"); // exactement la limite
+
+  const out = await runPaymentCorrection(deps, { saleId: sale.id, tenantId: TENANT, ...INPUT, maintenant });
+
+  assert.equal(out.ok, true, "la borne est INCLUSE : encore acceptée à la milliseconde de la limite");
+});
+
+test("TOO_OLD : origine = createdAt quand paidAt est null (très vieille vente)", async () => {
+  const sale = makeSale({ paidAt: null, createdAt: new Date("2026-08-20T08:00:00Z") });
+  const { deps, calls } = makeDeps({ sale });
+  const maintenantOk = new Date("2026-09-20T08:00:00.000Z");
+  const maintenantTrop = new Date("2026-09-20T08:00:00.001Z");
+
+  const ok = await runPaymentCorrection(deps, { saleId: sale.id, tenantId: TENANT, ...INPUT, maintenant: maintenantOk });
+  assert.equal(ok.ok, true, "createdAt sert de repère quand paidAt est null");
+
+  const { deps: deps2, calls: calls2 } = makeDeps({ sale });
+  const trop = await runPaymentCorrection(deps2, { saleId: sale.id, tenantId: TENANT, ...INPUT, maintenant: maintenantTrop });
+  assert.deepEqual(trop, { ok: false, error: "TOO_OLD" });
+  assert.equal(calls2.comptaCorrection, 0);
+});
+
+test("ORDRE DES REFUS : TOO_OLD est vérifié APRÈS NOT_SYNCED et AVANT NOTHING_TO_CORRECT", () => {
+  // Vente NOT_SYNCED (comptaSyncedAt: null) ET trop vieille : NOT_SYNCED doit gagner (refus de forme
+  // en tête, cf. l'ordre imposé par verifierCorrection).
+  const saleNotSynced = makeSale({ comptaSyncedAt: null });
+  const maintenantTrop = new Date("2026-09-20T08:00:00.001Z");
+  assert.equal(
+    verifierCorrection(saleNotSynced, { fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000 }, maintenantTrop).error,
+    "NOT_SYNCED",
+    "NOT_SYNCED (refus de forme) passe AVANT TOO_OLD",
+  );
+
+  // Vente synchronisée, trop vieille ET montant supérieur au net CASH (NOTHING_TO_CORRECT) :
+  // TOO_OLD doit gagner (il est vérifié avant NOTHING_TO_CORRECT).
+  const saleTropEtMontantFaux = makeSale({ payments: [{ method: "CASH", amountXpf: 1000n, settleRef: null }] });
+  assert.equal(
+    verifierCorrection(saleTropEtMontantFaux, { fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000 }, maintenantTrop).error,
+    "TOO_OLD",
+    "TOO_OLD passe AVANT NOTHING_TO_CORRECT",
+  );
 });
 
 // ─── 5. Un refus chacun, aucune dépendance d'écriture appelée ─────────────────────────────────
@@ -254,13 +326,13 @@ test("l'ALLER-RETOUR, en toutes lettres : Espèces→Carte, puis Carte→Espèce
   const { deps, payments } = makeStatefulDeps([{ method: "CASH", amountXpf: 5000n, settleRef: null }]);
 
   // 1) Espèces → Carte
-  const r1 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000 });
+  const r1 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000, maintenant: MAINTENANT });
   assert.equal(r1.ok, true);
   if (!r1.ok) return;
   assert.equal(r1.alreadyCorrected, false, "1ère correction : doit écrire");
 
   // 2) On s'est encore trompé : Carte → Espèces
-  const r2 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CARD", toMethod: "CASH", amountXpf: 5000 });
+  const r2 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CARD", toMethod: "CASH", amountXpf: 5000, maintenant: MAINTENANT });
   assert.equal(r2.ok, true);
   if (!r2.ok) return;
   assert.equal(r2.alreadyCorrected, false, "2ème correction (sens inverse) : doit écrire");
@@ -269,7 +341,7 @@ test("l'ALLER-RETOUR, en toutes lettres : Espèces→Carte, puis Carte→Espèce
   //    dans la clé, ceci retombe sur les `settleRef` de l'étape 1 (déjà connus) et le moteur
   //    répondrait `alreadyCorrected:true` SANS RIEN ÉCRIRE, alors que la vente est encore fausse.
   const nbAvant = payments.length;
-  const r3 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000 });
+  const r3 = await runPaymentCorrection(deps, { saleId: "sale-1", tenantId: TENANT, fromMethod: "CASH", toMethod: "CARD", amountXpf: 5000, maintenant: MAINTENANT });
   assert.equal(r3.ok, true);
   if (!r3.ok) return;
   assert.equal(r3.alreadyCorrected, false, "3ème correction (même couple que la 1ère) : DOIT écrire vraiment, la génération a changé");
