@@ -1,5 +1,65 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔁 CORRIGER LE MOYEN DE PAIEMENT D'UN TICKET — `POST /api/sales/:id/payment-correction` (2026-08-26)
+
+🗣️ Demande de la gérante d'Aurel'Styl : *« revenir en arrière sur un mode de paiement quand on
+s'est trompé »*. **Aucune migration, aucun changement de schéma.**
+
+**Un `SalePayment` n'est jamais modifié** — il ne l'était nulle part dans ce moteur, et ça ne
+change pas. La correction s'écrit en **CONTRE-ÉCRITURE** : `-X` sur l'ancien moyen, `+X` sur le
+nouveau. `Sale.totalXpf` et `Sale.status` ne sont **pas** touchés ⇒ le CA (`totalSalesXpf`) est
+intact, et l'attendu du Z se corrige **tout seul** : `closeSession` recalcule `expectedXpf` en
+sommant les `SalePayment` de méthode `CASH` de la session. Rien à « rafraîchir » : c'est une
+propriété du calcul, pas une discipline.
+
+🛑 **REFUS SI LA SESSION EST CLÔTURÉE (ou absente) — la garde centrale du lot.** La clôture fige
+`expectedXpf`/`varianceXpf` en base, mais `buildReport` (`lib/caisse.ts` ~213-230) réaffiche un
+attendu **recalculé à chaud** : corriger après coup ferait dire au même écran un attendu et un
+écart qui ne se répondent plus. C'est une décision **prudente en attente d'arbitrage de la
+gérante**, pas une propriété technique — si elle demande l'inverse, il faudra alors décider ce que
+devient le Z archivé. Éprouvé **par mutation** : garde retirée ⇒ un test rouge, et un seul.
+
+**L'ORDRE, et il compte : la COMPTABILITÉ d'abord, la caisse ensuite** (même raison que
+`void-sale.ts` : une caisse qui dit « carte » pendant que la comptabilité dit « espèces » est le
+pire des deux états). Si l'écriture comptable échoue → `502 COMPTA_CORRECTION_FAILED`, **rien**
+n'est écrit ici. Le rejeu est sûr : Compta répond « déjà corrigé », la caisse finit son travail.
+
+- 🔑 Clé **déterministe** `caisse:<saleId>:<de>-<vers>:<montant>` ; `settleRef` = `corr:<clé>:out` /
+  `:in`, **exactement les `ref` posées côté Compta**. C'est voulu : si le cron `repair-sales`
+  rejouait `runSaleSync`, le `settle` du montant négatif retomberait sur une `ref` déjà connue et
+  serait absorbé en « déjà payé » au lieu d'écrire un doublon.
+- Autres refus : `NOT_PAID` · `NO_INVOICE` · `NOT_SYNCED` (la vente n'est pas encore remontée en
+  compta : on ne corrige pas ce que le cron n'a pas fini d'écrire) · `NOTHING_TO_CORRECT` ·
+  `INVALID` (moyen hors enum `PayMethod` — un **test structurel relit `schema.prisma`** pour que
+  l'ajout d'un moyen ne passe pas inaperçu).
+- `log.info` **n'existait pas** dans `lib/log.ts` : ajouté. C'est là que vit la trace « qui a
+  corrigé » (`sale.payment_correction`) — aucun champ de schéma ne peut la porter sans migration.
+
+🔒 **VERROU DE LIGNE SUR `Sale` (`lib/sale-lock.ts`) — deux défauts trouvés par la revue QA du
+26/08, tous deux fermés avant livraison :**
+1. **La course.** `insertCorrectionPayments` comptait puis créait : en `READ COMMITTED`, deux
+   appels simultanés lisaient `count = 0` et écrivaient **4 lignes au lieu de 2** — Z faussé.
+   `SalePayment` n'a **aucune unicité en base** sur `settleRef` (contrairement à `CashMovement.ref`)
+   et en ajouter une serait une migration. On ferme donc un cran plus tôt, sur la **lecture** :
+   `SELECT … FOR UPDATE` sur la ligne `Sale`, **première** opération de la transaction d'écriture —
+   exactement le remède posé côté Compta le 23/08 (`invoice-lock.ts`), même plafond `lock_timeout`
+   3 s sous le timeout Prisma. ⚠️ **Le verrou ne couvre JAMAIS l'appel réseau à Compta** (il est
+   pris après). Éprouvé par mutation : sans verrou, la course écrit 4 lignes et le test rougit.
+2. **L'aller-retour silencieux.** Espèces→Carte, puis Carte→Espèces, puis Espèces→Carte : la 3ᵉ
+   retombait sur la clé de la 1ʳᵉ, répondait « déjà corrigé » et **n'écrivait rien pendant que
+   l'écran annonçait un succès**. La clé porte désormais une **génération** — le nombre de
+   `SalePayment` déjà préfixés `corr:` sur la vente, lu dans le snapshot (aucune requête de plus).
+   Deux appels *simultanés* lisent la même génération (donc même clé, donc dédupliqués) ; deux
+   corrections *successives* en voient des différentes. Test écrit en toutes lettres.
+
+🕳️ **Limite connue, assumée** : si l'écriture Compta réussit et que la caisse échoue derrière, le
+rejeu répare (clé déterministe) — mais **aucun cron ne le rejoue tout seul**, contrairement à
+`repair-sales` pour la synchro des ventes. Sans nouvelle tentative, les deux moteurs restent
+divergents en silence.
+
+✅ **234 tests** (207 avant), `tsc` 0, `next build` OK. Consommé par la surface **Aurel'Styl**
+uniquement pour l'instant (les 4 autres surfaces : lot à part, aucun travail moteur à refaire).
+
 ## 🗃️ IMPORTER UNE CLÔTURE Z + TAUX DE TGC PAR LIGNE (2026-08-22) — ✅ APPLIQUÉ ET EN PRODUCTION
 
 Migration `20260823090000_import_cloture_z` **appliquée le 2026-08-22** sur autorisation explicite de

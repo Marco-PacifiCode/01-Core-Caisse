@@ -26,4 +26,8 @@ export const log = {
   warn(scope: string, ctx?: Ctx): void {
     console.warn(`[core-caisse] WARN ${scope} ${ctx ? JSON.stringify(ctx) : ""}`)
   },
+  /** Trace d'un geste métier normal (audit), pas une erreur ni une anomalie. */
+  info(scope: string, ctx?: Ctx): void {
+    console.log(`[core-caisse] INFO ${scope} ${ctx ? JSON.stringify(ctx) : ""}`)
+  },
 }
