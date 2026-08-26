@@ -23,11 +23,19 @@ pas. corrections jusqu'à 1 mois plus tard. ça se voit au recomptage de la cais
   décrivent les VENTES, pas le tiroir — c'est cette ventilation-là qu'on veut voir suivre la
   correction. Repli sur le recalcul si `expectedXpf` est `null` (vieille session).
 - ⏳ **`TOO_OLD` : fenêtre d'1 MOIS** sur `sale.paidAt ?? sale.createdAt` (`lib/fenetre-correction.ts`).
-  **Mois CALENDAIRE** et non 31 jours (« un mois plus tard » se lit sur un calendrier) ; débordement
-  de quantième géré (31 janv. → 28/29 fév.) ; **heure NC = UTC+11 FIXE** — compter en UTC décalait la
+  **Mois CALENDAIRE** et non 31 jours (« un mois plus tard » se lit sur un calendrier) ; **heure NC = UTC+11 FIXE** — compter en UTC décalait la
   limite d'un jour pour une partie des encaissements ; borne **incluse**. `maintenant` est **injecté**,
   sans quoi les bornes ne se testent pas. ⚠️ **Module JUMEAU dans `01-Core-Compta`** (dépôts séparés,
   aucun paquet partagé) : le modifier ici oblige à le modifier là-bas.
+  🔄 **CORRIGÉ le 26/08 au soir (livré : `cbdb29a`) — le quantième DÉBORDE, il n'est plus raboté.** 🗣️ Marco : *« le
+  problème du mois calendaire, c'est qu'une erreur faite le 31 n'est pas récupérée le 1er. »* Le
+  rabotage au dernier jour du mois cible volait des jours aux quantièmes élevés : le 31 mars
+  n'avait que jusqu'au **30 avril**, moins d'un mois — et moins que le 1er du même mois, qui allait
+  jusqu'au 1er mai. Désormais : 31 mars → **1er mai**, 31 janv. → **3 mars** (28 fév. + 3),
+  bissextile → **2 mars**. Règle : **au moins un mois, jamais moins**. Les deux jumeaux ont été
+  changés ENSEMBLE et comparés côte à côte sur cinq cas de bord — limites identiques.
+  🪤 Trois tests d'ici s'appuyaient sur le rabotage (dont « 23 h NC ne perd pas un jour », qui
+  mêlait fuseau ET débordement) : réécrits pour ne mesurer qu'une chose à la fois.
 - ✅ **254 tests** (234 avant), `tsc` 0, build OK. Mutations prouvées : `TOO_OLD` retiré → 3 rouges ;
   31 jours au lieu du mois → 5 rouges ; attendu recalculé sur session close → 1 rouge.
 - 📌 `tsconfig.json` gagne `allowImportingTsExtensions` (même raison que côté Compta : un module pur
