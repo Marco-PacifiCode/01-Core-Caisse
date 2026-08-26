@@ -1,6 +1,10 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🔁 CORRIGER LE MOYEN DE PAIEMENT D'UN TICKET — `POST /api/sales/:id/payment-correction` (2026-08-26)
+## 🔁 CORRIGER LE MOYEN DE PAIEMENT D'UN TICKET — `POST /api/sales/:id/payment-correction` (2026-08-26) — ✅ **en production**
+
+🚀 **PR #26 · `main 30ddcd3` · release `20260826-180052` · WEB OK.** Livré **après** Core-Compta
+(PR #43, qui devait savoir répondre avant qu'on l'appelle) et **avant** la surface Aurel'Styl
+(PR #48). Ordre inverse : rien n'aurait cassé, mais aucune correction n'aurait abouti.
 
 🗣️ Demande de la gérante d'Aurel'Styl : *« revenir en arrière sur un mode de paiement quand on
 s'est trompé »*. **Aucune migration, aucun changement de schéma.**
