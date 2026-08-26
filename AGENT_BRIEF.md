@@ -1,6 +1,9 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## ⚖️ MARCO TRANCHE : la caisse close ne bloque plus, fenêtre d'1 MOIS (2026-08-26, soir)
+## ⚖️ MARCO TRANCHE : la caisse close ne bloque plus, fenêtre d'1 MOIS (2026-08-26, soir) — ✅ **en production**
+
+🚀 **PR #28 · `main 831c830` · release `20260826-202345` · WEB OK.** Livré après Compta (PR #45),
+avant la surface Aurel'Styl (PR #50).
 
 🗣️ **Verbatim** : *« le moyen de paiement n'est pas très important. tant que le montant ne change
 pas. corrections jusqu'à 1 mois plus tard. ça se voit au recomptage de la caisse de toute façon. »*
