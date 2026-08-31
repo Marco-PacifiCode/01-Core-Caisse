@@ -107,7 +107,25 @@ export async function POST(req: NextRequest) {
 
 /**
  * GET /api/sales?tenantId=...&status=...&sessionId=...&from=ISO&to=ISO&limit=...
+ *              [&sourceType=rdv&sourceId=<uuid>]
  * Historique des tickets d'un tenant (S2S, X-Core-Key).
+ *
+ * ── `sourceType` / `sourceId` : répondre « ce ticket existe-t-il ? » ────────────────
+ * Ajoutés le 2026-08-31. Une vente créée depuis un rendez-vous porte
+ * `(sourceType, sourceId) = ("rdv", appointmentId)` — c'est sa clé d'idempotence, celle
+ * de l'index unique `uniq_sale_external_source`.
+ *
+ * Une surface qui veut savoir si un rendez-vous a déjà son ticket n'avait, sans ce
+ * filtre, qu'un seul moyen : tirer les 500 dernières ventes et chercher dedans. C'est
+ * cher pour une question booléenne, et surtout **c'est faux** — une vente plus ancienne
+ * que la fenêtre passe à travers, et on conclut « pas de ticket » sur un rendez-vous
+ * déjà encaissé. Or `createSale` rend la vente EXISTANTE sans mettre ses lignes à jour :
+ * une réponse fausse ici fait encaisser un panier périmé. C'est de l'argent, donc on ne
+ * répond pas de façon probabiliste.
+ *
+ * Les deux paramètres n'ont d'effet qu'ENSEMBLE (un `sourceType` seul filtrerait toute
+ * une famille de ventes, ce que personne ne demande aujourd'hui). Absents, la réponse est
+ * STRICTEMENT celle d'avant : aucun appelant existant ne change de comportement.
  */
 export async function GET(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -120,6 +138,10 @@ export async function GET(req: NextRequest) {
   const from = searchParams.get("from");
   const to = searchParams.get("to");
   const limit = Math.min(Number(searchParams.get("limit")) || 100, 500);
+  // Les deux ensemble, ou rien : cf. le bloc de doc ci-dessus.
+  const sourceType = searchParams.get("sourceType");
+  const sourceId = searchParams.get("sourceId");
+  const sourceFilter = sourceType && sourceId ? { sourceType, sourceId } : {};
 
   const sales = await withTenant(tenantId, (tx) =>
     tx.sale.findMany({
@@ -127,6 +149,7 @@ export async function GET(req: NextRequest) {
         tenantId,
         ...(status ? { status: status as never } : {}),
         ...(sessionId ? { sessionId } : {}),
+        ...sourceFilter,
         ...(from || to
           ? { createdAt: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } }
           : {}),
