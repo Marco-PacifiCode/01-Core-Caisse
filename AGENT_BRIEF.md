@@ -1,6 +1,11 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🔎 `GET /api/sales` FILTRABLE PAR `(sourceType, sourceId)` — ⏳ **PR #32 OUVERTE, NON DÉPLOYÉE** (2026-08-31)
+## ✅ `GET /api/sales` FILTRABLE PAR `(sourceType, sourceId)` — **PR #32 MERGÉE ET DÉPLOYÉE** (2026-09-01)
+
+> 🗣️ **Marco, 2026-09-01 : « ok go pour tout ».** Mergée (`d7761be`) puis livrée :
+> release `20260901-005946`, artefact **prouvé == `origin/main`**, `pm2 core-caisse` **online**.
+> C'est la brique qui permet de POSER la question « existe-t-il déjà un ticket pour ce
+> rendez-vous ? » — sans elle, la garde d'argent de `01-Core-RDV` n'a rien à interroger.
 
 > **PR** : `github.com/Marco-PacifiCode/01-Core-Caisse/pull/32` (branche `claude/sales-filtre-source`).
 > **À merger EN PREMIER** des trois du lot : `01-Core-RDV` **#99** et `Ellement-de-beaute` **#185** en
