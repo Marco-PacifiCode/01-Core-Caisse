@@ -1,5 +1,32 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔎 `GET /api/sales` FILTRABLE PAR `(sourceType, sourceId)` — ⏳ **PR #32 OUVERTE, NON DÉPLOYÉE** (2026-08-31)
+
+> **PR** : `github.com/Marco-PacifiCode/01-Core-Caisse/pull/32` (branche `claude/sales-filtre-source`).
+> **À merger EN PREMIER** des trois du lot : `01-Core-RDV` **#99** et `Ellement-de-beaute` **#185** en
+> dépendent. **Aucune migration.** CI locale **GREEN**, `tsc` 0 erreur, **255/255**.
+
+**Deux paramètres optionnels**, qui n'ont d'effet **qu'ensemble**. **Sans eux, la requête produite est
+identique à celle d'avant** — aucun appelant existant ne change de comportement.
+
+**Pourquoi.** Une vente ouverte depuis un rendez-vous porte `(sourceType, sourceId) = ("rdv",
+appointmentId)` — sa clé d'idempotence (index `uniq_sale_external_source`). Une surface qui veut savoir
+si un rendez-vous a **déjà son ticket** n'avait qu'un seul moyen : tirer les **500 dernières** ventes et
+chercher dedans. C'est cher pour une question booléenne, et surtout **c'est faux** — une vente plus
+ancienne que la fenêtre passe à travers, et on conclut « pas de ticket » sur un rendez-vous déjà
+encaissé.
+
+💰 **Et cette réponse garde de l'argent** : `createSale` (`lib/caisse.ts`) **rend la vente existante
+SANS remettre ses lignes à jour**. Un « non » erroné laisse changer le panier du rendez-vous, et la
+caisse encaisse ensuite l'**ancien** panier, en silence. **On ne répond donc pas de façon
+probabiliste.**
+
+🪤 **Pour qui écrit un appelant** : tant que ce filtre n'est pas déployé, un moteur ancien **ignore les
+deux paramètres** et renvoie les N dernières ventes du tenant. Un appelant honnête doit détecter ce cas
+(un `sourceId` qui ne correspond pas à celui demandé) et conclure **« je n'ai pas pu savoir »** — donc
+refuser. C'est ce que fait la surface Ellément (`app/app/admin/agenda/actions.ts`,
+`ticketExisteInterne`). ⚠️ **Jamais `false`** : ce serait ouvrir le trou exactement là où il coûte.
+
 ## ⚖️ MARCO TRANCHE : la caisse close ne bloque plus, fenêtre d'1 MOIS (2026-08-26, soir) — ✅ **en production**
 
 🚀 **PR #28 · `main 831c830` · release `20260826-202345` · WEB OK.** Livré après Compta (PR #45),
