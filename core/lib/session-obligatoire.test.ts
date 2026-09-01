@@ -113,14 +113,22 @@ test("createSale appelle bien la règle — la garde n'est pas seulement écrite
   assert.match(bloc, /decideSessionVente\(/);
 });
 
-test("🔴 le refus tombe AVANT tx.sale.create — aucune vente, aucune ligne, rien à défaire", () => {
+test("🔴 createSale COUPE sur un refus — la garde est un `return`, pas une intention", () => {
+  // ⚠️ CE TEST A ÉTÉ FAUX PENDANT UNE HEURE, ET C'EST INSTRUCTIF. Il cherchait la chaîne
+  // `error: "NO_OPEN_SESSION"` — qui apparaît AUSSI dans la SIGNATURE de `createSale` (le type
+  // de retour). Le repère était donc trouvé même après suppression complète de la garde : une
+  // mutation qui supprimait les trois lignes du `return` restait VERTE (mesuré par le QA).
+  // On s'ancre désormais sur l'INSTRUCTION, jamais sur un mot qui traîne aussi dans un type.
   const bloc = caisse.slice(caisse.indexOf("export async function createSale"));
   const iDecision = bloc.indexOf("decideSessionVente(");
-  const iRefus = bloc.indexOf('error: "NO_OPEN_SESSION"');
   const iCreate = bloc.indexOf("await tx.sale.create(");
-  assert.ok(iDecision > 0 && iRefus > 0 && iCreate > 0, "les trois reperes doivent exister");
+  const mRefus = /if \(decision\.action === "REFUSEE"\) \{\s*return \{ ok: false as const, error: "NO_OPEN_SESSION" as const \};\s*\}/.exec(
+    bloc,
+  );
+  assert.ok(mRefus, "createSale doit couper sur une décision REFUSEE, par un return");
+  assert.ok(iDecision > 0 && iCreate > 0, "les deux repères doivent exister");
   assert.ok(iDecision < iCreate, "la décision doit précéder la création");
-  assert.ok(iRefus < iCreate, "le refus doit précéder la création");
+  assert.ok(mRefus.index < iCreate, "le refus doit précéder la création — aucune vente écrite");
 });
 
 test("createSale écrit le sessionId DÉCIDÉ, plus jamais celui de l'appelant tel quel", () => {
