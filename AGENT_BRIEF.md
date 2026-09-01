@@ -6,7 +6,7 @@
 > aujourd'hui chez Ellément, son premier rdv n'est pas inscrit en caisse. »* puis, après arbitrage du
 > périmètre : *« il faut seulement que la caisse soit ouverte pour encaisser à partir de maintenant. »*
 
-🛑 **NON DÉPLOYÉ, ET CE N'EST PAS UN OUBLI.** C'est de l'argent : une garde mal posée bloque un
+🛑 **NON DÉPLOYÉ, ET CE N'EST PAS UN OUBLI.** PR **#36** (la #35, même branche, a été fermée par erreur). C'est de l'argent : une garde mal posée bloque un
 encaissement réel au comptoir. Marco voit la forme avant. Branche `claude/session-obligatoire`.
 
 ### Le trou
