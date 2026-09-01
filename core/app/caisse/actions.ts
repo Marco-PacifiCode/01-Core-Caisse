@@ -125,11 +125,16 @@ export async function checkoutAction(
   });
   if (!created.ok) {
     const msg =
-      created.error === "PRODUCT_LINE_WITHOUT_PRODUCT"
-        ? "Une ligne produit n'a pas de produit associé."
-        : created.error === "INVALID_QTY"
-          ? "Quantité invalide."
-          : "Ticket vide.";
+      created.error === "NO_OPEN_SESSION"
+        ? // Cet écran ne monte le pavé de vente que si une session est ouverte : ce message ne
+          // devrait donc jamais s'afficher. Il est là pour la course — la caisse clôturée depuis
+          // un autre poste pendant qu'un ticket se composait — et il DIT LE GESTE, pas la panne.
+          "La caisse n'est pas ouverte. Ouvrez une session de caisse, puis encaissez à nouveau."
+        : created.error === "PRODUCT_LINE_WITHOUT_PRODUCT"
+          ? "Une ligne produit n'a pas de produit associé."
+          : created.error === "INVALID_QTY"
+            ? "Quantité invalide."
+            : "Ticket vide.";
     return { ok: false, error: msg };
   }
 

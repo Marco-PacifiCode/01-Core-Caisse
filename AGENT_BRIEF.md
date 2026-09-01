@@ -1,5 +1,136 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔒 PAS DE VENTE SANS CAISSE OUVERTE — **PR OUVERTE, RIEN DE DÉPLOYÉ** (2026-09-01)
+
+> 🗣️ **Marco, 2026-09-01** : *« un encaissement ne devrait pas être possible sans ouvrir de caisse.
+> aujourd'hui chez Ellément, son premier rdv n'est pas inscrit en caisse. »* puis, après arbitrage du
+> périmètre : *« il faut seulement que la caisse soit ouverte pour encaisser à partir de maintenant. »*
+
+🛑 **NON DÉPLOYÉ, ET CE N'EST PAS UN OUBLI.** PR **#36** (la #35, même branche, a été fermée par erreur). C'est de l'argent : une garde mal posée bloque un
+encaissement réel au comptoir. Marco voit la forme avant. Branche `claude/session-obligatoire`.
+
+### Le trou
+
+`Sale.sessionId` est **nullable** et personne ne le remplissait de force. Une vente sans session
+n'entre dans **aucun Z** (`closeSession` filtre `sessionId = <la session>`) : elle est encaissée,
+facturée côté Compta, et **absente de la clôture de caisse**. Mesuré en production le 2026-09-01 :
+**4 ventes / 28 700 F** sur trois salons (Onéiti 2 · AurelStyl 1 · Ellément 1). Chez Ellément, ticket
+créé à **10h22**, session ouverte à **10h25** — **trois minutes**.
+
+### ⚠️ Il avait DEUX causes, et une seule se voit
+
+1. **Aucune session ouverte** — le cas d'Ellément. Visible, racontable.
+2. **Une session est ouverte, mais l'écran ne le sait pas.** Les cinq surfaces dérivent le
+   `sessionId` au chargement de `app/app/admin/page.tsx` par un appel S2S `GET /api/sessions`
+   terminé par **`.catch(() => null)`**. Moteur qui hoquette, clé S2S en défaut, page chargée avant
+   l'ouverture de la caisse → la surface envoie `null` **alors que la session existe**. Aucun écran
+   ne peut corriger ça : l'écran est justement celui qui se trompe.
+
+➡️ D'où la forme retenue : **le `sessionId` de l'appelant n'est plus une consigne, c'est une
+proposition.** Le moteur relit, tranche, et ne refuse qu'en dernier recours.
+
+### 🔎 Pourquoi V-Cut n'a AUCUNE vente hors session — ce n'est PAS le code
+
+Mesuré par quatre méthodes indépendantes (hash du corps de `checkoutTicket` **identique** sur les 5
+surfaces, `diff -u` de `TicketLauncher.tsx`, de `admin/page.tsx`, de `CaisseManager.tsx`) :
+**il n'existe aucune différence de code entre V-Cut et les quatre autres.** Le trou est le même
+partout, à la ligne près. **V-Cut est propre par USAGE** : sa caisse est ouverte en permanence
+(déjà constaté en prod la semaine du 4 août, cf. `01-Core-RDV`). La discipline d'un salon n'est pas
+une garde — c'est pour ça qu'il en fallait une.
+
+### La garde, telle qu'elle est posée
+
+**Au moteur, dans `createSale` — le SEUL point d'écriture d'une vente du dépôt** (confirmé deux fois,
+par motif et par inspection fichier par fichier : un unique `tx.sale.create`, et une unique route
+`POST /api/sales`). Une garde d'écran n'aurait couvert qu'un chemin sur cinq.
+
+Règle pure et testée dans **`core/lib/session-obligatoire.ts`** — l'ordre des quatre cas EST la
+décision :
+1. **remontée différée** → exemptée (jamais refusée) ;
+2. session proposée et **OUVERTE** → gardée ;
+3. sinon, **caisse ouverte du moment** → le moteur **estampille** *(c'est ce qui ferme la cause n°2)* ;
+4. sinon → **refus `NO_OPEN_SESSION`**, **avant** toute écriture.
+
+`POST /api/sales` répond **409** (et non 400) : « l'état du serveur s'y oppose », pas « ta requête est
+malformée » — c'est ce que l'écran distingue pour proposer d'ouvrir la caisse.
+
+### 🛑 La forme non bloquante — c'est la moitié qui compte
+
+Un refus sec à une cliente carte à la main serait **pire que le trou**. Côté surface
+(`TicketLauncher.tsx`), le 409 fait apparaître, **dans la fenêtre de paiement** : « La caisse n'est
+pas ouverte » + **fond de caisse** + **« Ouvrir la caisse et encaisser »** → `openCashSession` puis
+**rejeu à l'identique**. Le ticket reste ouvert, les montants restent saisis, **rien n'est à
+ressaisir**. Rejouer est sûr : le refus n'a rien écrit, et l'idempotence `("rdv", appointmentId)`
+tient de toute façon. Le fond de caisse est demandé **explicitement** (`0` accepté, vide refusé) : le
+deviner à 0 fabriquerait un écart dès le premier Z.
+
+### 🪤 Ce qui aurait cassé un marchand EN PRODUCTION
+
+**La Rôtisserie de Pouembout** (`rotisserie-surface`, pm2, en ligne) encaisse **hors ligne**, tient
+son Z **en local**, et remonte ses ventes une fois par jour **avec `sessionId` nul, délibérément**.
+Une garde nue lui aurait refusé **chaque ticket**, en silence (`echecs.push`), tickets bloqués sur la
+tablette, invisible jusqu'à la compta du mois.
+→ **Exemption sur DEUX marqueurs indépendants** : `occurredAt` **ou** le nouveau `horsSession: true`.
+Il faut que **les deux manquent** pour que la garde morde. Le second existe parce que le premier ne
+suffit pas : la Rôtisserie tire `occurredAt` d'un champ **facultatif** de sa tablette
+(`horodatage?: string` → `?? null`).
+
+### 🚨 DEUX SURFACES EN PRODUCTION QUE PERSONNE N'AVAIT LISTÉES — **à trancher AVANT de merger**
+
+Trouvées par un **second** balayage, à la fin du lot, sur **tous** les dépôts de l'écosystème (le
+premier ratissage ne couvrait que les 5 salons + les Cores). **Ce moteur est mutualisé : la garde
+s'applique à elles aussi, et elles n'ont pas la forme non bloquante.**
+
+| Surface | pm2 | Ce qui se passe au merge du moteur |
+|---|---|---|
+| **`Pacifik`** (Le Pacifik Koné) | `pacifik-surface` **en ligne** | `surface/lib/caisse-actions.ts` **`creerNote`** poste `/api/sales` **sans `sessionId`, sans `occurredAt`, sans `horsSession`** → **refusé** si aucune caisse n'est ouverte. Message affiché : le texte brut du moteur (`corpsErreur` rend `corps.error`) → **« NO_OPEN_SESSION »** à l'écran. |
+| **`ArtDuSoin`** | `lartdusoin-surface` **en ligne** | Même patron `checkoutTicket` que les 5 salons (`finance-actions.ts:583`, `sessionId: input.sessionId ?? undefined`) → refus possible, et **`created.error` brut** affiché. C'est un **PROSPECT**, hors périmètre d'unification (Marco, 22/08) — donc hors du lot, mais **pas hors du moteur**. |
+
+⚠️ **Et pour le Pacifik, ce n'est pas qu'une question de message.** Le geste refusé serait
+**« ouvrir une note de table »**, pas un encaissement : dans un restaurant on ouvre la note, on
+encaisse plus tard. 🗣️ Marco a demandé *« que la caisse soit ouverte pour **encaisser** »*. Refuser
+l'ouverture d'une note va **plus loin** que la demande.
+
+**Ce que je n'ai pas fait, et pourquoi.** Ni l'un ni l'autre n'est dans le périmètre qu'on m'a donné
+(« les 5 surfaces »), et élargir seul le rayon d'action d'une garde d'argent sur deux commerces en
+production n'est pas une décision d'agent. **Trois issues possibles, Marco tranche :**
+1. **porter la forme non bloquante** aux deux (le patron existe, c'est mécanique) ;
+2. **les exempter** — `horsSession: true` sur `creerNote` du Pacifik (une note de table n'est pas un
+   encaissement), et laisser ArtDuSoin tel quel tant qu'il est prospect ;
+3. **assumer le refus** en n'améliorant que le message.
+
+### ⛔ ORDRE DE DÉPLOIEMENT — non négociable
+
+**1. `Rotisserie-Pouembout`** (PR `claude/hors-session-explicite`) · **2. les 5 surfaces** ·
+**3. CE MOTEUR, en dernier.**
+Chaque étape est **inerte** tant que la suivante n'est pas là (un champ inconnu de `POST /api/sales`
+est ignoré ; un 409 que le moteur n'émet pas encore n'est jamais reçu). **Livrer le moteur en premier
+casse la Rôtisserie et met un mur au comptoir des salons.**
+
+### Vérifié
+
+- **CI locale GREEN** (`ci-local.sh core-caisse`, exit 0, 5 étapes) · `tsc --noEmit` **0 erreur** ·
+  **273 tests / 273 pass** (255 avant, **+18**).
+- **Mutations prouvées rouges** : garde neutralisée → **3 rouges** · ordre des règles inversé →
+  **1 rouge** · `return` de refus supprimé de `createSale` → **1 rouge**.
+- 🪤 **Ce troisième test a été FAUX une heure**, et c'est la leçon du lot : il s'ancrait sur la chaîne
+  `error: "NO_OPEN_SESSION"`, **qui apparaît aussi dans la signature** de `createSale`. La garde
+  pouvait être entièrement supprimée sans faire rougir quoi que ce soit — trouvé par une mutation, pas
+  par une relecture. **On s'ancre sur l'instruction, jamais sur un mot qui traîne aussi dans un type.**
+- **Aucune migration.** `sessionId` reste nullable — le passer `NOT NULL` échouerait sur les lignes
+  nulles restantes.
+
+### Ce qui N'A PAS été fait, volontairement
+
+- **Les 26 200 F restants** (Onéiti 2 ventes / 16 700 F · AurelStyl 1 / 9 500 F) ne sont **pas**
+  régularisés : 🗣️ *« les autres on laisse pour l'instant »* (Marco, 2026-09-01). Ce sont les pièces
+  d'un marchand. *(La vente d'Ellément — 2 500 F — a été rattachée séparément par le coordinateur,
+  session encore ouverte, aucun Z arrêté touché ; sauvegarde `C:\dev\_backup\2026-09-01-ellement-vente-hors-session\`.)*
+- **`checkoutSale` n'est pas gardé** : la garde est à la création, seul point d'écriture. Reste donc
+  ouvert, et assumé pour l'instant — une vente créée pendant une session, **payée après sa clôture**,
+  entre dans un Z dont l'`expectedXpf` est figé. Hors du « seulement que la caisse soit ouverte pour
+  encaisser » demandé.
+
 ## ✅ `GET /api/sales` FILTRABLE PAR `(sourceType, sourceId)` — **PR #32 MERGÉE ET DÉPLOYÉE** (2026-09-01)
 
 > 🗣️ **Marco, 2026-09-01 : « ok go pour tout ».** Mergée (`d7761be`) puis livrée :

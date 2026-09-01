@@ -45,6 +45,7 @@ import {
 } from "./payment-correction";
 import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
 import { expectedXpfPourRapport } from "./z-report";
+import { decideSessionVente, sessionIdADecision } from "./session-obligatoire";
 import { lockSaleRow } from "./sale-lock";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -394,6 +395,13 @@ export type SaleLineInput = {
 
 export type CreateSaleInput = {
   cashierId?: string;
+  /**
+   * Session de caisse PROPOSÉE par l'appelant — une proposition, plus une consigne.
+   *
+   * Depuis le 2026-09-01, le moteur la RELIT en base et ne la retient que si elle est encore
+   * OUVERTE ; sinon il estampille la caisse ouverte du moment, et à défaut il refuse
+   * (`NO_OPEN_SESSION`). Cf. lib/session-obligatoire.ts pour le pourquoi des quatre règles.
+   */
   sessionId?: string | null;
   clientName?: string | null;
   lines: SaleLineInput[];
@@ -413,6 +421,22 @@ export type CreateSaleInput = {
    *  venir que d'une tablette mal réglée, et daterait une vente d'un exercice
    *  qui n'a pas commencé. */
   occurredAt?: Date | null;
+  /**
+   * « Cette vente n'appartient à aucune session de caisse de CE serveur. »
+   *
+   * Déclaration EXPLICITE d'une caisse hors ligne, qui tient son Z en local et le remonte par
+   * `POST /api/sessions/import`. Exempte la vente de la garde « pas d'encaissement sans caisse
+   * ouverte » (lib/session-obligatoire.ts).
+   *
+   * ⚠️ Ce marqueur DOUBLE volontairement `occurredAt`, il ne le remplace pas. `occurredAt` suffit
+   * en théorie — une vente datée du passé n'est pas un encaissement au comptoir — mais la
+   * Rôtisserie le tire d'un champ FACULTATIF de sa tablette (`horodatage?: string` → `?? null`).
+   * Un ticket sans horodatage serait alors refusé, et sa synchro échouerait en silence. Deux
+   * marqueurs indépendants : il faut que les deux manquent pour que la garde morde.
+   *
+   * Omis/false = comportement du comptoir : la garde s'applique.
+   */
+  horsSession?: boolean;
 };
 
 /**
@@ -424,6 +448,7 @@ export async function createSale(
   input: CreateSaleInput,
 ): Promise<
   | { ok: false; error: "EMPTY" | "PRODUCT_LINE_WITHOUT_PRODUCT" | "INVALID_QTY" | "FUTURE_DATE" }
+  | { ok: false; error: "NO_OPEN_SESSION" }
   | { ok: true; saleId: string; totalXpf: number; alreadyExisted: boolean }
 > {
   if (!input.lines || input.lines.length === 0) return { ok: false, error: "EMPTY" };
@@ -463,11 +488,50 @@ export async function createSale(
       }
     }
 
+    // ── « Pas d'encaissement sans caisse ouverte » (Marco, 2026-09-01) ────────────────────────
+    //
+    // Placé ICI, et pas ailleurs, pour trois raisons qui tiennent ensemble :
+    //   · `tx.sale.create` ci-dessous est la SEULE écriture de vente de tout ce moteur (une
+    //     seule aussi côté HTTP : `POST /api/sales`). Garder ce point, c'est garder tous les
+    //     chemins — comptoir, rendez-vous honoré, « en attente », bon cadeau, service à service.
+    //     Une garde posée dans un écran n'en couvrirait qu'un.
+    //   · APRÈS l'idempotence `(sourceType, sourceId)` : une vente déjà connue est RENDUE, pas
+    //     recréée. La refuser sur un rejeu ferait échouer une synchro qui n'a plus rien à écrire.
+    //   · AVANT toute écriture : un refus ne laisse ni ticket, ni ligne, ni paiement, ni facture.
+    //     Rien à défaire, rien à ressaisir — c'est ce qui rend le refus tenable au comptoir.
+    //
+    // La règle elle-même (l'ordre des quatre cas, et pourquoi) est dans lib/session-obligatoire.ts.
+    const posteId = input.posteId ?? null;
+    const sessionProposee = input.sessionId
+      ? await tx.cashSession.findFirst({
+          where: { id: input.sessionId, tenantId },
+          select: { id: true, status: true },
+        })
+      : null;
+    // Même invariant que `currentSession` : la session DU POSTE, jamais « n'importe laquelle » —
+    // sur un marchand multi-comptoirs, l'autre tiroir n'est pas le sien.
+    const sessionOuverte = await tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN", posteId },
+      orderBy: { openedAt: "desc" },
+      select: { id: true },
+    });
+    const decision = decideSessionVente({
+      sessionProposee,
+      sessionOuverteId: sessionOuverte?.id ?? null,
+      // Deux marqueurs INDÉPENDANTS de remontée différée — cf. `horsSession` dans CreateSaleInput :
+      // il faut que les deux manquent pour que la garde morde.
+      remonteeDifferee: input.horsSession === true || input.occurredAt != null,
+    });
+    if (decision.action === "REFUSEE") {
+      return { ok: false as const, error: "NO_OPEN_SESSION" as const };
+    }
+    const sessionIdDecide = sessionIdADecision(decision) ?? null;
+
     try {
       const sale = await tx.sale.create({
         data: {
           tenantId,
-          sessionId: input.sessionId ?? null,
+          sessionId: sessionIdDecide,
           cashierId: input.cashierId ?? null,
           clientName: input.clientName ?? null,
           sourceType: input.sourceType ?? null,
