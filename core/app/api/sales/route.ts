@@ -13,9 +13,20 @@ const VALID_KINDS: LineKind[] = ["SERVICE", "PRODUCT", "OTHER"];
  * une source externe (ex : RDV honoré) ou un poste de caisse distant. Idempotent sur
  * (sourceType, sourceId) quand fournis.
  *
+ * ⚠️ DEPUIS LE 2026-09-01 : PAS DE VENTE SANS CAISSE OUVERTE.
+ *   Le `sessionId` est une PROPOSITION, plus une consigne. Le moteur le relit, ne le retient que
+ *   s'il est encore OUVERT, sinon estampille la caisse ouverte du moment — et à défaut refuse
+ *   **409 NO_OPEN_SESSION**, avant d'avoir écrit quoi que ce soit.
+ *   Une vente sans session n'entrait dans AUCUN Z : encaissée, facturée, et absente de la clôture.
+ *   Une surface DOIT traiter le 409 en proposant d'ouvrir la caisse puis en rejouant — jamais en
+ *   affichant une erreur sèche à une cliente qui a sa carte à la main. Cf. lib/session-obligatoire.ts.
+ *
  * Body : { tenantId, cashierId?, sessionId?, clientName?, sourceType?, sourceId?,
- *          posteId?, occurredAt?,
+ *          posteId?, occurredAt?, horsSession?,
  *          lines: { kind, label, productId?, qty, unitXpf, tgcRatePpm? }[] }
+ *   horsSession : `true` = caisse HORS LIGNE qui tient son Z en local et le remonte par
+ *     POST /api/sessions/import (Rôtisserie de Pouembout). Exempte de la garde ci-dessus.
+ *     Redondant avec `occurredAt`, et c'est voulu : il faut que les DEUX manquent pour refuser.
  *   unitXpf : XPF entier (number).  productId : requis si kind=PRODUCT.
  *   posteId : caisse physique émettrice. Omis = marchand mono-caisse.
  *   occurredAt : date ISO de la vente RÉELLE, pour une remontée différée
@@ -38,6 +49,7 @@ export async function POST(req: NextRequest) {
     sourceId?: string;
     posteId?: string;
     occurredAt?: string;
+    horsSession?: boolean;
     lines?: { kind?: string; label?: string; productId?: string; qty?: number; unitXpf?: number; tgcRatePpm?: number }[];
   };
   try {
@@ -95,11 +107,19 @@ export async function POST(req: NextRequest) {
     sourceId: body.sourceId ?? null,
     posteId: body.posteId?.trim() || null,
     occurredAt,
+    // `=== true` et non un cast : un `"false"` de JSON mal formé ne doit pas exempter une vente
+    // de la garde. On n'exempte que sur une affirmation explicite.
+    horsSession: body.horsSession === true,
     lines: parsed,
   });
 
   if (!result.ok) {
-    const status = result.error === "PRODUCT_LINE_WITHOUT_PRODUCT" || result.error === "INVALID_QTY" ? 400 : 400;
+    // 409 CONFLICT pour NO_OPEN_SESSION, et c'est structurant, pas cosmétique : 400 dit « ta
+    // requête est mal formée » (l'écran affiche une erreur de saisie et la vente est perdue),
+    // 409 dit « l'état du serveur s'y oppose » — et cet état-là se répare en un geste. C'est ce
+    // code que la surface distingue pour PROPOSER D'OUVRIR LA CAISSE puis rejouer l'encaissement
+    // à l'identique, au lieu de renvoyer la gérante et sa cliente dans le mur.
+    const status = result.error === "NO_OPEN_SESSION" ? 409 : 400;
     return NextResponse.json({ error: result.error }, { status });
   }
   return NextResponse.json(result);
