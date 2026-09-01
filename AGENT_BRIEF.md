@@ -75,6 +75,30 @@ Il faut que **les deux manquent** pour que la garde morde. Le second existe parc
 suffit pas : la Rôtisserie tire `occurredAt` d'un champ **facultatif** de sa tablette
 (`horodatage?: string` → `?? null`).
 
+### 🚨 DEUX SURFACES EN PRODUCTION QUE PERSONNE N'AVAIT LISTÉES — **à trancher AVANT de merger**
+
+Trouvées par un **second** balayage, à la fin du lot, sur **tous** les dépôts de l'écosystème (le
+premier ratissage ne couvrait que les 5 salons + les Cores). **Ce moteur est mutualisé : la garde
+s'applique à elles aussi, et elles n'ont pas la forme non bloquante.**
+
+| Surface | pm2 | Ce qui se passe au merge du moteur |
+|---|---|---|
+| **`Pacifik`** (Le Pacifik Koné) | `pacifik-surface` **en ligne** | `surface/lib/caisse-actions.ts` **`creerNote`** poste `/api/sales` **sans `sessionId`, sans `occurredAt`, sans `horsSession`** → **refusé** si aucune caisse n'est ouverte. Message affiché : le texte brut du moteur (`corpsErreur` rend `corps.error`) → **« NO_OPEN_SESSION »** à l'écran. |
+| **`ArtDuSoin`** | `lartdusoin-surface` **en ligne** | Même patron `checkoutTicket` que les 5 salons (`finance-actions.ts:583`, `sessionId: input.sessionId ?? undefined`) → refus possible, et **`created.error` brut** affiché. C'est un **PROSPECT**, hors périmètre d'unification (Marco, 22/08) — donc hors du lot, mais **pas hors du moteur**. |
+
+⚠️ **Et pour le Pacifik, ce n'est pas qu'une question de message.** Le geste refusé serait
+**« ouvrir une note de table »**, pas un encaissement : dans un restaurant on ouvre la note, on
+encaisse plus tard. 🗣️ Marco a demandé *« que la caisse soit ouverte pour **encaisser** »*. Refuser
+l'ouverture d'une note va **plus loin** que la demande.
+
+**Ce que je n'ai pas fait, et pourquoi.** Ni l'un ni l'autre n'est dans le périmètre qu'on m'a donné
+(« les 5 surfaces »), et élargir seul le rayon d'action d'une garde d'argent sur deux commerces en
+production n'est pas une décision d'agent. **Trois issues possibles, Marco tranche :**
+1. **porter la forme non bloquante** aux deux (le patron existe, c'est mécanique) ;
+2. **les exempter** — `horsSession: true` sur `creerNote` du Pacifik (une note de table n'est pas un
+   encaissement), et laisser ArtDuSoin tel quel tant qu'il est prospect ;
+3. **assumer le refus** en n'améliorant que le message.
+
 ### ⛔ ORDRE DE DÉPLOIEMENT — non négociable
 
 **1. `Rotisserie-Pouembout`** (PR `claude/hors-session-explicite`) · **2. les 5 surfaces** ·
