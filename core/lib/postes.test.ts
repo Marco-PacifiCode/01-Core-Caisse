@@ -90,9 +90,13 @@ test("une date illisible est refusée au lieu de devenir silencieusement mainten
 });
 
 test("checkout n'ajoute d'options que s'il y a quelque chose à transmettre", () => {
-  // Sans giftCards ni paidAt, l'appel doit rester identique à celui d'avant :
+  // Sans giftCards, paidAt ni redeemGiftCards, l'appel doit rester identique à celui d'avant :
   // `undefined`, et non un objet vide qui changerait la signature observée.
-  assert.match(routeCheckout, /giftCards \|\| paidAt \? \{/);
+  //
+  // ⚠️ La liste des porteurs s'allonge (2026-09-04 : consommation d'un bon cadeau pendant
+  //    l'encaissement) ; ce qui NE doit pas changer, c'est qu'aucun d'eux n'est présent ⇒
+  //    `undefined`. On épingle donc la forme du ternaire, pas le nombre de termes.
+  assert.match(routeCheckout, /giftCards \|\| paidAt \|\| redeemGiftCards\s*\?/);
   assert.match(routeCheckout, /: undefined;/);
 });
 
