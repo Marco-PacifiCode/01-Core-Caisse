@@ -1,5 +1,37 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎁 CONSOMMER UN BON DANS LA TRANSACTION D'ENCAISSEMENT — livré (2026-09-04)
+
+🗣️ **Marco** : « elle ne peut pas encaisser avec un bon d'achat, il faut un bouton ici. »
+
+Le moteur savait **ÉMETTRE** un bon dans la transaction de l'encaissement, jamais en
+**CONSOMMER** un : `redeemGiftCard` était un appel séparé. Une surface qui voulait régler par
+bon devait donc brûler le bon **puis** encaisser — deux requêtes, et une fenêtre où la cliente
+perd son bon si le réseau coupe entre les deux.
+
+**`CheckoutOptions.redeemGiftCards`**, symétrique exact de `.giftCards` :
+- validation de **forme** d'abord (`normalizeRedeemedFor`), **inerte** sans le champ ;
+- contrôle de consommabilité **AVANT** que le moindre paiement soit persisté — même raison que
+  le contrôle de code libre : sans lui, l'argent serait pris et la vente resterait en attente ;
+- **UPDATE CONDITIONNEL** (`redeemedAt: null`) **DANS** le `withTenant` du passage à PAID :
+  0 ligne = un autre comptoir a brûlé le bon → on annule TOUT, le ticket reste DRAFT.
+
+🔒 **Aucun montant à encaisser n'y transite** : un bon n'est pas un moyen de paiement, son
+montant est entré dans le CA le jour de son achat. La surface a déjà retiré du ticket ce que le
+bon couvre (ligne `OTHER` négative).
+
+🛑 **AUCUNE migration** (le modèle `GiftCard` portait déjà tous les champs) et **AUCUNE valeur
+d'enum** — un test l'épingle désormais sur `PayMethod` et `LineKind` : une valeur d'enum
+PostgreSQL ne se retire jamais.
+
+⚠️ **Contrainte à connaître avant de toucher au bloc de la transaction** : un test structurel
+isole le code entre `const issued = await withTenant` et la **première** fermeture `  });`.
+Condition et marquage de l'`updateMany` sont donc sortis dans des `const` et l'appel tient sur
+UNE ligne — sinon le test échoue sur du code pourtant correct.
+
+258/258 tests, `tsc` 0. Trois tests structurels ajoutés (même transaction · update conditionnel
+· aucune valeur d'enum).
+
 ## ✅ `GET /api/sales` FILTRABLE PAR `(sourceType, sourceId)` — **PR #32 MERGÉE ET DÉPLOYÉE** (2026-09-01)
 
 > 🗣️ **Marco, 2026-09-01 : « ok go pour tout ».** Mergée (`d7761be`) puis livrée :
