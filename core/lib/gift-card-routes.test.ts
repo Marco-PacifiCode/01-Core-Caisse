@@ -293,3 +293,37 @@ test("🔴 checkoutSale : le passage à PAID et la création des bons sont dans 
   assert.match(bloc, /status:\s*"PAID"/);
   assert.match(bloc, /tx\.giftCard\.create/);
 });
+
+test("🔴 checkoutSale : le passage à PAID et la CONSOMMATION des bons sont dans LA MÊME transaction", () => {
+  // Symétrique exact du test précédent, et c'est le cœur de l'affaire : entre « le bon est
+  // brûlé » et « la vente est payée » il ne doit exister AUCUNE fenêtre. Une consommation
+  // sortie de ce bloc — dans un appel séparé, avant ou après — laisserait une cliente sans
+  // bon et sans prestation si le réseau coupe entre les deux requêtes.
+  const bloc = isolateBlock(corpsCheckoutSale(), "const issued = await withTenant", "  });");
+  assert.match(bloc, /status:\s*"PAID"/);
+  assert.match(bloc, /tx\.giftCard\.updateMany/);
+});
+
+test("🔴 la consommation est un UPDATE CONDITIONNEL, et 0 ligne annule tout l'encaissement", () => {
+  // `redeemedAt: null` dans le `where` : c'est la base, et elle seule, qui arbitre la course
+  // entre deux comptoirs. Un `findFirst` suivi d'un `update` laisserait passer les deux.
+  const bloc = isolateBlock(corpsCheckoutSale(), "const issued = await withTenant", "  });");
+  const iCond = bloc.indexOf("redeemedAt: null");
+  const iUpdate = bloc.indexOf("tx.giftCard.updateMany");
+  assert.ok(iCond > -1, "la condition `redeemedAt: null` a disparu du marquage");
+  assert.ok(iUpdate > -1, "l'updateMany a disparu de la transaction");
+  // Aucune relecture préalable dans le bloc : on ne LIT pas pour décider, on écrit sous condition.
+  assert.ok(!/tx\.giftCard\.findFirst/.test(bloc), "ne relis pas le bon dans la transaction : écris sous condition");
+  // Et l'échec doit ANNULER la transaction, pas être avalé.
+  assert.match(bloc, /throw new Error\("GIFT_CARD_RACE"\)/);
+});
+
+test("🔴 aucune valeur d'enum n'est ajoutée pour les bons cadeaux", () => {
+  // L'invariant du schéma : une valeur d'enum PostgreSQL ne se retire JAMAIS. Un bon n'est pas
+  // un moyen de paiement — s'il en devenait un, ce test tomberait avant la migration.
+  const schema = readFileSync(new URL("../prisma/schema.prisma", import.meta.url), "utf8");
+  const payMethod = schema.slice(schema.indexOf("enum PayMethod"), schema.indexOf("}", schema.indexOf("enum PayMethod")));
+  const lineKind = schema.slice(schema.indexOf("enum LineKind"), schema.indexOf("}", schema.indexOf("enum LineKind")));
+  assert.ok(!/GIFT/i.test(payMethod), `PayMethod a gagné une valeur de bon cadeau : ${payMethod}`);
+  assert.ok(!/GIFT/i.test(lineKind), `LineKind a gagné une valeur de bon cadeau : ${lineKind}`);
+});

@@ -44,6 +44,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     // champ près. Une évolution du moteur ne doit jamais coûter une vérification à un marchand
     // qui n'a rien demandé.
     giftCards?: GiftCardInput[];
+    // Bons cadeaux à CONSOMMER pendant cet encaissement. Aucun montant à encaisser n'y transite :
+    // un bon n'est pas un moyen de paiement, son montant est entré dans le CA le jour de son
+    // achat. La surface a déjà retiré du ticket ce que le bon couvre (ligne `OTHER` négative) ;
+    // il ne reste ici qu'à le brûler, dans la transaction du passage à PAID.
+    redeemGiftCards?: { id?: string; redeemedForXpf?: number | null; redeemedBy?: string | null; redeemedByName?: string | null }[];
   };
   try {
     body = await req.json();
@@ -75,6 +80,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // rien à transmettre, pour que l'appel soit à l'octet près celui d'avant PC-0064.
   const giftCards = Array.isArray(body.giftCards) && body.giftCards.length > 0 ? body.giftCards : undefined;
 
+  // Idem pour la consommation : la route transmet, elle ne juge pas. Seul l'`id` est exigé ici,
+  // parce qu'un `id` manquant n'est pas un refus métier mais une requête malformée.
+  let redeemGiftCards: { id: string; redeemedForXpf?: number | null; redeemedBy?: string | null; redeemedByName?: string | null }[] | undefined;
+  if (Array.isArray(body.redeemGiftCards) && body.redeemGiftCards.length > 0) {
+    redeemGiftCards = [];
+    for (const r of body.redeemGiftCards) {
+      if (!r?.id || typeof r.id !== "string") {
+        return NextResponse.json({ error: "redeemGiftCards : id requis sur chaque bon" }, { status: 400 });
+      }
+      redeemGiftCards.push({
+        id: r.id,
+        redeemedForXpf: r.redeemedForXpf ?? null,
+        redeemedBy: r.redeemedBy ?? null,
+        redeemedByName: r.redeemedByName ?? null,
+      });
+    }
+  }
+
   // `paidAt` : encaissement rejoué depuis une caisse hors ligne (2026-08-15).
   // Une date illisible est refusée ici plutôt que transformée en « maintenant »
   // sans le dire.
@@ -89,7 +112,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   // On n'ajoute la clé d'options QUE si elle porte quelque chose : sans
   // `giftCards` ni `paidAt`, l'appel reste à l'octet près celui d'avant.
-  const options = giftCards || paidAt ? { ...(giftCards ? { giftCards } : {}), ...(paidAt ? { paidAt } : {}) } : undefined;
+  const options =
+    giftCards || paidAt || redeemGiftCards
+      ? {
+          ...(giftCards ? { giftCards } : {}),
+          ...(paidAt ? { paidAt } : {}),
+          ...(redeemGiftCards ? { redeemGiftCards } : {}),
+        }
+      : undefined;
   const result = await checkoutSale(tenantId, saleId, parsed, options);
 
   if (!result.ok) {
@@ -102,6 +132,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       // Refus de bon cadeau : ils tombent AVANT tout encaissement, rien n'a été pris.
       GIFT_CARD_INVALID: 409,
       GIFT_CARD_CODE_TAKEN: 409,
+      // Bon inconsommable (inconnu, deja brule, annule) : refus AVANT tout encaissement.
+      GIFT_CARD_NOT_REDEEMABLE: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

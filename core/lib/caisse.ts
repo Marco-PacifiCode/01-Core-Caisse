@@ -26,6 +26,7 @@ import {
   type CashMovementLike,
 } from "./cash-movement";
 import {
+  normalizeRedeemedFor,
   summarizeRedeemedGiftCards,
   validateGiftCard,
   validateGiftCards,
@@ -539,6 +540,28 @@ export type CheckoutOptions = {
    * champ en plus.
    */
   giftCards?: GiftCardInput[];
+  /**
+   * Bons cadeaux à CONSOMMER dans la transaction du passage à PAID.
+   *
+   * 🔒 CE N'EST PAS UN MOYEN DE PAIEMENT, et ce champ ne porte donc AUCUN montant à encaisser.
+   *    Le montant du bon est entré dans le CA le jour de son ACHAT ; le ré-encaisser ici
+   *    compterait le même argent deux fois. Ce que la surface fait de la couverture, c'est une
+   *    ligne `OTHER` NÉGATIVE dans le ticket : le total baisse, les moyens ordinaires règlent le
+   *    complément, et le Z ne voit passer que l'argent réellement nouveau.
+   *
+   * `redeemedForXpf` ne calcule rien : il ENREGISTRE le prix affiché le jour de l'échange, pour
+   * recouper après coup. Le reliquat d'un bon plus gros que la prestation est PERDU — un bon est
+   * binaire, il n'y a pas de solde et il ne faut pas en réintroduire un.
+   */
+  redeemGiftCards?: RedeemGiftCardRef[];
+};
+
+/** Un bon à brûler pendant l'encaissement, désigné par son id (la surface l'a retrouvé par son code). */
+export type RedeemGiftCardRef = {
+  id: string;
+  redeemedForXpf?: number | null;
+  redeemedBy?: string | null;
+  redeemedByName?: string | null;
 };
 
 export type CheckoutResult = {
@@ -584,7 +607,12 @@ export type CheckoutError =
   // C'est la seule place tenable — un bon refusé après l'encaissement laisserait une vente
   // payée sans le bon qu'elle a vendu, c'est-à-dire de l'argent pris pour rien.
   | { ok: false; error: "GIFT_CARD_INVALID"; reason: GiftCardRefusal | "DUPLICATE_CODE"; index: number }
-  | { ok: false; error: "GIFT_CARD_CODE_TAKEN"; code: string };
+  | { ok: false; error: "GIFT_CARD_CODE_TAKEN"; code: string }
+  // Bon à CONSOMMER qui n'est pas consommable : inconnu, déjà brûlé, ou annulé. Le refus tombe
+  // AVANT que le moindre paiement soit persisté ; et si un autre comptoir brûle le même bon dans
+  // l'intervalle, l'`updateMany` de la transaction rend 0 et fait ÉCHOUER le passage à PAID —
+  // le ticket reste DRAFT, personne n'a payé, le bon n'a servi qu'une fois.
+  | { ok: false; error: "GIFT_CARD_NOT_REDEEMABLE"; giftCardId: string; reason: GiftCardRedeemRefusal };
 
 // ─── Synchronisation Compta/Stock (moteur lib/sync.ts branché sur Prisma) ───
 
@@ -738,6 +766,22 @@ export async function checkoutSale(
     giftCardsToIssue = validated.data;
   }
 
+  // ── Bons cadeaux à CONSOMMER : validation de FORME, avant tout le reste ────────────────
+  // Même inertie que ci-dessus : sans le champ, pas une requête, pas une différence.
+  const giftCardsToRedeem: { id: string; redeemedForXpf: bigint | null; by: string | null; byName: string | null }[] = [];
+  for (const r of options?.redeemGiftCards ?? []) {
+    const forXpf = normalizeRedeemedFor(r.redeemedForXpf ?? null);
+    if (!forXpf.ok) {
+      return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: r.id, reason: forXpf.error };
+    }
+    giftCardsToRedeem.push({
+      id: r.id,
+      redeemedForXpf: forXpf.redeemedForXpf,
+      by: r.redeemedBy ?? null,
+      byName: r.redeemedByName ?? null,
+    });
+  }
+
   const compta = comptaClient();
 
   // Idempotence : si déjà PAID, ne pas ré-encaisser — mais retenter la synchro si elle est incomplète.
@@ -783,6 +827,30 @@ export async function checkoutSale(
       tx.giftCard.findFirst({ where: { tenantId, code: { in: codes } }, select: { code: true } }),
     );
     if (taken) return { ok: false, error: "GIFT_CARD_CODE_TAKEN", code: taken.code };
+  }
+
+  // ── Bons cadeaux à consommer : sont-ils encore consommables ? ──────────────────────────
+  // Même raison, exactement, que le contrôle de code libre juste au-dessus : cette lecture
+  // est faite AVANT de persister le moindre paiement. Sans elle, un bon déjà brûlé ferait
+  // échouer la transaction du passage à PAID APRÈS l'enregistrement des paiements — l'argent
+  // serait pris et la vente resterait en attente. Ce contrôle protège la CLIENTE ; l'UPDATE
+  // conditionnel de la transaction (plus bas) reste le dernier mot pour la course entre deux
+  // comptoirs, et il ne devrait jamais avoir à parler.
+  if (giftCardsToRedeem.length > 0) {
+    const rows = await withTenant(tenantId, (tx) =>
+      tx.giftCard.findMany({
+        where: { tenantId, id: { in: giftCardsToRedeem.map((g) => g.id) } },
+        select: { id: true, redeemedAt: true, cancelledAt: true },
+      }),
+    );
+    for (const g of giftCardsToRedeem) {
+      const row = rows.find((r) => r.id === g.id);
+      // Un bon d'un AUTRE marchand est « introuvable », pas « refusé » : le cloisonnement est
+      // un filtre `where`, il ne se raconte pas à l'appelant.
+      if (!row) return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: g.id, reason: "NOT_FOUND" };
+      if (row.cancelledAt) return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: g.id, reason: "CANCELLED" };
+      if (row.redeemedAt) return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: g.id, reason: "ALREADY_REDEEMED" };
+    }
   }
 
   // « J'encaisse, puis je rends » : c'est LE moteur qui impute, pas l'appelant. On ne
@@ -849,6 +917,10 @@ export async function checkoutSale(
   //    cliente qui repart les mains vides parce qu'un réseau a coupé entre deux requêtes.
   //    ⚠️ Ne PAS déplacer ces créations hors de ce `withTenant`, et ne PAS leur donner un
   //    `skipDuplicates` : perdre silencieusement un bon vendu serait pire que l'échec.
+  // Sentinelle de COURSE : renseignée DANS la transaction, lue APRÈS son annulation. Un objet
+  // plutôt qu'une variable simple — une affectation faite dans une closure ne se lit pas comme
+  // un `let` par l'analyse de flot, et le refus deviendrait injoignable sans que rien n'alerte.
+  const race: { id: string | null } = { id: null };
   const issued = await withTenant(tenantId, async (tx) => {
     // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
     // Une date future est ignorée plutôt que refusée : le ticket est déjà
@@ -864,6 +936,29 @@ export async function checkoutSale(
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
     await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement } });
+    // 🔴 LES BONS SE CONSOMMENT ICI, dans la MÊME transaction que le passage à PAID — pour la
+    //    raison exactement symétrique de leur création : zéro fenêtre entre « le bon est brûlé »
+    //    et « la vente est payée ». L'UPDATE est CONDITIONNEL (`redeemedAt: null`) : s'il rend
+    //    0 ligne, un autre comptoir a brûlé le bon entre le contrôle préalable et cet instant —
+    //    on annule TOUT, le ticket reste DRAFT, et le bon n'aura servi qu'une seule fois.
+    //    ⚠️ Condition et marquage sont sortis dans des `const`, et l'appel tient sur UNE ligne :
+    //    même contrainte que l'update ci-dessus. Le test structurel isole ce bloc jusqu'à la
+    //    première fermeture « }); », donc un appel multiligne le tronquerait — et le test
+    //    échouerait sur du code pourtant correct. Une fermeture « }; » ne le trompe pas.
+    for (const g of giftCardsToRedeem) {
+      const cond = { id: g.id, tenantId, redeemedAt: null, cancelledAt: null };
+      const marque = {
+        redeemedAt: datePaiement,
+        redeemedBy: g.by,
+        redeemedByName: g.byName,
+        redeemedForXpf: g.redeemedForXpf,
+      };
+      const done = await tx.giftCard.updateMany({ where: cond, data: marque });
+      if (done.count !== 1) {
+        race.id = g.id;
+        throw new Error("GIFT_CARD_RACE");
+      }
+    }
     if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
     const rows: GiftCardIssued[] = [];
     for (const g of giftCardsToIssue) {
@@ -881,7 +976,15 @@ export async function checkoutSale(
       });
     }
     return rows;
+  }).catch((e: unknown) => {
+    // Seule la COURSE d'un bon est rattrapée ici — tout autre échec reste une panne. La liste
+    // vide n'est jamais lue : le refus part à la ligne suivante, avant tout usage d'`issued`.
+    if (race.id) return [] as GiftCardIssued[];
+    throw e;
   });
+  if (race.id) {
+    return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: race.id, reason: "ALREADY_REDEEMED" };
+  }
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
   const reloaded = await getSale(tenantId, saleId);
