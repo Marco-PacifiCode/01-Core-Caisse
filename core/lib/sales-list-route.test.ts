@@ -85,3 +85,56 @@ test("les paiements sont chargés en UNE fois (include), pas par ticket", () => 
 test("la limite reste bornée (pas de lecture illimitée)", () => {
   assert.match(getBody(), /Math\.min\(/);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LE LOT (`sourceIds`) — ajouté le 2026-09-06.
+//
+// Pourquoi : le planning veut colorier « payé / pas payé » sur un mois. Avec le seul
+// `sourceId`, cela faisait ~300 appels pour une vue mois — c'est la raison écrite pour
+// laquelle le filtre « statut du paiement » n'existait pas côté surface.
+//
+// Ce que ces assertions attrapent, et qui coûterait de l'argent :
+//  · le plafond de 500 réappliqué au lot → une demande de 600 identifiants rendrait 500
+//    lignes et l'appelant conclurait « pas de ticket » sur les cent autres, donc
+//    ré-encaisserait ;
+//  · le refus au-delà du maximum remplacé par une troncature → même défaut, en silence ;
+//  · `sourceIds` accepté sans `sourceType` → un `IN` sur toutes les familles de ventes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("LOT : la route lit `sourceIds` et en fait un `IN`", () => {
+  const body = getBody();
+  assert.match(body, /searchParams\.get\("sourceIds"\)/);
+  assert.match(body, /sourceId:\s*\{\s*in:/);
+});
+
+test("LOT : `sourceIds` sans `sourceType` est REFUSÉ (sinon IN sur toutes les familles)", () => {
+  assert.match(getBody(), /sourceType requis avec sourceIds/);
+});
+
+test("🛑 LOT : au-delà du maximum on REFUSE, on ne tronque pas", () => {
+  const body = getBody();
+  assert.match(body, /MAX_SOURCE_IDS/);
+  assert.match(body, /TOO_MANY_SOURCE_IDS/);
+  assert.match(body, /status:\s*400/);
+});
+
+test("🛑 LOT : `take` vaut le NOMBRE d'identifiants, pas la limite plafonnée à 500", () => {
+  // L'unicité (tenantId, sourceType, sourceId) rend cette borne exacte. Repasser par
+  // `limit` ici rendrait la réponse tronquée sans que personne ne le sache.
+  const body = getBody();
+  assert.match(body, /const take = enLot \? tousLesIds\.length : limit/);
+  assert.match(body, /take,/);
+  assert.ok(!/take:\s*limit/.test(body), "le lot est encore borné par `limit`");
+});
+
+test("LOT : `sourceId` et `sourceIds` s'ADDITIONNENT (pas de précédence silencieuse)", () => {
+  assert.match(getBody(), /new Set\(\[\.\.\.\(sourceId \? \[sourceId\] : \[\]\), \.\.\.idsBruts\]\)/);
+});
+
+test("LOT : le chemin historique est INCHANGÉ quand `sourceIds` est absent", () => {
+  // `enLot` est faux dès qu'aucun identifiant n'est fourni : on retombe exactement sur
+  // le filtre d'avant, et sur `take = limit`.
+  const body = getBody();
+  assert.match(body, /const enLot = idsBruts\.length > 0/);
+  assert.match(body, /sourceType && sourceId\s*\n?\s*\?\s*\{ sourceType, sourceId \}/);
+});
