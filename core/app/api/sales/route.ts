@@ -126,7 +126,35 @@ export async function POST(req: NextRequest) {
  * Les deux paramètres n'ont d'effet qu'ENSEMBLE (un `sourceType` seul filtrerait toute
  * une famille de ventes, ce que personne ne demande aujourd'hui). Absents, la réponse est
  * STRICTEMENT celle d'avant : aucun appelant existant ne change de comportement.
+ *
+ * ── `sourceIds` : la MÊME question, posée pour trois cents rendez-vous d'un coup ──────
+ * Ajouté le 2026-09-06. Le filtre ci-dessus ne prend qu'UN identifiant. Un planning qui
+ * veut colorier « payé / pas payé » sur un mois devait donc appeler cette route une fois
+ * PAR rendez-vous — environ trois cents appels pour une vue mois. C'est la raison pour
+ * laquelle le filtre « statut du paiement » de la barre du planning n'avait jamais été
+ * construit (`Salon-Reference/surface/lib/agenda-filtres.ts`, § « hors de portée »).
+ *
+ * `?sourceType=rdv&sourceIds=<uuid>,<uuid>,…` répond pour toute la liste en une requête.
+ * L'index `@@index([tenantId, sourceType, sourceId])` couvre exactement ce `IN`.
+ *
+ * 🛑 CE CHEMIN NE TRONQUE JAMAIS, ET C'EST LE POINT DÉLICAT. `uniq_sale_external_source`
+ * garantit AU PLUS UNE vente par `(tenantId, sourceType, sourceId)` : la réponse contient
+ * donc au plus autant de lignes que d'identifiants demandés, et `take` est fixé à ce
+ * nombre exact — le plafond de 500 du chemin historique ne s'applique pas ici, sinon une
+ * demande de 600 identifiants rendrait 500 lignes et l'appelant conclurait « pas de
+ * ticket » sur les cent autres. Au-delà de `MAX_SOURCE_IDS`, on REFUSE (400) au lieu de
+ * rogner : un refus se voit, une troncature se croit. C'est de l'argent — même
+ * raisonnement que le bloc précédent.
  */
+
+/**
+ * Le nombre d'identifiants acceptés en une fois. Deux bornes le fixent :
+ *   · la longueur de l'URL — 200 UUID font ~7,4 ko de query, sous les 8 ko qu'un
+ *     en-tête HTTP traverse partout sans réglage ;
+ *   · l'usage réel — un mois de planning d'un salon à deux praticiennes tourne autour
+ *     de 300 rendez-vous, soit deux appels. L'appelant découpe, la route ne devine pas.
+ */
+export const MAX_SOURCE_IDS = 200;
 export async function GET(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { searchParams } = new URL(req.url);
@@ -141,7 +169,36 @@ export async function GET(req: NextRequest) {
   // Les deux ensemble, ou rien : cf. le bloc de doc ci-dessus.
   const sourceType = searchParams.get("sourceType");
   const sourceId = searchParams.get("sourceId");
-  const sourceFilter = sourceType && sourceId ? { sourceType, sourceId } : {};
+
+  // Le LOT. `sourceId` et `sourceIds` s'additionnent plutôt que de se supplanter : une
+  // précédence silencieuse ferait disparaître un identifiant que l'appelant croit avoir
+  // demandé, et c'est exactement le genre d'absence qui se lit « pas de ticket ».
+  const idsBruts = (searchParams.get("sourceIds") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+  const tousLesIds = [...new Set([...(sourceId ? [sourceId] : []), ...idsBruts])];
+  const enLot = idsBruts.length > 0;
+
+  if (enLot && !sourceType) {
+    return NextResponse.json({ error: "sourceType requis avec sourceIds" }, { status: 400 });
+  }
+  if (tousLesIds.length > MAX_SOURCE_IDS) {
+    return NextResponse.json(
+      { error: "TOO_MANY_SOURCE_IDS", max: MAX_SOURCE_IDS, recu: tousLesIds.length },
+      { status: 400 },
+    );
+  }
+
+  const sourceFilter = enLot
+    ? { sourceType, sourceId: { in: tousLesIds } }
+    : sourceType && sourceId
+      ? { sourceType, sourceId }
+      : {};
+
+  // 🛑 En lot, la borne est le NOMBRE D'IDENTIFIANTS, jamais `limit` : l'unicité
+  // `(tenantId, sourceType, sourceId)` rend cette borne exacte, donc sans troncature.
+  const take = enLot ? tousLesIds.length : limit;
 
   const sales = await withTenant(tenantId, (tx) =>
     tx.sale.findMany({
@@ -156,7 +213,7 @@ export async function GET(req: NextRequest) {
       },
       include: { payments: { select: { method: true, amountXpf: true } } },
       orderBy: { createdAt: "desc" },
-      take: limit,
+      take,
     }),
   );
 
