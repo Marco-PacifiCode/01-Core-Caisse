@@ -37,7 +37,7 @@ et répond « je ne sais pas » — jamais « pas de ticket ».
 TRANSFER 8 · CHEQUE 7 · MIXTE 4), 11 laissées ouvertes (54 000 XPF de reste dû).
 `occurredAt` et `paidAt` antidatés — les champs que ce moteur porte déjà pour les caisses
 hors ligne. Script, sondes avant/après et **procédure de retrait** :
-`C:\dev\_backup6-09-06-demo-argent\`.
+`C:\dev\_backup\2026-09-06-demo-argent\`.
 
 🛑 **UN MANQUE DU MOTEUR MIS À NU, NON CORRIGÉ (décision Marco)** : `runSaleSync` crée la
 facture Compta **sans date**, et `POST /api/invoices` de Core-Compta n'en accepte aucune
