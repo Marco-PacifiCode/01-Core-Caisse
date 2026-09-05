@@ -1,5 +1,53 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ 2026-09-06 — `GET /api/sales` RÉPOND POUR N RENDEZ-VOUS D'UN COUP (déployé)
+
+Branche `claude/sales-source-ids` → PR #38, `main` = `5d4ba9d`, release
+`20260906-023932`, pm2 `core-caisse` online. 264 tests verts, `tsc` 0.
+
+**Ce qui change** : `GET /api/sales?sourceType=rdv&sourceIds=<uuid>,<uuid>,…`. Un planning
+qui veut savoir « qui a payé » sur un mois appelait cette route **une fois par
+rendez-vous** — trois cents appels pour une vue mois. C'est ce qui bloquait le filtre
+« Règlement » de la surface, construit le même jour.
+
+🛑 **Ce chemin NE TRONQUE JAMAIS.** L'unicité `uniq_sale_external_source`
+`(tenantId, sourceType, sourceId)` garantit au plus une vente par identifiant : `take`
+vaut le nombre d'identifiants demandés, le plafond de 500 du chemin historique ne
+s'applique pas. Au-delà de `MAX_SOURCE_IDS = 200` **identifiants distincts**, la route
+**refuse en 400** au lieu de rogner — *une troncature se lirait « pas de ticket » et
+ferait ré-encaisser une cliente qui a déjà payé*.
+
+✅ **Vérifié EN PRODUCTION après déploiement**, pas seulement en test :
+- 114 identifiants → 114 lignes, `{PAID: 103, DRAFT: 11}` ;
+- 200 identifiants distincts → 200 ; **201 → 400 `TOO_MANY_SOURCE_IDS`** ;
+- `sourceIds` sans `sourceType` → **400** ;
+- ⚠️ le dédoublonnage a lieu **avant** le plafond : 228 identifiants dont 114 distincts
+  passent, et c'est voulu (l'appelant n'est pas puni pour un doublon).
+- **Sonde des 6 salons avant/après le déploiement : identique à l'octet près.**
+
+🪤 **Le repli côté appelant compte autant que la route.** Un Core-Caisse plus ancien
+ignore `sourceIds` **en silence** et rend sa liste habituelle. La surface refuse toute
+réponse contenant un `sourceId` non demandé (`Salon-Reference/surface/lib/paiement-rdv.ts`)
+et répond « je ne sais pas » — jamais « pas de ticket ».
+
+## 💰 2026-09-06 — L'ARGENT DU SALON DE DÉMONSTRATION (données, tenant fictif)
+
+114 ventes créées **par les routes de ce moteur** (jamais d'`INSERT`) sur le seul tenant
+`d0000000-…-de`, rattachées aux rendez-vous honorés : 103 encaissées (CARD 50 · CASH 34 ·
+TRANSFER 8 · CHEQUE 7 · MIXTE 4), 11 laissées ouvertes (54 000 XPF de reste dû).
+`occurredAt` et `paidAt` antidatés — les champs que ce moteur porte déjà pour les caisses
+hors ligne. Script, sondes avant/après et **procédure de retrait** :
+`C:\dev\_backup6-09-06-demo-argent\`.
+
+🛑 **UN MANQUE DU MOTEUR MIS À NU, NON CORRIGÉ (décision Marco)** : `runSaleSync` crée la
+facture Compta **sans date**, et `POST /api/invoices` de Core-Compta n'en accepte aucune
+(`Invoice.createdAt` = `@default(now())`). Un encaissement antidaté produit donc une pièce
+datée du jour. Correctif proposé : un `issuedAt` **optionnel** sur `POST /api/invoices`,
+relayé depuis `sale.createdAt` par `core/lib/sync.ts`. **C'est de la facturation → §8 →
+escaladé, pas déployé.**
+
+---
+
 ## 🎁 CONSOMMER UN BON DANS LA TRANSACTION D'ENCAISSEMENT — livré (2026-09-04)
 
 🗣️ **Marco** : « elle ne peut pas encaisser avec un bon d'achat, il faut un bouton ici. »
