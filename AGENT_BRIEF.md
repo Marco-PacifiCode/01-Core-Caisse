@@ -1,5 +1,9 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ⚙️ CI GITHUB : PULL_REQUEST + MANUEL SEULEMENT (2026-09-07)
+
+- 2026-09-07 — ci.yml : CI GitHub sur pull_request + manuel seulement (plus sur chaque push), concurrency cancel-in-progress. Verif locale ci-local.sh inchangee.
+
 ## ✅ 2026-09-06 — `GET /api/sales` RÉPOND POUR N RENDEZ-VOUS D'UN COUP (déployé)
 
 Branche `claude/sales-source-ids` → PR #38, `main` = `5d4ba9d`, release

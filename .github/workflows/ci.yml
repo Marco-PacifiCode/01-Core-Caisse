@@ -1,4 +1,5 @@
 name: CI
+# 2026-09-06 (decision Marco) : plus de run sur chaque push claude/** — pull_request + manuel seulement. Verif locale = ci-local.sh (gate ng-deploy).
 
 # CI moteur core : verifie tsc (typecheck) — exige par la doctrine de deploiement autonome
 # (00-Archi-NextGen/CLAUDE.md regle 8 : CI verte tsc+eslint avant deploy). Pas de build next
@@ -6,13 +7,8 @@ name: CI
 # besoin que DATABASE_URL existe pour generer le client.
 
 on:
-  push:
-    branches:
-      - main
-      - "claude/**"
-
-  # Filet manuel : rien ne se declenche tout seul dessus, mais il permet de relancer
-  # la CI sur une branche quand on en a besoin, sans reactiver `pull_request`.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
