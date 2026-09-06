@@ -967,6 +967,8 @@ c'est-à-dire **l'option B**, qui n'est pas ce qui est écrit.
 Core-Compta **PR #20 est sur `main` et déployée** (`20260804-140657`) — les deux premières étapes
 sont FAITES. Reste : **Core-Compta #21 → #11 (ici) → V-Cut #201**.
 
+- 2026-09-07 — ci.yml : paths-ignore (docs/briefs/workflows) + certificat ci-local dans la PR = pas de run GitHub. Zero minute depuis le poste.
+
 ## Dernières actions (2026-07-20)
 - 🧹 **Ménage des branches `claude/*`, 2ᵉ passe : 4 → 3 sur ce remote**
   (2026-08-05, chantier écosystème ordonné par Marco. **Aucune ligne de code n'a quitté le dépôt**,

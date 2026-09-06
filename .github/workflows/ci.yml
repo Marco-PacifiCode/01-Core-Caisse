@@ -1,5 +1,6 @@
 name: CI
 # 2026-09-06 (decision Marco) : plus de run sur chaque push claude/** — pull_request + manuel seulement. Verif locale = ci-local.sh (gate ng-deploy).
+# 2026-09-07 : paths-ignore (docs/briefs/workflows = 0 run) + une PR portant [ci-local: GREEN <sha>] ne rebuild pas (deja verifiee en Docker local).
 
 # CI moteur core : verifie tsc (typecheck) — exige par la doctrine de deploiement autonome
 # (00-Archi-NextGen/CLAUDE.md regle 8 : CI verte tsc+eslint avant deploy). Pas de build next
@@ -9,6 +10,10 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - '**/*.md'
+      - 'docs/**'
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
@@ -24,6 +29,7 @@ jobs:
   ci:
     name: Typecheck (tsc) · Test
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.body, '[ci-local: GREEN') }}
     timeout-minutes: 15
     defaults:
       run:
