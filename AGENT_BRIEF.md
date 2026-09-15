@@ -1,9 +1,16 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — ÉCRIT, **NON DÉPLOYÉ, MIGRATION NON JOUÉE**
+## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — **MIGRATION JOUÉE + CORE DÉPLOYÉ**
 
-Branche `claude/gift-card-redeemed-appointment`, poussée, **PR non ouverte**. Tâche d'exécution
-cadrée : lier un bon cadeau consommé au rendez-vous qu'il a réglé, pour qu'un RDV honoré par un
+✅ **En prod le 15/09.** Migration appliquée par `ops.sh migrate core-caisse` (accord Marco) :
+colonne `GiftCard.redeemedAppointmentId text NULL` vérifiée dans `information_schema`, `rls.sql`
+rejoué, isolation prouvée sous le rôle applicatif sur les 6 tables, sauvegarde de structure
+`C:\dev\_backup\core-caisse\ops-migrate-core-caisse-20260915T054704Z-avant.sql`. Puis Core
+déployé (PR #42, `main` = `2e5834f`, release `20260915-165401`) ; preuve bout en bout
+`GET /api/gift-cards` → 200. Retour arrière colonne : `DROP COLUMN "redeemedAppointmentId"`.
+Consommateur : surface Ellément (lot C2) ; V-Cut peut suivre avec le même code surface.
+
+Tâche d'exécution cadrée : lier un bon cadeau consommé au rendez-vous qu'il a réglé, pour qu'un RDV honoré par un
 bon SEUL (pas de reliquat en espèces/CB) ne reste pas affiché « à encaisser » côté surface.
 
 `GiftCard.redeemedAppointmentId` (nullable, sans FK, même patron que `Sale.sourceId`) est
@@ -11,7 +18,7 @@ renseigné à la consommation par `checkoutSale` quand la vente EST le RDV honor
 (`sale.sourceType === "rdv"`), et transmissible aussi via `POST /api/gift-cards/:id/redeem`.
 272 tests verts (271 + 1), `tsc --noEmit` vert, `prisma validate` vert.
 
-**Migration additive** (à passer par Marco, **NON JOUÉE**) :
+**Migration additive** (jouée le 15/09, cf. ci-dessus) :
 `core/prisma/migrations/20260915120000_gift_card_redeemed_appointment/migration.sql`.
 
 🛑 **Ordre impératif à respecter** : migration → déploiement de ce Core (avec
