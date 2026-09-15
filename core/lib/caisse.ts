@@ -1309,7 +1309,10 @@ export async function annulerVente(
         // acquis tant qu'une correction ADMIN manuelle (lib/loyalty-db.ts#adjustLoyalty) ne
         // les reprend pas.
         if (sale.status === "PAID") {
-          await reverseSaleLoyalty(tx, { tenantId, saleId, occurredAt: new Date() });
+          // Pas d'`occurredAt` ici : une reprise fidélité prend celui de la ligne qu'elle
+          // annule (le cycle du crédit d'origine), jamais l'instant de l'annulation — cf. le
+          // correctif du 2026-09-16 dans lib/loyalty-db.ts#reverseSale.
+          await reverseSaleLoyalty(tx, { tenantId, saleId });
         }
       }).then(() => undefined),
   };

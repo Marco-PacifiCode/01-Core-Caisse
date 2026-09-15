@@ -538,16 +538,30 @@ export async function redeemReward(tx: LoyaltyTx, args: RedeemRewardArgs): Promi
  * elle, N'EST JAMAIS reprise ici : le RDV a bien été honoré, l'annulation de la VENTE ne le
  * défait pas (§2.5 du plan).
  *
+ * 🔴 CORRECTIF (2026-09-16, contre-QA sur 9a98e32) : les deux `REVERSAL` prenaient
+ * `occurredAt = new Date()` (l'instant de l'annulation, pas celui du crédit annulé). Défaut
+ * prouvé : `sumVisits`/`sumPoints` (décision Marco 15/09, remise à zéro au changement de forme
+ * ou réactivation) filtrent le net sur `occurredAt >= activatedAt` du programme COURANT. Un
+ * ticket du cycle 1 (+300 pts, `occurredAt` cycle 1) annulé APRÈS une réactivation voit ses
+ * +300 déjà exclus du net du cycle 2 (leur `occurredAt` est antérieur au nouveau `activatedAt`)
+ * — mais sa reprise (-300), datée d'AUJOURD'HUI, entrait dans le cycle 2 et faisait passer son
+ * net de 100 à -200 : une reprise plus jeune que son crédit d'origine change de cycle tout
+ * seule. ARBITRAGE : une reprise appartient au cycle du crédit qu'elle annule — elle prend
+ * l'`occurredAt` de la ligne qu'elle défait (`points:sale:<id>` pour `unpoints`,
+ * `redeem:sale:<id>` pour `unredeem`), jamais `new Date()`. `createdAt` (horodatage réel de
+ * l'écriture, `@default(now())`, jamais posé explicitement ici) garde la trace de QUAND la
+ * reprise a eu lieu — seul `occurredAt` détermine dans quel cycle elle compte.
+ *
  * Best-effort en cas de doublon : `insertEntry` avale un `P2002` (rejouer `annulerVente` sur une
  * vente déjà VOID ne repasse de toute façon jamais ici, `runVoidSale` le court-circuite avant).
  */
 export async function reverseSale(
   tx: LoyaltyTx,
-  args: { tenantId: string; saleId: string; occurredAt: Date },
+  args: { tenantId: string; saleId: string },
 ): Promise<void> {
   const pointsEntry = await tx.loyaltyEntry.findFirst({
     where: { tenantId: args.tenantId, kind: "POINTS", ref: `points:sale:${args.saleId}` },
-    select: { accountId: true, points: true },
+    select: { accountId: true, points: true, occurredAt: true },
   });
   if (pointsEntry && pointsEntry.points) {
     await insertEntry(tx, {
@@ -559,13 +573,14 @@ export async function reverseSale(
       sourceId: args.saleId,
       saleId: args.saleId,
       ref: `unpoints:sale:${args.saleId}`,
-      occurredAt: args.occurredAt,
+      // Cycle du crédit annulé, PAS l'instant de l'annulation — cf. le correctif ci-dessus.
+      occurredAt: pointsEntry.occurredAt,
     });
   }
 
   const redeemEntry = await tx.loyaltyEntry.findFirst({
     where: { tenantId: args.tenantId, kind: "REDEEM", ref: `redeem:sale:${args.saleId}` },
-    select: { accountId: true, rewardEntryId: true },
+    select: { accountId: true, rewardEntryId: true, occurredAt: true },
   });
   if (redeemEntry && redeemEntry.rewardEntryId) {
     await tx.loyaltyEntry.updateMany({
@@ -581,7 +596,9 @@ export async function reverseSale(
       sourceId: args.saleId,
       saleId: args.saleId,
       ref: `unredeem:sale:${args.saleId}`,
-      occurredAt: args.occurredAt,
+      // Cycle de la consommation annulée, PAS l'instant de l'annulation. Ne porte ni visites ni
+      // points (une REDEEM n'en portait déjà pas) : seule la cohérence du cycle importe ici.
+      occurredAt: redeemEntry.occurredAt,
     });
   }
 }

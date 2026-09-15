@@ -115,6 +115,8 @@ premier jour. Les récompenses déjà gagnées restent dues. »
 
 **Suite** : 360 tests, tous verts (`npm test`). `tsc --noEmit` et `prisma validate` verts.
 
+🔴 **2026-09-16, correctif contre-QA supplémentaire** : `reverseSale` posait `occurredAt: new Date()` sur ses `REVERSAL` (l'instant de l'annulation, pas celui du crédit annulé), ce qui faisait entrer la reprise d'un ticket ancien dans le NET du cycle courant après une réactivation — corrigé en reprenant l'`occurredAt` de la ligne `POINTS`/`REDEEM` d'origine (`reverseSaleLoyalty` n'a donc plus besoin d'`occurredAt` en entrée) ; suite à 365 tests, tous verts.
+
 ## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — ✅ MIGRATION JOUÉE ET PROUVÉE (accord Marco), code livré le 15/09 (PR #46)
 
 Branche `claude/caisse-fidelite-schema-20260916` (worktree jetable `_wt/caisse-fidelite-c1`), tâche

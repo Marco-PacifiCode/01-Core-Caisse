@@ -458,7 +458,7 @@ test("🔴 (a) vente 600 pts (1 récompense, net 100) ; annulation (net -500) ; 
 
   // Annulation de la vente A (même écriture que `annulerVente` en réel) : reprend les 600 pts.
   // Net après reprise : 600 (POINTS) - 500 (REWARD) - 600 (REVERSAL) = -500.
-  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-A", occurredAt: new Date("2026-09-15T11:00:00Z") });
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-A" });
 
   const saleB = await creditPoints(tx, {
     tenantId: TENANT,
@@ -783,7 +783,9 @@ test("reverseSale : reprend les points ET remet la récompense consommée dispon
 
   const { tx, entries } = makeFakeTx([pointsEntry, reward, redeemEntry]);
 
-  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-1", occurredAt: new Date("2026-09-16T09:00:00Z") });
+  // 🔴 CORRECTIF (2026-09-16) : plus d'`occurredAt` en paramètre — la REVERSAL prend celui de la
+  // ligne qu'elle annule (ici 2026-09-01, cf. `seedReward`), jamais l'instant de l'appel.
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-1" });
 
   const rewardAfter = entries.find((e) => e.id === "reward-9")!;
   assert.equal(rewardAfter.redeemedAt, null, "la récompense redevient disponible");
@@ -794,15 +796,149 @@ test("reverseSale : reprend les points ET remet la récompense consommée dispon
   const unpoints = reversals.find((e) => e.ref === "unpoints:sale:sale-1");
   assert.ok(unpoints);
   assert.equal(unpoints!.points, -30, "les points sont repris (signe inverse)");
+  assert.equal(
+    unpoints!.occurredAt.getTime(),
+    pointsEntry.occurredAt.getTime(),
+    "la reprise appartient au CYCLE du crédit annulé, pas à l'instant de l'annulation",
+  );
   const unredeem = reversals.find((e) => e.ref === "unredeem:sale:sale-1");
   assert.ok(unredeem);
   assert.equal(unredeem!.rewardEntryId, "reward-9");
+  assert.equal(
+    unredeem!.occurredAt.getTime(),
+    redeemEntry.occurredAt.getTime(),
+    "la reprise de consommation appartient au CYCLE de la consommation annulée",
+  );
 });
 
 test("reverseSale : vente sans points ni récompense -> aucune écriture", async () => {
   const { tx, entries } = makeFakeTx();
-  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-vide", occurredAt: new Date() });
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-vide" });
   assert.equal(entries.length, 0);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// reverseSale — UNE REPRISE APPARTIENT AU CYCLE DU CRÉDIT QU'ELLE ANNULE — contre-QA sur 9a98e32
+//
+// DÉFAUT PROUVÉ (QA ciblée) : la REVERSAL prenait `occurredAt: new Date()` (l'instant de
+// l'annulation). Un ticket du cycle 1 (+300 pts) annulé APRÈS une réactivation voit ses +300
+// déjà exclus du net du cycle 2 (`sumPoints` filtre sur `occurredAt >= activatedAt`), mais sa
+// reprise (-300), datée d'AUJOURD'HUI, ENTRAIT dans le cycle 2 : le net du cycle 2 passait de
+// 100 à -200. ARBITRAGE : la REVERSAL prend l'`occurredAt` de la ligne qu'elle annule.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("🔴 scénario QA : cycle 1 (300 pts) ; réactivation ; cycle 2 (100 pts) ; annulation du ticket du cycle 1 -> net du cycle 2 reste 100", async () => {
+  const { tx } = makeFakeTx();
+  const date1 = new Date("2026-01-01T00:00:00Z");
+  const program1 = pointsProgram({ activatedAt: date1, pointsPerReward: 1_000_000 }); // seuil hors d'atteinte, pas de REWARD ici
+
+  const cycle1 = await creditPoints(tx, {
+    tenantId: TENANT,
+    program: program1,
+    clientFicheId: "fiche-cycles",
+    displayName: "Cliente Cycles",
+    saleId: "sale-cycle1",
+    points: 300,
+    occurredAt: new Date("2026-01-05T10:00:00Z"),
+  });
+  assert.equal(cycle1.credited, true);
+
+  // Réactivation : changement de forme (POINTS -> VISITS -> POINTS aurait pareillement posé
+  // `now`) — ici on simule directement le nouveau pivot via nextActivatedAt, comme les autres
+  // tests « décision Marco 15/09 » de ce fichier.
+  const dateReactivation = new Date("2026-06-01T00:00:00Z");
+  const activatedAt2 = nextActivatedAt(date1, "POINTS", "VISITS", dateReactivation);
+  const activatedAt3 = nextActivatedAt(activatedAt2, "VISITS", "POINTS", new Date("2026-06-02T00:00:00Z"))!;
+
+  const program2 = pointsProgram({ activatedAt: activatedAt3, pointsPerReward: 1_000_000 });
+  const cycle2 = await creditPoints(tx, {
+    tenantId: TENANT,
+    program: program2,
+    clientFicheId: "fiche-cycles",
+    displayName: "Cliente Cycles",
+    saleId: "sale-cycle2",
+    points: 100,
+    occurredAt: new Date("2026-06-05T10:00:00Z"),
+  });
+  assert.equal(cycle2.credited, true);
+
+  // Annulation du ticket du CYCLE 1, APRÈS la réactivation.
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-cycle1" });
+
+  tx.loyaltyProgram.findFirst = async () => program2;
+  const summary = await accountSummary(tx, TENANT, ["fiche-cycles"]);
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].points, 100, "le net du cycle 2 n'est PAS affecté par la reprise d'un crédit du cycle 1");
+});
+
+test("reverseSale : un ticket du CYCLE COURANT annulé fait bien diminuer le net (la reprise compte dans SON cycle)", async () => {
+  const { tx } = makeFakeTx();
+  const date1 = new Date("2026-01-01T00:00:00Z");
+  const program = pointsProgram({ activatedAt: date1, pointsPerReward: 1_000_000 });
+
+  await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-courant",
+    displayName: "Cliente Courant",
+    saleId: "sale-a",
+    points: 300,
+    occurredAt: new Date("2026-01-05T10:00:00Z"),
+  });
+  await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-courant",
+    displayName: "Cliente Courant",
+    saleId: "sale-b",
+    points: 100,
+    occurredAt: new Date("2026-01-06T10:00:00Z"),
+  });
+
+  tx.loyaltyProgram.findFirst = async () => program;
+  const before = await accountSummary(tx, TENANT, ["fiche-courant"]);
+  assert.equal(before[0].points, 400);
+
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-a" });
+
+  const after = await accountSummary(tx, TENANT, ["fiche-courant"]);
+  assert.equal(after[0].points, 100, "l'annulation d'un ticket du cycle COURANT diminue bien le net du même cycle");
+});
+
+test("reverseSale : la récompense rendue par unredeem est de nouveau disponible, quel que soit le cycle de sa consommation d'origine", async () => {
+  const reward = seedReward({ id: "reward-cycle", accountId: "account-cycle", occurredAt: new Date("2026-01-01T00:00:00Z") });
+  reward.redeemedAt = new Date("2026-01-10T00:00:00Z");
+  reward.redeemedSaleId = "sale-old-cycle";
+  const redeemEntry: FakeEntry = seedReward({
+    id: "redeem-cycle",
+    accountId: "account-cycle",
+    kind: "REDEEM",
+    visits: 0,
+    points: 0,
+    ref: "redeem:sale:sale-old-cycle",
+    saleId: "sale-old-cycle",
+    sourceType: "sale",
+    sourceId: "sale-old-cycle",
+    rewardEntryId: "reward-cycle",
+    discountXpf: 300n,
+    rewardKind: null,
+    rewardPercent: null,
+    rewardBase: null,
+    // Consommée dans un cycle ANCIEN — largement avant l'activatedAt du programme courant.
+    occurredAt: new Date("2026-01-10T00:00:00Z"),
+  });
+  const { tx, entries } = makeFakeTx([reward, redeemEntry]);
+
+  // Annulation APRÈS une réactivation (activatedAt courant très postérieur à la consommation).
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-old-cycle" });
+
+  const rewardAfter = entries.find((e) => e.id === "reward-cycle")!;
+  assert.equal(rewardAfter.redeemedAt, null, "de nouveau disponible, malgré le changement de cycle");
+  assert.equal(rewardAfter.redeemedSaleId, null);
+  assert.equal(
+    isRewardAvailable({ redeemedAt: rewardAfter.redeemedAt, expiresAt: rewardAfter.expiresAt }),
+    true,
+  );
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1176,7 +1312,16 @@ test("checkoutSale : rejeu idempotent d'une vente déjà PAID -> retour anticip�
 
 test("annulerVente : reprise fidélité UNIQUEMENT si la vente était PAID, dans la MÊME transaction que markVoid", () => {
   const corps = corpsAnnulerVente();
-  assert.match(corps, /if \(sale\.status === "PAID"\) \{\s*\n\s*await reverseSaleLoyalty\(tx, \{ tenantId, saleId, occurredAt: new Date\(\) \}\);/);
+  const iGuard = corps.indexOf('if (sale.status === "PAID") {');
+  const iCall = corps.indexOf("await reverseSaleLoyalty(tx, { tenantId, saleId });");
+  assert.ok(iGuard > -1, "garde `sale.status === PAID` introuvable");
+  assert.ok(iCall > -1, "appel à reverseSaleLoyalty introuvable, ou porte encore un occurredAt");
+  assert.ok(iGuard < iCall && iCall - iGuard < 700, "l'appel doit être DANS la garde PAID, pas ailleurs");
+});
+
+test("annulerVente : reverseSaleLoyalty n'est plus appelée avec un occurredAt — la reprise prend celui du crédit annulé (correctif 2026-09-16)", () => {
+  const corps = corpsAnnulerVente();
+  assert.doesNotMatch(corps, /reverseSaleLoyalty\(tx, \{[^}]*occurredAt/);
 });
 
 test("annulerVente : commentaire TODO fidélité sur l'avoir Compta (pas de reprise auto dans ce lot)", () => {

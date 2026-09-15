@@ -102,6 +102,17 @@ test("checkout n'ajoute d'options que s'il y a quelque chose à transmettre", ()
   assert.match(routeCheckout, /\?\s*\{[\s\S]*?\}\s*:\s*undefined;/);
 });
 
+test("checkout : la condition COMPLÈTE porte bien les SIX porteurs, dans l'ordre (garde de régression doublée, cf. checkout-route.test.ts)", () => {
+  // ⚠️ Assertion STRICTE, volontairement dupliquée depuis checkout-route.test.ts : la protection
+  // contre un porteur oublié (cf. contre-QA 2026-09-16, `loyalty`/`redeemLoyalty` absents de la
+  // condition alors que le câblage existait déjà plus haut dans la route) ne doit PAS tenir à un
+  // seul fichier de test.
+  assert.match(
+    routeCheckout,
+    /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit \|\| loyalty \|\| redeemLoyalty\s*\?/,
+  );
+});
+
 // ── Rétrocompatibilité, la promesse centrale ─────────────────────────────────
 
 test("posteId est toujours optionnel côté appelant", () => {
