@@ -45,7 +45,8 @@ import {
   type SaleSnapshotForCorrection,
 } from "./payment-correction";
 import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
-import { expectedXpfPourRapport } from "./z-report";
+import { expectedXpfPourRapport, creditXpfPourRapport } from "./z-report";
+import { checkoutUnderpaidGuard, dueAtNoonUtcIso, type CreditOptions } from "./credit";
 import { lockSaleRow } from "./sale-lock";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
@@ -153,6 +154,12 @@ export type ZReport = {
   // compter une seconde fois.
   giftCardRedeemedCount: number; // combien de prestations reglees par un bon
   giftCardRedeemedXpf: number; // leur valeur faciale, DEJA encaissee a la vente des bons
+  // ── Vente à crédit (échéancier, lot A, 2026-09-15) ──────────────────────────────────
+  // 🔒 PUREMENT INFORMATIF, même statut que les deux champs bons cadeaux ci-dessus. Le Z
+  // compte UNIQUEMENT l'encaissé (`cashSalesXpf`/`byMethod`/`totalSalesXpf` ne voient QUE les
+  // `SalePayment` réels) : `creditXpf` explique l'écart entre `totalSalesXpf` (CA facturé) et
+  // ce qui est réellement dans le tiroir — il n'entre NULLE PART ailleurs.
+  creditXpf: number; // Σ (totalXpf - payé) des ventes à crédit de la session, jamais négatif
 };
 
 /**
@@ -179,13 +186,20 @@ export async function closeSession(
     const byMethod: Record<string, bigint> = {};
     let cashSales = 0n;
     let totalSales = 0n;
+    // Vente à crédit (lot A) : { totalXpf, paidXpf } par vente PAID de la session, pour
+    // `creditXpfPourRapport` ci-dessous — purement informatif, cf. lib/z-report.ts.
+    const salesForCredit: { totalXpf: bigint; paidXpf: bigint }[] = [];
     for (const s of sales) {
       totalSales += s.totalXpf;
+      let paidForSale = 0n;
       for (const p of s.payments) {
         byMethod[p.method] = (byMethod[p.method] ?? 0n) + p.amountXpf;
         if (p.method === "CASH") cashSales += p.amountXpf;
+        paidForSale += p.amountXpf;
       }
+      salesForCredit.push({ totalXpf: s.totalXpf, paidXpf: paidForSale });
     }
+    const creditXpf = creditXpfPourRapport(salesForCredit);
 
     // Les mouvements de tiroir de la session (remboursements, prelevements, apports).
     // Sans eux, un avoir rendu en especes produisait un ecart MUET au Z.
@@ -247,6 +261,9 @@ export async function closeSession(
       // (les deux lignes ci-dessus, `expected` et `totalSales`, ne les ont jamais vus).
       giftCardRedeemedCount: gc.giftCardRedeemedCount,
       giftCardRedeemedXpf: Number(gc.giftCardRedeemedXpf),
+      // Informatif, recalculé à chaque lecture (même régime que cashSalesXpf/byMethod/totalSalesXpf
+      // ci-dessus) — cf. lib/z-report.ts#creditXpfPourRapport.
+      creditXpf: Number(creditXpf),
     });
 
     if (session.status === "CLOSED") {
@@ -554,6 +571,16 @@ export type CheckoutOptions = {
    * binaire, il n'y a pas de solde et il ne faut pas en réintroduire un.
    */
   redeemGiftCards?: RedeemGiftCardRef[];
+  /**
+   * Vente À CRÉDIT (échéancier, lot A, 2026-09-15) — décisions Marco (15/09) :
+   *   - `payments` porte le 1er versement : montant LIBRE, strictement > 0, encaissé le jour même.
+   *   - La vente passe PAID comme aujourd'hui (ce n'est PAS un nouveau statut).
+   *   - `dueAt` (YYYY-MM-DD) est la date de la DERNIÈRE échéance, transmise à Core-Compta.
+   *   - Les échéances ULTÉRIEURES sont un encaissement MANUEL — HORS de ce lot.
+   *   - Le Z compte UNIQUEMENT l'encaissé ; `dont à crédit` est informatif (cf. lib/z-report.ts).
+   * Absent = comportement STRICTEMENT inchangé (garde UNDERPAID classique, cf. lib/credit.ts).
+   */
+  credit?: CreditOptions;
 };
 
 /** Un bon à brûler pendant l'encaissement, désigné par son id (la surface l'a retrouvé par son code). */
@@ -599,6 +626,11 @@ export type CheckoutError =
   | { ok: false; error: "ALREADY_VOID" }
   | { ok: false; error: "NO_PAYMENT" }
   | { ok: false; error: "UNDERPAID"; totalXpf: number; paidXpf: number }
+  // Vente à crédit (lot A) : refus AVANT tout encaissement, symétriques d'UNDERPAID —
+  // CREDIT_NOT_NEEDED = déjà soldé (rien à créditer) ; CREDIT_NEEDS_DEPOSIT = 1er versement
+  // manquant ou nul (cf. lib/credit.ts#checkoutUnderpaidGuard).
+  | { ok: false; error: "CREDIT_NOT_NEEDED" }
+  | { ok: false; error: "CREDIT_NEEDS_DEPOSIT" }
   // Excédent sur une méthode qui ne rend pas la monnaie (carte/virement/chèque) : c'est
   // une saisie fausse, pas un rendu. Les espèces en trop, elles, ne sont JAMAIS une
   // erreur — le moteur impute le dû et rend la différence.
@@ -618,7 +650,7 @@ export type CheckoutError =
 
 type LoadedSale = NonNullable<Awaited<ReturnType<typeof getSale>>>;
 
-function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
+function toSnapshot(sale: LoadedSale, creditDueAtIso?: string | null): SyncSaleSnapshot {
   return {
     id: sale.id,
     tenantId: sale.tenantId,
@@ -629,6 +661,9 @@ function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
     invoiceNumber: sale.invoiceNumber,
     comptaSyncedAt: sale.comptaSyncedAt,
     stockSyncedAt: sale.stockSyncedAt,
+    // Vente à crédit (lot A) : fourni UNIQUEMENT dans la même requête que l'encaissement (cf.
+    // lib/sync.ts#SyncSaleSnapshot.dueAt — pas de champ dédié sur `Sale`, angle mort assumé).
+    dueAt: creditDueAtIso ?? null,
     lines: sale.lines.map((l) => ({
       id: l.id,
       kind: l.kind,
@@ -663,8 +698,13 @@ function persistFor(tenantId: string, saleId: string): SyncPersist {
  * Rejoue les étapes de synchro MANQUANTES d'une vente déjà chargée (PAID attendu).
  * N'échoue jamais sur un échec core : l'issue est retournée + persistée (syncError/syncAttempts).
  */
-async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
-  const outcome = await runSaleSync(toSnapshot(sale), comptaClient(), stockClient(), persistFor(sale.tenantId, sale.id));
+async function syncLoadedSale(sale: LoadedSale, creditDueAtIso?: string | null): Promise<SyncOutcome> {
+  const outcome = await runSaleSync(
+    toSnapshot(sale, creditDueAtIso),
+    comptaClient(),
+    stockClient(),
+    persistFor(sale.tenantId, sale.id),
+  );
   if (!outcome.synced && outcome.failure) {
     const f = outcome.failure;
     // Socle observabilité : pont inter-cores (Compta/Stock) en échec après encaissement → watchdog.
@@ -794,11 +834,15 @@ export async function checkoutSale(
 
   const compta = comptaClient();
 
+  // Vente à crédit (lot A) : calculé UNE fois, réutilisé aux deux appels de synchro de cette
+  // requête (rejeu idempotent ci-dessous + synchro nominale plus bas). `null` sans `credit`.
+  const creditDueAtIso = options?.credit ? dueAtNoonUtcIso(options.credit.dueAt) : null;
+
   // Idempotence : si déjà PAID, ne pas ré-encaisser — mais retenter la synchro si elle est incomplète.
   if (sale.status === "PAID") {
     const paid = sale.payments.reduce((t, p) => t + p.amountXpf, 0n);
     const pending = !sale.comptaSyncedAt || !sale.stockSyncedAt;
-    const outcome = pending ? await syncLoadedSale(sale) : null;
+    const outcome = pending ? await syncLoadedSale(sale, creditDueAtIso) : null;
     const invoiceId = outcome ? outcome.invoiceId : sale.invoiceId;
     return {
       ok: true,
@@ -910,8 +954,12 @@ export async function checkoutSale(
     tx.salePayment.findMany({ where: { tenantId, saleId }, orderBy: { createdAt: "asc" } }),
   );
   const paidTotal = persisted.reduce((t, p) => t + p.amountXpf, 0n);
-  if (paidTotal < sale.totalXpf) {
-    return { ok: false, error: "UNDERPAID", totalXpf: Number(sale.totalXpf), paidXpf: Number(paidTotal) };
+  const guard = checkoutUnderpaidGuard(sale.totalXpf, paidTotal, options?.credit);
+  if (!guard.ok) {
+    if (guard.error === "UNDERPAID") {
+      return { ok: false, error: "UNDERPAID", totalXpf: Number(sale.totalXpf), paidXpf: Number(paidTotal) };
+    }
+    return { ok: false, error: guard.error };
   }
   const change = Number(computeChange(persisted.map((p) => ({
     method: p.method,
@@ -999,7 +1047,7 @@ export async function checkoutSale(
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
   const reloaded = await getSale(tenantId, saleId);
-  const outcome = await syncLoadedSale(reloaded!);
+  const outcome = await syncLoadedSale(reloaded!, creditDueAtIso);
 
   // Numéro de la facture d'ACHAT (au nom de l'acheteur) reporté sur les bons : simple
   // annotation de rapprochement, faite APRÈS la synchro parce que le numéro n'existe pas

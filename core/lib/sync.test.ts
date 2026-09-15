@@ -67,9 +67,11 @@ function emptyState(): FakeState {
 /** Compta fake : compte les appels ; peut échouer sur commande. */
 function makeCompta(opts: { failCreate?: CoreClientError; failSettle?: CoreClientError } = {}) {
   const calls = { createInvoice: 0, settle: 0 };
+  const createInvoiceArgs: unknown[] = [];
   const client: ComptaClient = {
-    async createInvoice(): Promise<CreateInvoiceResult> {
+    async createInvoice(input): Promise<CreateInvoiceResult> {
       calls.createInvoice++;
+      createInvoiceArgs.push(input);
       if (opts.failCreate) throw opts.failCreate;
       return { invoiceId: "inv-1", number: "FAC-1", totalXpf: 8000, alreadyExisted: false };
     },
@@ -80,7 +82,7 @@ function makeCompta(opts: { failCreate?: CoreClientError; failSettle?: CoreClien
     },
     receiptUrl: (invoiceId) => `http://compta/receipt/${invoiceId}`,
   };
-  return { client, calls, opts };
+  return { client, calls, opts, createInvoiceArgs };
 }
 
 /** Stock fake : compte les appels ; peut échouer sur commande. */
@@ -226,4 +228,32 @@ test("étapes déjà convergées : aucun appel sortant (no-op idempotent)", asyn
   assert.equal(compta.calls.settle, 0);
   assert.equal(stock.calls.recordSale, 0);
   assert.equal(out.stockDecremented, 1, "le reporting compte les lignes PRODUCT déjà couvertes");
+});
+
+// ─── Vente à crédit (échéancier, lot A, 2026-09-15) : dueAt transmis à Compta ─────────────────
+
+test("vente à crédit : dueAt transmis à Compta à MIDI UTC, sans décalage de jour (piège +11)", async () => {
+  const state = emptyState();
+  const compta = makeCompta();
+  const stock = makeStock();
+  // Même valeur que lib/credit.ts#dueAtNoonUtcIso("2026-10-01") — c'est checkoutSale qui la calcule
+  // avant de construire le snapshot ; runSaleSync la transmet TELLE QUELLE, sans y toucher.
+  const sale = makeSale({ dueAt: "2026-10-01T12:00:00.000Z" });
+
+  const out = await runSaleSync(sale, compta.client, stock.client, makePersist(state));
+  assert.equal(out.synced, true);
+  assert.equal(compta.calls.createInvoice, 1);
+  const args = compta.createInvoiceArgs[0] as { dueAt?: string };
+  assert.equal(args.dueAt, "2026-10-01T12:00:00.000Z", "le jour NE doit PAS glisser au 30/09 ni au 02/10");
+});
+
+test("vente SANS crédit : dueAt absent du payload envoyé à Compta (comportement inchangé)", async () => {
+  const state = emptyState();
+  const compta = makeCompta();
+  const stock = makeStock();
+  const sale = makeSale(); // pas de `dueAt`
+
+  await runSaleSync(sale, compta.client, stock.client, makePersist(state));
+  const args = compta.createInvoiceArgs[0] as { dueAt?: string };
+  assert.equal(args.dueAt, undefined);
 });

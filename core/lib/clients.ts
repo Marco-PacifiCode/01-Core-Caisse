@@ -53,6 +53,10 @@ export type CreateInvoiceInput = {
    *  c'est la seule reference partagee avec le circuit de paiement. */
   ticketRef?: string | null;
   clientName?: string | null;
+  /** Vente À CRÉDIT (lot A, 2026-09-15) : ISO 8601 de la dernière échéance — transmis tel quel,
+   *  Core-Compta l'accepte déjà en création de facture (vérifié en frais : `app/api/invoices/
+   *  route.ts`, `dueAt?: string` optionnel). Absent = facture sans échéance, inchangé. */
+  dueAt?: string;
   lines: InvoiceLineInput[];
 };
 
@@ -214,6 +218,7 @@ const httpCompta: ComptaClient = {
       sourceId: input.sourceId,
       ticketRef: input.ticketRef ?? undefined,
       clientName: input.clientName ?? undefined,
+      dueAt: input.dueAt ?? undefined,
       lines: input.lines,
     });
     return (await res.json()) as CreateInvoiceResult;

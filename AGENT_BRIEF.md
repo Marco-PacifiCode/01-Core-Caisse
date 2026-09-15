@@ -1,5 +1,40 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — codé, NON déployé
+
+Branche `claude/caisse-checkout-credit` (worktree `_wt/core-caisse-credit`), tâche d'exécution
+cadrée par un Lead Opus : autoriser une vente à CRÉDIT (1er versement + échéances ultérieures)
+sans casser le chemin existant. **AUCUNE migration** — pas de champ ajouté sur `Sale`.
+
+**But** : `checkoutSale` peut désormais passer une vente PAID sous-payée quand l'appelant fournit
+`credit: { dueAt }` (YYYY-MM-DD, dernière échéance) — le 1er versement est libre, strictement > 0,
+encaissé le jour même (décision Marco 15/09). Sans `credit`, comportement **strictement inchangé**
+(garde UNDERPAID classique). Nouveaux refus AVANT encaissement : `CREDIT_NOT_NEEDED` (payé ≥ total,
+409) et `CREDIT_NEEDS_DEPOSIT` (payé ≤ 0, 422). Route `POST /api/sales/:id/checkout` : `credit.dueAt`
+invalide → 400. Décision pure extraite dans `core/lib/credit.ts` (`checkoutUnderpaidGuard`,
+`parseDueAt`, `dueAtNoonUtcIso` — ancrage MIDI UTC, piège +11 NC).
+
+**Argent — accord Marco requis avant déploiement.** Cette branche touche l'encaissement et la
+facturation ; elle n'a **pas** été déployée par cet exécutant (interdiction du mandat). Le Z
+(`closeSession`) compte toujours UNIQUEMENT l'encaissé et expose une ligne informative `creditXpf`
+(« dont à crédit », `core/lib/z-report.ts#creditXpfPourRapport`) — n'entre ni dans `totalSalesXpf`
+ni dans `expectedXpf`, même régime que `giftCardRedeemedXpf`.
+
+**Consommateur** : surface Salon-Reference (lots B/C à venir — UI de saisie du crédit côté caisse,
+écran des échéances). Les échéances ultérieures restent un encaissement MANUEL, HORS de ce lot A.
+
+⚠️ **Angle mort assumé, PAS refermé** (cf. mémoire `angle-mort-declare-ne-se-referme-pas`) : `dueAt`
+n'est transmis à Core-Compta QUE dans la même requête que l'encaissement (`checkoutSale` le passe
+en mémoire à `runSaleSync`, rien n'est persisté sur `Sale` faute de champ libre — migration hors
+lot). Si le PREMIER appel à `compta.createInvoice` échoue (panne réseau/Compta) sur une vente à
+crédit, la facture est créée SANS `dueAt` lors de la reprise différée (`repairSale` / cron
+`repair-sales`), qui ne connaît plus l'échéance. Résolution = champ dédié sur `Sale`, donc migration
+— décision à prendre en amont du lot B/C, pas par cet exécutant.
+
+272→292 tests verts (+20 : `lib/credit.test.ts`, +5 dans `lib/z-report.test.ts`, +2 dans
+`lib/sync.test.ts`, `lib/checkout-route.test.ts`, +1 régénéré dans `lib/postes.test.ts`),
+`tsc --noEmit` vert. Contrôle anti-fantôme fait (garde sabotée → 3 tests rouges → restaurée → vert).
+
 ## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — **MIGRATION JOUÉE + CORE DÉPLOYÉ**
 
 ✅ **En prod le 15/09.** Migration appliquée par `ops.sh migrate core-caisse` (accord Marco) :

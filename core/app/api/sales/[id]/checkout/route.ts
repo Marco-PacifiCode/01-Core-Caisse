@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { checkoutSale, type PaymentInput } from "@/lib/caisse";
+import { parseDueAt } from "@/lib/credit";
 import type { GiftCardInput } from "@/lib/gift-card";
 import type { PayMethod } from "@prisma/client";
 
@@ -15,15 +16,21 @@ const VALID_METHODS: PayMethod[] = ["CASH", "CARD", "TRANSFER", "CHEQUE", "OTHER
  * (décrément SALE). Idempotent de bout en bout : rejouer avec le même saleId ne double NI la facture
  * NI le stock NI les paiements.
  *
- * Body : { tenantId, payments: { method, amountXpf, tenderedXpf? }[] }
+ * Body : { tenantId, payments: { method, amountXpf, tenderedXpf? }[], credit?: { dueAt } }
  *   payments : 1..n (paiement MIXTE supporté). tenderedXpf (espèces) → rendu monnaie.
+ *   credit (échéancier, lot A, 2026-09-15) : VENTE À CRÉDIT — `payments` porte alors le 1er
+ *     versement (montant libre, strictement > 0), `dueAt` (YYYY-MM-DD) la date de la DERNIÈRE
+ *     échéance. Absent = comportement STRICTEMENT inchangé. Les échéances ultérieures sont un
+ *     encaissement MANUEL, hors de cette route.
  *
  * Réponse 200 : { ok, saleId, status, invoiceId, invoiceNumber, totalXpf, paidXpf, changeXpf,
  *                 receiptUrl, stockDecremented, syncPending, syncError, alreadyPaid }
  *   Un échec S2S APRÈS encaissement ne fait PAS échouer la requête : la vente reste PAID,
  *   syncPending=true (invoiceId/receiptUrl éventuellement null), et la convergence est reprise par
  *   POST /api/sales/:id/repair ou le balayage /api/cron/repair-sales.
- * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/OVERPAID/ALREADY_VOID/NO_PAYMENT (validations AVANT encaissement).
+ * Erreurs : 404 SALE_NOT_FOUND · 409 UNDERPAID/OVERPAID/ALREADY_VOID/NO_PAYMENT/CREDIT_NOT_NEEDED
+ *   (validations AVANT encaissement) · 422 CREDIT_NEEDS_DEPOSIT (crédit sans 1er versement) ·
+ *   400 `credit.dueAt invalide`.
  *
  * `amountXpf` est une DÉCLARATION, pas une consigne : le moteur impute lui-même `min(reçu, dû)`
  * et rend l'excédent en espèces (cf. lib/money.ts normalizePayments). Un excédent en
@@ -49,6 +56,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     // achat. La surface a déjà retiré du ticket ce que le bon couvre (ligne `OTHER` négative) ;
     // il ne reste ici qu'à le brûler, dans la transaction du passage à PAID.
     redeemGiftCards?: { id?: string; redeemedForXpf?: number | null; redeemedBy?: string | null; redeemedByName?: string | null }[];
+    /** Vente À CRÉDIT (échéancier, lot A, 2026-09-15) : `dueAt` = date (YYYY-MM-DD) de la
+     *  DERNIÈRE échéance. `payments` ci-dessus porte alors le 1er versement. */
+    credit?: { dueAt?: string };
   };
   try {
     body = await req.json();
@@ -110,14 +120,25 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     paidAt = d;
   }
 
+  // `credit` (échéancier, lot A) : `dueAt` doit être une date calendaire YYYY-MM-DD valide —
+  // même forme de refus que `paidAt` ci-dessus (400, AVANT tout encaissement).
+  let credit: { dueAt: string } | undefined;
+  if (body.credit) {
+    if (!body.credit.dueAt || !parseDueAt(body.credit.dueAt)) {
+      return NextResponse.json({ error: "credit.dueAt invalide" }, { status: 400 });
+    }
+    credit = { dueAt: body.credit.dueAt };
+  }
+
   // On n'ajoute la clé d'options QUE si elle porte quelque chose : sans
-  // `giftCards` ni `paidAt`, l'appel reste à l'octet près celui d'avant.
+  // `giftCards` ni `paidAt` ni `credit`, l'appel reste à l'octet près celui d'avant.
   const options =
-    giftCards || paidAt || redeemGiftCards
+    giftCards || paidAt || redeemGiftCards || credit
       ? {
           ...(giftCards ? { giftCards } : {}),
           ...(paidAt ? { paidAt } : {}),
           ...(redeemGiftCards ? { redeemGiftCards } : {}),
+          ...(credit ? { credit } : {}),
         }
       : undefined;
   const result = await checkoutSale(tenantId, saleId, parsed, options);
@@ -134,6 +155,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       GIFT_CARD_CODE_TAKEN: 409,
       // Bon inconsommable (inconnu, deja brule, annule) : refus AVANT tout encaissement.
       GIFT_CARD_NOT_REDEEMABLE: 409,
+      // Vente à crédit (lot A) : CREDIT_NOT_NEEDED = déjà soldé, refus au même titre qu'UNDERPAID
+      // (conflit d'état AVANT tout encaissement). CREDIT_NEEDS_DEPOSIT = requête bien formée mais
+      // 1er versement manquant/nul — 422, pas 409 (ce n'est pas un conflit d'état, une correction
+      // du body suffit).
+      CREDIT_NOT_NEEDED: 409,
+      CREDIT_NEEDS_DEPOSIT: 422,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

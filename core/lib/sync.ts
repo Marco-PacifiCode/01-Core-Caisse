@@ -55,6 +55,13 @@ export type SyncSaleSnapshot = {
   invoiceNumber: string | null;
   comptaSyncedAt: Date | null;
   stockSyncedAt: Date | null;
+  /** Vente À CRÉDIT (lot A, 2026-09-15) : ISO 8601 à MIDI UTC de la dernière échéance (déjà
+   *  calculée par l'appelant — cf. lib/credit.ts#dueAtNoonUtcIso), transmis TEL QUEL à
+   *  `compta.createInvoice`. `null`/absent = facture sans échéance, comportement inchangé.
+   *  ⚠️ Ni stocké ni relu ici : l'appelant (checkoutSale) ne le fournit QUE dans le même
+   *  requête que l'encaissement — un `repairSale` ultérieur (après échec Compta) le perd, faute
+   *  de champ dédié sur `Sale` (angle mort assumé, cf. AGENT_BRIEF.md 2026-09-15). */
+  dueAt?: string | null;
   lines: SyncLine[];
   payments: SyncPayment[];
 };
@@ -136,6 +143,8 @@ export async function runSaleSync(
           sourceId: sale.id,
           ticketRef: sale.sourceId,
           clientName: sale.clientName,
+          // Vente à crédit (lot A) : omis quand non renseigné — PAS de fallback à une date bidon.
+          ...(sale.dueAt ? { dueAt: sale.dueAt } : {}),
           lines: sale.lines.map((l) => ({
             label: l.label,
             qty: l.qty,
