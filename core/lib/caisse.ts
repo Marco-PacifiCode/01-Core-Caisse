@@ -768,7 +768,13 @@ export async function checkoutSale(
 
   // ── Bons cadeaux à CONSOMMER : validation de FORME, avant tout le reste ────────────────
   // Même inertie que ci-dessus : sans le champ, pas une requête, pas une différence.
-  const giftCardsToRedeem: { id: string; redeemedForXpf: bigint | null; by: string | null; byName: string | null }[] = [];
+  const giftCardsToRedeem: {
+    id: string;
+    redeemedForXpf: bigint | null;
+    by: string | null;
+    byName: string | null;
+    appointmentId: string | null;
+  }[] = [];
   for (const r of options?.redeemGiftCards ?? []) {
     const forXpf = normalizeRedeemedFor(r.redeemedForXpf ?? null);
     if (!forXpf.ok) {
@@ -779,6 +785,10 @@ export async function checkoutSale(
       redeemedForXpf: forXpf.redeemedForXpf,
       by: r.redeemedBy ?? null,
       byName: r.redeemedByName ?? null,
+      // Rattache le bon consommé au RDV honoré — SEULEMENT quand la vente EST ce RDV
+      // (`sourceType === "rdv"`) : un bon consommé sur une vente comptoir ordinaire ne
+      // porte aucun appointmentId.
+      appointmentId: sale.sourceType === "rdv" ? sale.sourceId : null,
     });
   }
 
@@ -952,6 +962,7 @@ export async function checkoutSale(
         redeemedBy: g.by,
         redeemedByName: g.byName,
         redeemedForXpf: g.redeemedForXpf,
+        redeemedAppointmentId: g.appointmentId,
       };
       const done = await tx.giftCard.updateMany({ where: cond, data: marque });
       if (done.count !== 1) {
@@ -1321,6 +1332,7 @@ export type GiftCardView = {
   redeemedAt: string | null;
   redeemedByName: string | null;
   redeemedForXpf: number | null;
+  redeemedAppointmentId: string | null;
   cancelledAt: string | null;
   cancelReason: string | null;
 };
@@ -1342,6 +1354,7 @@ type GiftCardRow = {
   redeemedAt: Date | null;
   redeemedByName: string | null;
   redeemedForXpf: bigint | null;
+  redeemedAppointmentId: string | null;
   cancelledAt: Date | null;
   cancelReason: string | null;
 };
@@ -1363,6 +1376,7 @@ const GIFT_CARD_SELECT = {
   redeemedAt: true,
   redeemedByName: true,
   redeemedForXpf: true,
+  redeemedAppointmentId: true,
   cancelledAt: true,
   cancelReason: true,
 } as const;
@@ -1390,6 +1404,7 @@ function toGiftCardView(row: GiftCardRow): GiftCardView {
     redeemedAt: row.redeemedAt ? row.redeemedAt.toISOString() : null,
     redeemedByName: row.redeemedByName,
     redeemedForXpf: row.redeemedForXpf === null ? null : Number(row.redeemedForXpf),
+    redeemedAppointmentId: row.redeemedAppointmentId ?? null,
     cancelledAt: row.cancelledAt ? row.cancelledAt.toISOString() : null,
     cancelReason: row.cancelReason,
   };
@@ -1451,6 +1466,7 @@ export type RedeemGiftCardInput = {
   redeemedBy?: string | null;
   redeemedByName?: string | null;
   redeemedForXpf?: bigint | null;
+  redeemedAppointmentId?: string | null;
 };
 
 export type RedeemGiftCardResult =
@@ -1491,6 +1507,7 @@ export async function redeemGiftCard(
         redeemedBy: input.redeemedBy ?? null,
         redeemedByName: input.redeemedByName ?? null,
         redeemedForXpf: input.redeemedForXpf ?? null,
+        redeemedAppointmentId: input.redeemedAppointmentId ?? null,
       },
     });
 

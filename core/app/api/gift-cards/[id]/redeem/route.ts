@@ -28,14 +28,16 @@ export const runtime = "nodejs";
  *    affiche la date de validité en clair, le moteur ne refuse que ce qui est objectivement
  *    impossible (déjà consommé, annulé).
  *
- * Body : { tenantId, redeemedBy?, redeemedByName?, redeemedForXpf? }
+ * Body : { tenantId, redeemedBy?, redeemedByName?, redeemedForXpf?, redeemedAppointmentId? }
  *   · redeemedForXpf : prix affiché de la prestation le jour de l'échange. FACULTATIF, et il ne
  *     calcule AUCUN solde — le bon est BINAIRE, il n'y a pas de solde. Il ne sert qu'à recouper
  *     la caisse après coup.
+ *   · redeemedAppointmentId : RDV honoré par ce bon. FACULTATIF, chaîne non vide de ≤ 64
+ *     caractères ; absent ou `null` → aucun RDV rattaché ; tout autre type, vide ou trop long → 400.
  *
  * Réponses :
  *   200 { ok:true, giftCard }
- *   400 REDEEMED_FOR_NOT_INTEGER · REDEEMED_FOR_NEGATIVE · tenantId manquant
+ *   400 REDEEMED_FOR_NOT_INTEGER · REDEEMED_FOR_NEGATIVE · tenantId manquant · redeemedAppointmentId invalide
  *   401 clé de service absente
  *   404 { error:"NOT_FOUND" }
  *   409 { error:"ALREADY_REDEEMED" } · { error:"CANCELLED" }
@@ -57,10 +59,23 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const forXpf = normalizeRedeemedFor(body.redeemedForXpf);
   if (!forXpf.ok) return NextResponse.json({ error: forXpf.error }, { status: 400 });
 
+  let redeemedAppointmentId: string | null = null;
+  if (body.redeemedAppointmentId !== undefined && body.redeemedAppointmentId !== null) {
+    if (
+      typeof body.redeemedAppointmentId !== "string" ||
+      body.redeemedAppointmentId.length === 0 ||
+      body.redeemedAppointmentId.length > 64
+    ) {
+      return NextResponse.json({ error: "redeemedAppointmentId invalide" }, { status: 400 });
+    }
+    redeemedAppointmentId = body.redeemedAppointmentId;
+  }
+
   const result = await redeemGiftCard(tenantId, id, {
     redeemedBy: typeof body.redeemedBy === "string" ? body.redeemedBy : null,
     redeemedByName: typeof body.redeemedByName === "string" ? body.redeemedByName : null,
     redeemedForXpf: forXpf.redeemedForXpf,
+    redeemedAppointmentId,
   });
 
   if (!result.ok) {
