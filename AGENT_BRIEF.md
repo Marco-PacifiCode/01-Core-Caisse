@@ -1,5 +1,63 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — 🛑 NON DÉPLOYÉ
+
+Branche `claude/caisse-fidelite-moteur-20260916` (worktree jetable `_wt/caisse-fidelite-c2`,
+empilée sur C1, base `235b5d9`), tâche d'exécution cadrée. **Ne déploie rien, aucune commande
+contre la prod** — même mandat que C1.
+
+**Nouveau `core/lib/loyalty-db.ts`, écritures DB** (reçoit `tx`, testable par un FAUX `tx` en
+mémoire, sans DB ni contexte Next — `lib/loyalty-checkout.test.ts`) : `lockAccount` (upsert +
+`FOR UPDATE`), `insertEntry` (P2002 → `{duplicate:true}`, jamais levé), `creditVisit`,
+`creditPoints`, `redeemReward` (update conditionnel `redeemedAt: null`, symétrique du bon
+cadeau), `reverseSale` (reprise à l'annulation), `adjustLoyalty` (correction ADMIN),
+`accountSummary` (lecture pure). ⚠️ **Écart assumé par rapport au pseudo-code littéral du
+plan §5** : la boucle d'émission des récompenses (`issueRewardsForDelta`) crée le **delta**
+entre `rewardsToCreate(sumAvant,N)` et `rewardsToCreate(sumAprès,N)`, pas `0..rewardsToCreate
+(sumAprès,N)-1` à chaque événement — une lecture littérale aurait ré-émis une récompense déjà
+acquise sous un `ref` différent à CHAQUE visite/vente suivante qui ne franchit aucun nouveau
+seuil (le `ref` est ancré sur l'événement DÉCLENCHEUR, qui change à chaque fois). Test qui
+aurait détecté le bug s'il avait été codé au pied de la lettre : « mode VISITS, 5 visites → 1
+récompense, jamais 2 » (`loyalty-checkout.test.ts`).
+
+**`checkoutSale`** (`lib/caisse.ts`) gagne `options.loyalty` (rattache la vente à une fiche
+pour créditer des points en mode `POINTS`) et `options.redeemLoyalty` (consomme une
+récompense). Contrôle de forme + disponibilité de la récompense **avant** tout paiement
+persisté (même schéma que les bons cadeaux) ; consommation + crédit de points **dans** la
+transaction du passage à PAID, **après** les bons. Course entre deux comptoirs → `LOYALTY_RACE`,
+traitée comme `GIFT_CARD_RACE`. Rejeu d'une vente déjà PAID → retour anticipé, **aucune**
+écriture fidélité (le bloc est après ce retour).
+
+💰 **`giftCardSalesXpf` (6ᵉ paramètre de `pointsForSale`, décision Marco du 15/09 sur C1)** :
+calculé en sommant les `amountXpf` de `giftCardsToIssue` (les bons émis PAR cette vente,
+donnée d'entrée déjà validée) — jamais en inspectant les lignes ni en relisant `GiftCard` en
+base. Test : ticket 3 000 F prestations + bon 10 000 F émis, assiette `ALL` → 30 points.
+
+**`annulerVente`** : reprise fidélité (`reverseSale`) dans la **même** transaction que le
+passage à VOID, **uniquement** si la vente était PAID (une vente DRAFT n'a jamais rien écrit
+en fidélité). Un avoir émis **directement** depuis Core-Compta (verrouillé) ne repasse pas par
+`annulerVente` : commentaire `TODO fidélité` laissé à cet endroit, reprise **non automatique**
+dans ce lot (correction ADMIN manuelle prévue plus tard) — décision Marco du 15/09.
+
+**Routes** (`app/api/loyalty/{program,accounts,visits,adjust}/route.ts`), gardées par
+`hasServiceKey`, sur le modèle de `app/api/gift-cards/route.ts` : `GET/PUT /program`,
+`GET /accounts` (50 fiches au plus, lecture pure — aucune fiche créée), `POST /visits`
+(best-effort côté appelant, silencieux ici), `POST /adjust` (ADMIN, motif ≥ 3 caractères,
+`ref` préfixé `adjust:`). 🔒 **Droits (décision Marco #2)** : la garde de rôle (ADMIN vs
+`caisse`) vit côté SURFACE — ce Core ne connaît que la clé de service S2S, rien n'est
+réinventé ici.
+
+**+29 tests** dans `lib/loyalty-checkout.test.ts` (18 exécutés réellement sur le moteur DB via
+faux `tx`, 11 structurels sur `checkoutSale`/`annulerVente`) → **343 tests** au total, tous
+verts. `tsc --noEmit` et `prisma validate` verts. Contrôle anti-fantôme fait : sabotage de
+`redeemReward` (retrait de `redeemedAt: null` du `where`) → les 2 tests de double consommation
+rougissent → restauré → suite verte.
+
+🛑 **Ne fait PAS** : jouer la migration C1, déployer ce Core, ni aucune surface. **Ordre
+impératif avant tout déploiement** : migration C1 (`ops.sh migrate core-caisse`, accord
+Marco) → `rls.sql` rejoué → déploiement de ce Core → écrans surface (hors de ce lot). Argent
+en jeu (points/récompenses) → accord Marco explicite avant tout `ng-deploy`.
+
 ## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — 🛑 MIGRATION NON JOUÉE, ACCORD MARCO REQUIS
 
 Branche `claude/caisse-fidelite-schema-20260916` (worktree jetable `_wt/caisse-fidelite-c1`), tâche

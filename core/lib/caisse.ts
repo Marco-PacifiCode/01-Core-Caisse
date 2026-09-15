@@ -48,6 +48,27 @@ import { prepareClotureImport, type ImportClotureInput, type ImportClotureError 
 import { expectedXpfPourRapport, creditXpfPourRapport } from "./z-report";
 import { checkoutUnderpaidGuard, dueAtNoonUtcIso, type CreditOptions } from "./credit";
 import { lockSaleRow } from "./sale-lock";
+import {
+  validateProgram,
+  nextActivatedAt,
+  pointsForSale,
+  rewardDiscountXpf,
+  isRewardAvailable,
+  LOYALTY_LINE_PREFIX,
+  type LoyaltyProgramInput,
+  type LoyaltyProgramData,
+  type LoyaltyBase,
+} from "./loyalty";
+import {
+  creditVisit as creditVisitDb,
+  creditPoints as creditPointsDb,
+  redeemReward as redeemRewardDb,
+  reverseSale as reverseSaleLoyalty,
+  adjustLoyalty as adjustLoyaltyDb,
+  accountSummary as loyaltyAccountSummary,
+  offProgram,
+  type LoyaltyProgramRow,
+} from "./loyalty-db";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
@@ -581,6 +602,20 @@ export type CheckoutOptions = {
    * Absent = comportement STRICTEMENT inchangé (garde UNDERPAID classique, cf. lib/credit.ts).
    */
   credit?: CreditOptions;
+  /**
+   * Fidélité (lot C2, plan Salon-Reference 2026-09-15) — rattache la vente à une fiche pour
+   * créditer des points en mode `POINTS` : `options.loyalty.clientFicheId` identifie la cliente,
+   * retrouvée par la surface (fiche RDV ou `pickedClient` au comptoir). Absent = comportement
+   * strictement inchangé, aucune écriture de fidélité.
+   */
+  loyalty?: { clientFicheId: string; displayName: string };
+  /**
+   * Consommation d'une récompense fidélité DANS la transaction du passage à PAID — même schéma
+   * que `redeemGiftCards` : la surface a déjà posé la ligne `OTHER` négative
+   * (`LOYALTY_LINE_PREFIX`) qui couvre le ticket, ce champ ne fait que brûler la récompense.
+   * Jamais un `PayMethod` : le CA baisse une seule fois, par la ligne négative.
+   */
+  redeemLoyalty?: { rewardEntryId: string; by?: string | null; byName?: string | null };
 };
 
 /** Un bon à brûler pendant l'encaissement, désigné par son id (la surface l'a retrouvé par son code). */
@@ -644,7 +679,13 @@ export type CheckoutError =
   // AVANT que le moindre paiement soit persisté ; et si un autre comptoir brûle le même bon dans
   // l'intervalle, l'`updateMany` de la transaction rend 0 et fait ÉCHOUER le passage à PAID —
   // le ticket reste DRAFT, personne n'a payé, le bon n'a servi qu'une fois.
-  | { ok: false; error: "GIFT_CARD_NOT_REDEEMABLE"; giftCardId: string; reason: GiftCardRedeemRefusal };
+  | { ok: false; error: "GIFT_CARD_NOT_REDEEMABLE"; giftCardId: string; reason: GiftCardRedeemRefusal }
+  // Fidélité (lot C2) : les trois refus tombent AVANT tout encaissement, même raison que les
+  // bons cadeaux — une récompense refusée après l'encaissement laisserait une vente payée sans
+  // la remise qui a justifié son montant.
+  | { ok: false; error: "LOYALTY_NOT_REDEEMABLE"; reason: "NOT_FOUND" | "ALREADY_REDEEMED" | "EXPIRED" }
+  | { ok: false; error: "LOYALTY_AMOUNT_MISMATCH" }
+  | { ok: false; error: "LOYALTY_ACCOUNT_MISMATCH" };
 
 // ─── Synchronisation Compta/Stock (moteur lib/sync.ts branché sur Prisma) ───
 
@@ -914,6 +955,58 @@ export async function checkoutSale(
     }
   }
 
+  // ── Fidélité à CONSOMMER : la récompense est-elle encore consommable, ET le montant posé
+  //    par la surface est-il EXACTEMENT celui attendu ? ──────────────────────────────────────
+  // Même raison, exactement, que les deux contrôles bons cadeaux ci-dessus : cette lecture est
+  // faite AVANT de persister le moindre paiement. Sans elle, une récompense déjà consommée ou
+  // expirée ferait échouer la transaction du passage à PAID APRÈS l'enregistrement des
+  // paiements — l'argent serait pris et la vente resterait en attente. Ce contrôle protège la
+  // CLIENTE ; l'`updateMany` conditionnel de la transaction (`redeemReward`, lib/loyalty-db.ts)
+  // reste le dernier mot pour la course entre deux comptoirs.
+  let loyaltyRedeem: { rewardEntryId: string; discountXpf: bigint } | null = null;
+  if (options?.redeemLoyalty) {
+    const rewardId = options.redeemLoyalty.rewardEntryId;
+    const reward = await withTenant(tenantId, (tx) =>
+      tx.loyaltyEntry.findFirst({
+        where: { id: rewardId, tenantId, kind: "REWARD" },
+        include: { account: { select: { clientFicheId: true } } },
+      }),
+    );
+    if (!reward) return { ok: false, error: "LOYALTY_NOT_REDEEMABLE", reason: "NOT_FOUND" };
+    if (reward.redeemedAt) return { ok: false, error: "LOYALTY_NOT_REDEEMABLE", reason: "ALREADY_REDEEMED" };
+    if (!isRewardAvailable({ redeemedAt: reward.redeemedAt, expiresAt: reward.expiresAt })) {
+      return { ok: false, error: "LOYALTY_NOT_REDEEMABLE", reason: "EXPIRED" };
+    }
+
+    // Assiette calculée sur les lignes POSITIVES du ticket, exactement comme côté surface
+    // (§2.4 du plan) — la fonction pure, PAS l'ordre d'affichage : le Core ne dépend jamais de
+    // l'ordre dans lequel fidélité et bon ont été posés à l'écran.
+    const linesForReward = sale.lines.map((l) => ({ kind: l.kind, lineXpf: lineTotalXpf(l.unitXpf, l.qty) }));
+    const attendu = rewardDiscountXpf(
+      {
+        rewardKind: reward.rewardKind,
+        rewardPercent: reward.rewardPercent,
+        rewardAmountXpf: reward.rewardAmountXpf,
+        rewardBase: reward.rewardBase,
+      },
+      linesForReward,
+    );
+    const loyaltyLines = sale.lines.filter((l) => l.kind === "OTHER" && l.label.startsWith(LOYALTY_LINE_PREFIX));
+    const matches =
+      attendu > 0n &&
+      loyaltyLines.length === 1 &&
+      loyaltyLines[0].qty === 1 &&
+      lineTotalXpf(loyaltyLines[0].unitXpf, loyaltyLines[0].qty) === -attendu;
+    if (!matches) return { ok: false, error: "LOYALTY_AMOUNT_MISMATCH" };
+
+    // Le compte de la récompense doit être celui de la cliente rattachée à CETTE vente — une
+    // récompense ne se prête pas d'une fiche à une autre.
+    if (!options.loyalty || reward.account.clientFicheId !== options.loyalty.clientFicheId) {
+      return { ok: false, error: "LOYALTY_ACCOUNT_MISMATCH" };
+    }
+    loyaltyRedeem = { rewardEntryId: rewardId, discountXpf: attendu };
+  }
+
   // « J'encaisse, puis je rends » : c'est LE moteur qui impute, pas l'appelant. On ne
   // persiste JAMAIS une imputation supérieure au dû — sinon la vente est soldée en trop
   // en Compta et le rendu part en recette (bug vécu V'Cut : 3000 encaissés sur un ticket
@@ -986,6 +1079,15 @@ export async function checkoutSale(
   // plutôt qu'une variable simple — une affectation faite dans une closure ne se lit pas comme
   // un `let` par l'analyse de flot, et le refus deviendrait injoignable sans que rien n'alerte.
   const race: { id: string | null } = { id: null };
+  // Sentinelle de COURSE, fidélité (lot C2) — même schéma exactement que `race` ci-dessus, pour
+  // la même raison : une affectation faite DANS la closure de la transaction ne se lit pas comme
+  // un `let` par l'analyse de flot.
+  const loyaltyRace: { hit: boolean } = { hit: false };
+  // Bon cadeau émis PAR CETTE vente : montant EXCLU de l'assiette de points (décision Marco,
+  // complément du 15/09 au lot C1) — cf. lib/loyalty.ts#pointsForSale, dernier paramètre. Calculé
+  // sur les DONNÉES DE L'ENTRÉE (giftCardsToIssue), pas sur les lignes ni sur les bons relus en
+  // base : c'est le lien non ambigu documenté dans loyalty.ts (`GiftCard.saleId`, pas une ligne).
+  const giftCardSalesXpf = giftCardsToIssue.reduce((t, g) => t + g.amountXpf, 0n);
   const issued = await withTenant(tenantId, async (tx) => {
     // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
     // Une date future est ignorée plutôt que refusée : le ticket est déjà
@@ -1046,15 +1148,67 @@ export async function checkoutSale(
         beneficiaryName: row.beneficiaryName,
       });
     }
+
+    // ── Fidélité (lot C2) : consommation de la récompense, PUIS crédit des points — DANS LA
+    //    MÊME transaction que le passage à PAID, APRÈS les bons (§2.3/§2.4 du plan). ──────────
+    if (loyaltyRedeem) {
+      // Même schéma que la consommation d'un bon juste au-dessus : `redeemReward`
+      // (lib/loyalty-db.ts) est un UPDATE CONDITIONNEL (`redeemedAt: null`), et `count !== 1`
+      // fait échouer TOUTE la transaction — traité exactement comme GIFT_CARD_RACE.
+      const redeemed = await redeemRewardDb(tx, {
+        tenantId,
+        rewardEntryId: loyaltyRedeem.rewardEntryId,
+        saleId,
+        discountXpf: loyaltyRedeem.discountXpf,
+        occurredAt: datePaiement,
+        actorId: options?.redeemLoyalty?.by ?? null,
+        actorName: options?.redeemLoyalty?.byName ?? null,
+      });
+      if (!redeemed.ok) {
+        loyaltyRace.hit = true;
+        throw new Error("LOYALTY_RACE");
+      }
+    }
+    if (options?.loyalty) {
+      const program = await tx.loyaltyProgram.findFirst({ where: { tenantId } });
+      if (program && program.mode === "POINTS" && program.pointsPerHundredXpf) {
+        const linesForPoints = sale.lines.map((l) => ({ kind: l.kind, lineXpf: lineTotalXpf(l.unitXpf, l.qty) }));
+        const points = pointsForSale(
+          linesForPoints,
+          sale.totalXpf,
+          paidTotal,
+          program.pointsBase as LoyaltyBase,
+          program.pointsPerHundredXpf,
+          giftCardSalesXpf,
+        );
+        if (points > 0) {
+          await creditPointsDb(tx, {
+            tenantId,
+            program,
+            clientFicheId: options.loyalty.clientFicheId,
+            displayName: options.loyalty.displayName,
+            saleId,
+            points,
+            occurredAt: datePaiement,
+          });
+        }
+      }
+    }
+
     return rows;
   }).catch((e: unknown) => {
-    // Seule la COURSE d'un bon est rattrapée ici — tout autre échec reste une panne. La liste
+    // Seule la COURSE d'un bon (ou d'une récompense fidélité) est rattrapée ici — tout autre
+    // échec reste une panne. La liste
     // vide n'est jamais lue : le refus part à la ligne suivante, avant tout usage d'`issued`.
     if (race.id) return [] as GiftCardIssued[];
+    if (loyaltyRace.hit) return [] as GiftCardIssued[];
     throw e;
   });
   if (race.id) {
     return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: race.id, reason: "ALREADY_REDEEMED" };
+  }
+  if (loyaltyRace.hit) {
+    return { ok: false, error: "LOYALTY_NOT_REDEEMABLE", reason: "ALREADY_REDEEMED" };
   }
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
@@ -1141,9 +1295,23 @@ export async function annulerVente(
 
   const persist: VoidPersist = {
     markVoid: () =>
-      withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } })).then(
-        () => undefined,
-      ),
+      withTenant(tenantId, async (tx) => {
+        await tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } });
+        // Fidélité (lot C2) : reprise DANS LA MÊME transaction que le passage à VOID — soit les
+        // deux, soit ni l'un ni l'autre (§2.5 du plan). UNIQUEMENT si la vente était PAID : une
+        // vente DRAFT n'a jamais rien écrit en fidélité (points/récompense ne naissent que dans
+        // la transaction du passage à PAID de `checkoutSale`) — `sale.status` est celui lu par
+        // `getSale` ci-dessus, AVANT toute transition, donc non affecté par ce `markVoid` lui-même.
+        //
+        // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
+        // Core-Compta verrouillé). Un avoir émis DIRECTEMENT depuis Core-Compta ne repasse pas
+        // par `annulerVente` — il n'est donc jamais vu ici, et points/récompense restent
+        // acquis tant qu'une correction ADMIN manuelle (lib/loyalty-db.ts#adjustLoyalty) ne
+        // les reprend pas.
+        if (sale.status === "PAID") {
+          await reverseSaleLoyalty(tx, { tenantId, saleId, occurredAt: new Date() });
+        }
+      }).then(() => undefined),
   };
 
   return runVoidSale(
@@ -1159,6 +1327,141 @@ export async function annulerVente(
     persist,
     opts,
   );
+}
+
+// ─── Fidélité (lot C2, plan Salon-Reference 2026-09-15) ────────────────────────────────────────
+// Branchement Prisma/withTenant des routes `app/api/loyalty/**` sur le moteur pur
+// (lib/loyalty.ts) et le moteur DB (lib/loyalty-db.ts, testable par un faux `tx`). Même schéma
+// que les bons cadeaux plus haut dans ce fichier : ces fonctions sont le SEUL endroit qui
+// connaît Prisma pour la fidélité.
+//
+// DROITS (décision Marco #2, 2026-09-15) : régler le programme et corriger un compte = ADMIN
+// seule ; appliquer une récompense au comptoir = droit `caisse` (sans `remise`). La garde de
+// rôle vit côté SURFACE (finance-actions.ts) — ce Core ne connaît que la clé de service S2S,
+// jamais le rôle de l'appelant : rien n'est réinventé ici.
+
+export type LoyaltyProgramView = LoyaltyProgramData & {
+  activatedAt: string | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+};
+
+function toProgramView(row: LoyaltyProgramRow & { updatedAt?: Date; updatedBy?: string | null }): LoyaltyProgramView {
+  return {
+    mode: row.mode as LoyaltyProgramData["mode"],
+    visitsPerReward: row.visitsPerReward,
+    pointsPerHundredXpf: row.pointsPerHundredXpf,
+    pointsBase: row.pointsBase as LoyaltyProgramData["pointsBase"],
+    pointsPerReward: row.pointsPerReward,
+    rewardKind: row.rewardKind as LoyaltyProgramData["rewardKind"],
+    rewardPercent: row.rewardPercent,
+    rewardAmountXpf: row.rewardAmountXpf,
+    rewardBase: row.rewardBase as LoyaltyProgramData["rewardBase"],
+    rewardValidityMonths: row.rewardValidityMonths,
+    clientPortalVisible: row.clientPortalVisible,
+    activatedAt: row.activatedAt ? row.activatedAt.toISOString() : null,
+    updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null,
+    updatedBy: row.updatedBy ?? null,
+  };
+}
+
+/** GET /api/loyalty/program : `{mode:"OFF"}` s'il n'y a encore aucune ligne pour ce tenant. */
+export async function getLoyaltyProgram(tenantId: string): Promise<{ mode: "OFF" } | LoyaltyProgramView> {
+  const row = await withTenant(tenantId, (tx) => tx.loyaltyProgram.findFirst({ where: { tenantId } }));
+  if (!row) return { mode: "OFF" };
+  return toProgramView(row);
+}
+
+export type UpsertLoyaltyProgramResult = { ok: true; data: LoyaltyProgramView } | { ok: false; error: string };
+
+/** PUT /api/loyalty/program : valide, calcule `activatedAt`, puis `upsert`. */
+export async function upsertLoyaltyProgram(
+  tenantId: string,
+  input: LoyaltyProgramInput,
+  updatedBy: string | null,
+): Promise<UpsertLoyaltyProgramResult> {
+  const validated = validateProgram(input);
+  if (!validated.ok) return { ok: false, error: validated.error };
+
+  return withTenant(tenantId, async (tx) => {
+    const prev = await tx.loyaltyProgram.findFirst({ where: { tenantId } });
+    const now = new Date();
+    const activatedAt = nextActivatedAt(prev?.activatedAt ?? null, prev?.mode ?? "OFF", validated.data.mode, now);
+    const row = await tx.loyaltyProgram.upsert({
+      where: { tenantId },
+      update: { ...validated.data, activatedAt, updatedBy },
+      create: { tenantId, ...validated.data, activatedAt, updatedBy },
+    });
+    return { ok: true as const, data: toProgramView(row) };
+  });
+}
+
+/** GET /api/loyalty/accounts : soldes dérivés à la lecture pour N fiches (aucune écriture). */
+export async function listLoyaltyAccounts(tenantId: string, ficheIds: string[]) {
+  return withTenant(tenantId, (tx) => loyaltyAccountSummary(tx, tenantId, ficheIds));
+}
+
+export type CreditLoyaltyVisitInput = {
+  clientFicheId: string;
+  displayName: string;
+  appointmentId: string;
+  occurredAt?: Date;
+  by?: string | null;
+  byName?: string | null;
+};
+
+/**
+ * POST /api/loyalty/visits : crédite une visite honorée. Best-effort du CÔTÉ APPELANT (la
+ * surface) — ici, refus silencieux (`credited:false`, jamais d'erreur) si le programme est OFF,
+ * si le RDV est antérieur à `activatedAt`, ou si la visite a déjà été créditée (rejeu).
+ */
+export async function creditLoyaltyVisit(tenantId: string, input: CreditLoyaltyVisitInput) {
+  return withTenant(tenantId, async (tx) => {
+    const program = await tx.loyaltyProgram.findFirst({ where: { tenantId } });
+    if (!program) return { ok: true as const, credited: false };
+    const result = await creditVisitDb(tx, {
+      tenantId,
+      program,
+      clientFicheId: input.clientFicheId,
+      displayName: input.displayName,
+      appointmentId: input.appointmentId,
+      occurredAt: input.occurredAt ?? new Date(),
+      actorId: input.by ?? null,
+      actorName: input.byName ?? null,
+    });
+    return { ok: true as const, credited: result.credited };
+  });
+}
+
+export type AdjustLoyaltyInput = {
+  clientFicheId: string;
+  displayName: string;
+  visits: number;
+  points: number;
+  reason: string;
+  ref: string;
+  by?: string | null;
+  byName?: string | null;
+};
+
+/** POST /api/loyalty/adjust : correction manuelle ADMIN (motif obligatoire, tracée au journal). */
+export async function adjustLoyaltyAccount(tenantId: string, input: AdjustLoyaltyInput) {
+  return withTenant(tenantId, async (tx) => {
+    const program = (await tx.loyaltyProgram.findFirst({ where: { tenantId } })) ?? offProgram(tenantId);
+    return adjustLoyaltyDb(tx, {
+      tenantId,
+      program,
+      clientFicheId: input.clientFicheId,
+      displayName: input.displayName,
+      visits: input.visits,
+      points: input.points,
+      reason: input.reason,
+      ref: input.ref,
+      occurredAt: new Date(),
+      actorId: input.by ?? null,
+      actorName: input.byName ?? null,
+    });
+  });
 }
 
 // ─── Correction du moyen de paiement ────────────────────────────────────────────────────────
