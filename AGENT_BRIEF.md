@@ -1,5 +1,51 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — 🛑 MIGRATION NON JOUÉE, ACCORD MARCO REQUIS
+
+Branche `claude/caisse-fidelite-schema-20260916` (worktree jetable `_wt/caisse-fidelite-c1`), tâche
+d'exécution cadrée : plan Salon-Reference (fidélité, 3 formes réglables : compteur/visites/points),
+lot C1 seulement (schéma + moteur pur). **Ne déploie rien, n'exécute rien contre la base.**
+
+**Schéma** : trois nouveaux modèles dans `core/prisma/schema.prisma` — `LoyaltyProgram` (réglages,
+un par marchand), `LoyaltyAccount` (compte fidélité d'une cliente, rattaché à `core_auth
+Client.id` par `clientFicheId`, **sans FK**, autre base), `LoyaltyEntry` (journal, jamais de solde
+en cache — visites/points/récompenses tous DÉRIVÉS à la lecture). Idempotence par
+`(tenantId, ref)`. **Pas de nouvel enum** : `mode`/`kind`/`rewardKind`/`rewardBase`/`pointsBase`
+sont des `String`, validés par `core/lib/loyalty.ts`.
+
+🛑 **Migration additive DÉPOSÉE, PAS jouée, aucun accès prod** :
+`core/prisma/migrations/20260916120000_loyalty/migration.sql` — uniquement `CREATE TABLE` /
+`CREATE INDEX` / `ADD CONSTRAINT` (aucun `ALTER`/`DROP` sur une table existante), générée par
+`prisma migrate diff` depuis le schéma de `origin/main`. `prisma/rls.sql` complété (3 tables
+ajoutées au tableau, même motif FORCE RLS que les 6 existantes). **Ordre impératif avant tout
+déploiement, même esprit que les entrées crédit/bon cadeau ci-dessous** : migration
+(`ops.sh migrate core-caisse`, accord Marco) → `rls.sql` rejoué → déploiement de ce Core → C2
+(routes/écrans).
+
+**Nouveau `core/lib/loyalty.ts`, pur (sans Prisma)** : `validateProgram`, `nextActivatedAt`,
+`pointsForSale`, `rewardDiscountXpf`, `rewardsToCreate`, `expiresAtFor`, `isRewardAvailable`,
+`LOYALTY_LINE_PREFIX`. 18 nouveaux tests dans `core/lib/loyalty.test.ts` (`node --test`), tous
+verts ; 314 tests au total sur le repo. `tsc --noEmit` et `prisma validate`/`generate` verts.
+Contrôle anti-fantôme fait : sabotage de `rewardDiscountXpf` (`base - 1n` → `base`) → le test
+« 4 499n » rougit seul → restauré → suite verte.
+
+⚠️ **Complément Marco reçu en cours de lot C1 (après le cadrage initial)** : un bon cadeau ne
+rapporte JAMAIS de points, quelle que soit l'assiette. **Vérifié en lisant `core/lib/caisse.ts` et
+`Salon-Reference/surface/lib/finance-actions.ts`** : une vente de bon cadeau N'EST PAS un
+`LineKind` dédié (l'enum ne connaît que `SERVICE | PRODUCT | OTHER`, et un nouvel enum est exclu) —
+c'est une `SaleLine` **ordinaire** de `kind: "OTHER"`, au label libre posé par la surface ; `OTHER`
+est partagé avec toute autre ligne divers (remise, frais). **Rien dans `{kind, lineXpf}` ne
+distingue donc structurellement une vente de bon d'une autre ligne `OTHER`** — seul
+`GiftCard.saleId` (pas une ligne) identifie authentiquement les bons émis par une vente. `pointsForSale`
+a donc reçu un 6e paramètre optionnel `giftCardSalesXpf: bigint = 0n` (soustrait de l'assiette
+`ALL`), que l'appelant (C2) devra calculer en sommant `GiftCard.amountXpf` des bons émis par la
+vente — jamais en inspectant les lignes. Test ajouté : 3 000 F prestations + 10 000 F vente de bon,
+assiette `ALL`, 1 pt/100 F → 30 points. **Ce changement de signature n'a pas été validé par un
+Lead** : à relire avant C2.
+
+**Ne fait PAS** : C2 (routes, écrans, moteur d'écriture des `LoyaltyEntry`) — hors périmètre de ce
+lot, cf. plan §6 piège 2 (C2 avant la migration jouée = 500 sur les routes fidélité).
+
 ## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — ✅ EN PRODUCTION
 
 ✅ **Accord Marco (15/09)** : migration `20260915200000_sale_due_at` **JOUÉE** en prod par
