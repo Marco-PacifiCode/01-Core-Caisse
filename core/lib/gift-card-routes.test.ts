@@ -318,6 +318,68 @@ test("🔴 la consommation est un UPDATE CONDITIONNEL, et 0 ligne annule tout l'
   assert.match(bloc, /throw new Error\("GIFT_CARD_RACE"\)/);
 });
 
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// 10. 🔴 BON CONSOMMÉ LIÉ AU RDV HONORÉ (redeemedAppointmentId)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+//
+// Un RDV honoré uniquement par un bon (pas de reliquat en espèces/CB) ne doit pas revenir « à
+// encaisser » côté surface : le rapprochement se fait par `GiftCard.redeemedAppointmentId`.
+
+test("🔴 checkoutSale : le bloc de consommation transactionnel marque redeemedAppointmentId", () => {
+  const bloc = isolateBlock(corpsCheckoutSale(), "const issued = await withTenant", "  });");
+  assert.match(bloc, /redeemedAppointmentId/);
+});
+
+test("checkoutSale : le RDV honoré est celui de la vente, uniquement quand sourceType est \"rdv\"", () => {
+  assert.match(corpsCheckoutSale(), /sale\.sourceType === "rdv"/);
+});
+
+test("redeemGiftCard : l'UPDATE écrit redeemedAppointmentId reçu en entrée", () => {
+  assert.match(corpsRedeemGiftCard(), /redeemedAppointmentId:\s*input\.redeemedAppointmentId/);
+});
+
+test("POST /api/gift-cards/:id/redeem lit et transmet redeemedAppointmentId", () => {
+  const corps = redeemBody();
+  assert.match(corps, /body\.redeemedAppointmentId/);
+  assert.match(corps, /redeemedAppointmentId(?:,|\s*:)/);
+});
+
+test("🔴 redeem : redeemedAppointmentId invalide (mauvais type, vide, ou > 64 caractères) → 400", () => {
+  assert.match(redeemBody(), /redeemedAppointmentId invalide/);
+});
+
+test("GIFT_CARD_SELECT porte redeemedAppointmentId", () => {
+  const src = caisseSrc();
+  const debut = src.indexOf("const GIFT_CARD_SELECT");
+  const fin = src.indexOf("} as const", debut);
+  assert.ok(debut > -1 && fin > -1, "GIFT_CARD_SELECT introuvable");
+  assert.match(src.slice(debut, fin), /redeemedAppointmentId:\s*true/);
+});
+
+test("toGiftCardView porte toujours la clé redeemedAppointmentId, même à null", () => {
+  // toGiftCardView n'est pas exportée (pas de `export`) : on isole sa fonction directement.
+  const src = caisseSrc();
+  const debut = src.indexOf("function toGiftCardView");
+  const fin = src.indexOf("\n}", debut);
+  assert.ok(debut > -1 && fin > -1, "toGiftCardView introuvable");
+  const bloc = src.slice(debut, fin);
+  assert.match(bloc, /redeemedAppointmentId:\s*row\.redeemedAppointmentId\s*\?\?\s*null/);
+});
+
+test("🔴 la migration additive gift_card_redeemed_appointment ne DROP rien et n'ALTER TYPE rien", () => {
+  const migrationFile = new URL(
+    "../prisma/migrations/20260915120000_gift_card_redeemed_appointment/migration.sql",
+    import.meta.url,
+  );
+  const sql = readFileSync(migrationFile, "utf8");
+  const sansCommentaires = sql
+    .split("\n")
+    .filter((ligne) => !ligne.trim().startsWith("--"))
+    .join("\n");
+  assert.ok(!/\bDROP\b/i.test(sansCommentaires), `DROP trouvé hors commentaire : ${sansCommentaires}`);
+  assert.ok(!/ALTER TYPE/i.test(sansCommentaires), `ALTER TYPE trouvé hors commentaire : ${sansCommentaires}`);
+});
+
 test("🔴 aucune valeur d'enum n'est ajoutée pour les bons cadeaux", () => {
   // L'invariant du schéma : une valeur d'enum PostgreSQL ne se retire JAMAIS. Un bon n'est pas
   // un moyen de paiement — s'il en devenait un, ce test tomberait avant la migration.

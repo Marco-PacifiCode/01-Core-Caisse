@@ -324,6 +324,9 @@ model GiftCard {
   // Prix affiché de la prestation le jour de l'échange. N'ENTRE DANS AUCUN CALCUL de solde (il
   // n'y a pas de solde) : il sert uniquement à recouper la caisse après coup.
   redeemedForXpf BigInt?
+  // RDV honoré par ce bon, SANS FK, exactement comme `Sale.sourceId` : sert au rapprochement,
+  // ne doit jamais bloquer une opération. NULL si le bon n'a pas été consommé sur un RDV.
+  redeemedAppointmentId String?
 
   // ── Annulation (ADMIN seule) ──────────────────────────────────────────────────────────────
   cancelledAt     DateTime?

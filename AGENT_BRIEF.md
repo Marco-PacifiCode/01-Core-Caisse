@@ -1,5 +1,24 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — ÉCRIT, **NON DÉPLOYÉ, MIGRATION NON JOUÉE**
+
+Branche `claude/gift-card-redeemed-appointment`, poussée, **PR non ouverte**. Tâche d'exécution
+cadrée : lier un bon cadeau consommé au rendez-vous qu'il a réglé, pour qu'un RDV honoré par un
+bon SEUL (pas de reliquat en espèces/CB) ne reste pas affiché « à encaisser » côté surface.
+
+`GiftCard.redeemedAppointmentId` (nullable, sans FK, même patron que `Sale.sourceId`) est
+renseigné à la consommation par `checkoutSale` quand la vente EST le RDV honoré
+(`sale.sourceType === "rdv"`), et transmissible aussi via `POST /api/gift-cards/:id/redeem`.
+272 tests verts (271 + 1), `tsc --noEmit` vert, `prisma validate` vert.
+
+**Migration additive** (à passer par Marco, **NON JOUÉE**) :
+`core/prisma/migrations/20260915120000_gift_card_redeemed_appointment/migration.sql`.
+
+🛑 **Ordre impératif à respecter** : migration → déploiement de ce Core (avec
+`--confirm-schema`) → déploiement des surfaces qui lisent le nouveau champ. Si ce Core part
+**avant** la migration, la lecture des bons cadeaux casse pour **tous** les marchands (colonne
+attendue par le code, absente en base).
+
 ## ⚙️ CI GITHUB : PULL_REQUEST + MANUEL SEULEMENT (2026-09-07)
 
 - 2026-09-07 — ci.yml : CI GitHub sur pull_request + manuel seulement (plus sur chaque push), concurrency cancel-in-progress. Verif locale ci-local.sh inchangee.
