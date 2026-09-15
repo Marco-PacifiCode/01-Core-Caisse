@@ -35,3 +35,45 @@ test("SANS credit dans le body, options ne porte pas la clé `credit` (comportem
   const body = readRoute();
   assert.match(body, /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit/);
 });
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Fidélité (lot C2) — câblage manquant, correctif QA du 2026-09-16 : la route ne transmettait
+// ni `loyalty` ni `redeemLoyalty` à `checkoutSale`, aucune route HTTP n'atteignait donc le
+// moteur de fidélité (S2 inopérant côté surface). Contrat figé ici par lecture de source, même
+// limite que les tests `credit`/`paidAt` ci-dessus (route non exécutable hors contexte Next).
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("loyalty.clientFicheId doit être un UUID valide (400 sinon, AVANT tout encaissement)", () => {
+  const body = readRoute();
+  assert.match(body, /UUID_RE\.test\(clientFicheId\)/);
+  assert.match(body, /loyalty\.clientFicheId invalide/);
+});
+
+test("loyalty.displayName requis, non vide, borné à 200 caractères (400 sinon)", () => {
+  const body = readRoute();
+  assert.match(body, /displayName\.length > 200/);
+  assert.match(body, /loyalty\.displayName requis/);
+});
+
+test("redeemLoyalty.rewardEntryId doit être un UUID valide (400 sinon)", () => {
+  const body = readRoute();
+  assert.match(body, /UUID_RE\.test\(rewardEntryId\)/);
+  assert.match(body, /redeemLoyalty\.rewardEntryId invalide/);
+});
+
+test("forme valide : `loyalty` et `redeemLoyalty` sont bien transmis dans `options` à checkoutSale", () => {
+  const body = readRoute();
+  // La clé options est calculée avant l'appel checkoutSale(...) et inclut loyalty/redeemLoyalty
+  // dès que l'un des deux est présent — même discipline que giftCards/credit ci-dessus.
+  assert.match(body, /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit \|\| loyalty \|\| redeemLoyalty/);
+  assert.match(body, /\.\.\.\(loyalty \? \{ loyalty \} : \{\}\)/);
+  assert.match(body, /\.\.\.\(redeemLoyalty \? \{ redeemLoyalty \} : \{\}\)/);
+  assert.match(body, /const result = await checkoutSale\(tenantId, saleId, parsed, options\);/);
+});
+
+test("les erreurs de fidélité renvoyées par checkoutSale sont mappées sur 409 (conflit d'état, pas requête malformée)", () => {
+  const body = readRoute();
+  assert.match(body, /LOYALTY_NOT_REDEEMABLE:\s*409/);
+  assert.match(body, /LOYALTY_AMOUNT_MISMATCH:\s*409/);
+  assert.match(body, /LOYALTY_ACCOUNT_MISMATCH:\s*409/);
+});

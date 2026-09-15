@@ -15,7 +15,6 @@ import {
   nextActivatedAt,
   pointsForSale,
   rewardDiscountXpf,
-  rewardsToCreate,
   expiresAtFor,
   isRewardAvailable,
 } from "./loyalty.ts";
@@ -113,12 +112,16 @@ test("validateProgram : VISITS complet et valide est accepté", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
-// rewardsToCreate / expiresAtFor / nextActivatedAt / isRewardAvailable
+// expiresAtFor / nextActivatedAt / isRewardAvailable
+//
+// `rewardsToCreate` a été RETIRÉE (2026-09-16, correctif QA) : c'était un quotient entier
+// (`Math.floor(sum/perReward)`) qui MENT sur un solde NÉGATIF (arrondit vers -∞). Le moteur
+// d'émission des récompenses (`lib/loyalty-db.ts#issueRewardsWhileNetReached`) ne divise plus
+// jamais — il consomme le NET par tranches tant qu'il atteint le seuil. Ne pas réintroduire un
+// quotient ici : un solde de fidélité est signé (REWARD, REVERSAL et ADJUST peuvent être
+// négatifs), et un quotient entier ne s'applique correctement qu'à un solde qui ne descend
+// jamais sous zéro.
 // ══════════════════════════════════════════════════════════════════════════════════════════
-
-test("rewardsToCreate(20, 10) → 2", () => {
-  assert.equal(rewardsToCreate(20, 10), 2);
-});
 
 test("expiresAtFor(31/01, 1) tombe au 28 ou 29/02", () => {
   const occurredAt = new Date(Date.UTC(2026, 0, 31, 12, 0, 0));
@@ -137,10 +140,27 @@ test("nextActivatedAt : OFF -> VISITS pose now", () => {
   assert.equal(nextActivatedAt(null, "OFF", "VISITS", now), now);
 });
 
-test("nextActivatedAt : VISITS -> POINTS garde la date précédente", () => {
+test("nextActivatedAt : VISITS -> POINTS (changement de FORME active) pose now — décision Marco 15/09", () => {
   const prev = new Date("2026-01-01T00:00:00Z");
   const now = new Date("2026-09-15T00:00:00Z");
-  assert.equal(nextActivatedAt(prev, "VISITS", "POINTS", now), prev);
+  assert.equal(nextActivatedAt(prev, "VISITS", "POINTS", now), now);
+});
+
+test("nextActivatedAt : VISITS -> VISITS (même forme, une valeur change) garde la date précédente", () => {
+  const prev = new Date("2026-01-01T00:00:00Z");
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(prev, "VISITS", "VISITS", now), prev);
+});
+
+test("nextActivatedAt : VISITS -> OFF garde la date précédente (couper ne remet rien à zéro)", () => {
+  const prev = new Date("2026-01-01T00:00:00Z");
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(prev, "VISITS", "OFF", now), prev);
+});
+
+test("nextActivatedAt : OFF -> VISITS -> OFF -> VISITS (réactivation) pose now", () => {
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(new Date("2026-01-01T00:00:00Z"), "OFF", "VISITS", now), now);
 });
 
 test("isRewardAvailable : ni consommée ni expirée → true", () => {

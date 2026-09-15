@@ -1,6 +1,123 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — 🛑 MIGRATION NON JOUÉE, ACCORD MARCO REQUIS
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — 🛑 NON DÉPLOYÉ
+
+Branche `claude/caisse-fidelite-moteur-20260916` (worktree jetable `_wt/caisse-fidelite-c2`,
+empilée sur C1, base `235b5d9`), tâche d'exécution cadrée. **Ne déploie rien, aucune commande
+contre la prod** — même mandat que C1.
+
+**Nouveau `core/lib/loyalty-db.ts`, écritures DB** (reçoit `tx`, testable par un FAUX `tx` en
+mémoire, sans DB ni contexte Next — `lib/loyalty-checkout.test.ts`) : `lockAccount` (upsert +
+`FOR UPDATE`), `insertEntry` (P2002 → `{duplicate:true}`, jamais levé), `creditVisit`,
+`creditPoints`, `redeemReward` (update conditionnel `redeemedAt: null`, symétrique du bon
+cadeau), `reverseSale` (reprise à l'annulation), `adjustLoyalty` (correction ADMIN),
+`accountSummary` (lecture pure). 🔴 **Correctif QA du 2026-09-16 : `issueRewardsForDelta`
+(delta de quotients) remplacée par `issueRewardsWhileNetReached` (retour au plan §2.2, au
+pied de la lettre).** Défaut prouvé sur l'ancienne version : elle comparait
+`Math.floor(sumAvant/N)` à `Math.floor(sumAprès/N)`, un quotient entier qui MENT dès que le
+solde net devient négatif (REWARD retranche N, REVERSAL et ADJUST peuvent être négatifs ;
+`Math.floor` arrondit vers -∞). Deux cas reproduits par la QA : (a) vente de 600 pts (seuil
+500) → 1 récompense, net 100 ; annulation → net -500 ; vente de 500 pts → une 2ᵉ récompense
+était créée à tort (la cliente n'avait pourtant gagné que 500 pts nets) ; (b) 5 visites → 1
+récompense (net 0) ; correction ADMIN de -3 → net -3 ; 3 visites de plus → une 2ᵉ récompense
+à tort. `issueRewardsWhileNetReached` ne divise plus jamais : sous le verrou de compte, elle
+calcule le net APRÈS la ligne déclenchante, puis consomme ce net par tranches de N
+(`while (net >= N) { REWARD(-N) ; net -= N }`, `ref = reward:<triggerRef>:<i>`, borne de
+sécurité 1000 itérations). `rewardsToCreate` (le quotient pur) a été retirée de `loyalty.ts`
+— un solde de fidélité est signé, un quotient entier ne s'applique qu'à un solde qui ne
+descend jamais sous zéro. Tests couvrant les deux cas QA + rejeu + franchissement multiple en
+une seule fournée : `loyalty-checkout.test.ts`.
+
+**`checkoutSale`** (`lib/caisse.ts`) gagne `options.loyalty` (rattache la vente à une fiche
+pour créditer des points en mode `POINTS`) et `options.redeemLoyalty` (consomme une
+récompense). Contrôle de forme + disponibilité de la récompense **avant** tout paiement
+persisté (même schéma que les bons cadeaux) ; consommation + crédit de points **dans** la
+transaction du passage à PAID, **après** les bons. Course entre deux comptoirs → `LOYALTY_RACE`,
+traitée comme `GIFT_CARD_RACE`. Rejeu d'une vente déjà PAID → retour anticipé, **aucune**
+écriture fidélité (le bloc est après ce retour).
+
+💰 **`giftCardSalesXpf` (6ᵉ paramètre de `pointsForSale`, décision Marco du 15/09 sur C1)** :
+calculé en sommant les `amountXpf` de `giftCardsToIssue` (les bons émis PAR cette vente,
+donnée d'entrée déjà validée) — jamais en inspectant les lignes ni en relisant `GiftCard` en
+base. Test : ticket 3 000 F prestations + bon 10 000 F émis, assiette `ALL` → 30 points.
+
+**`annulerVente`** : reprise fidélité (`reverseSale`) dans la **même** transaction que le
+passage à VOID, **uniquement** si la vente était PAID (une vente DRAFT n'a jamais rien écrit
+en fidélité). Un avoir émis **directement** depuis Core-Compta (verrouillé) ne repasse pas par
+`annulerVente` : commentaire `TODO fidélité` laissé à cet endroit, reprise **non automatique**
+dans ce lot (correction ADMIN manuelle prévue plus tard) — décision Marco du 15/09.
+
+**Routes** (`app/api/loyalty/{program,accounts,visits,adjust}/route.ts`), gardées par
+`hasServiceKey`, sur le modèle de `app/api/gift-cards/route.ts` : `GET/PUT /program`,
+`GET /accounts` (50 fiches au plus, lecture pure — aucune fiche créée), `POST /visits`
+(best-effort côté appelant, silencieux ici), `POST /adjust` (ADMIN, motif ≥ 3 caractères,
+`ref` préfixé `adjust:`). 🔒 **Droits (décision Marco #2)** : la garde de rôle (ADMIN vs
+`caisse`) vit côté SURFACE — ce Core ne connaît que la clé de service S2S, rien n'est
+réinventé ici.
+
+**+29 tests** dans `lib/loyalty-checkout.test.ts` (18 exécutés réellement sur le moteur DB via
+faux `tx`, 11 structurels sur `checkoutSale`/`annulerVente`) → **343 tests** au total, tous
+verts. `tsc --noEmit` et `prisma validate` verts. Contrôle anti-fantôme fait : sabotage de
+`redeemReward` (retrait de `redeemedAt: null` du `where`) → les 2 tests de double consommation
+rougissent → restauré → suite verte.
+
+🛑 **Ne fait PAS** : jouer la migration C1, déployer ce Core, ni aucune surface. **Ordre
+impératif avant tout déploiement** : migration C1 (`ops.sh migrate core-caisse`, accord
+Marco) → `rls.sql` rejoué → déploiement de ce Core → écrans surface (hors de ce lot). Argent
+en jeu (points/récompenses) → accord Marco explicite avant tout `ng-deploy`.
+
+### 🔴 2026-09-16 — 3 correctifs contre-QA (câblage, plafond, remise à zéro)
+
+**1. Câblage manquant, corrigé** : `app/api/sales/[id]/checkout/route.ts` ne transmettait ni
+`loyalty` ni `redeemLoyalty` à `checkoutSale` — **aucune route HTTP n'atteignait le moteur de
+fidélité**, S2 (crédit de points au checkout) était inopérant côté surface bien que le moteur
+soit prêt côté Core. Ajouté : lecture + validation du corps (`loyalty.clientFicheId` UUID,
+`loyalty.displayName` 1-200 car., `redeemLoyalty.rewardEntryId` UUID → 400 sinon), transmission
+dans `options`, et mapping des erreurs `LOYALTY_NOT_REDEEMABLE`/`LOYALTY_AMOUNT_MISMATCH`/
+`LOYALTY_ACCOUNT_MISMATCH` sur 409 (même famille que les bons cadeaux). Tests dans
+`lib/checkout-route.test.ts` (contrat figé par lecture de source, même limite que les tests
+`credit`/`paidAt` du même fichier).
+
+**2. Plafond sans exception, corrigé** : `issueRewardsWhileNetReached` LEVAIT
+`LoyaltyRewardOverflowError` au-delà de 1000 récompenses en un seul événement — atteignable avec
+un réglage extrême (1 point pour une récompense, ticket à 100 pts/100F ⇒ des dizaines de milliers
+de points d'un coup), et la boucle tournant DANS la transaction du passage à PAID, l'exception
+pouvait faire échouer un encaissement **après persistance des paiements**. Décision : ne lève
+plus jamais — s'arrête à `MAX_REWARDS_PER_EVENT` (1000) récompenses pour CET événement, `log.warn`
+(compte + nombre émis), et le net excédentaire (encore ≥ perReward) N'EST PAS PERDU : il reste
+dans le journal et sera repris par le PROCHAIN événement sur ce compte. `LoyaltyRewardOverflowError`
+supprimée (plus aucun appelant). `POST /api/loyalty/adjust` protégé par un `try/catch` → 500 JSON
+propre (`{error:"Erreur interne"}`, jamais de pile), même schéma que
+`app/api/cron/repair-sales/route.ts`. Test : ADJUST de +100 000 points au seuil 1 → exactement
+1000 récompenses créées, pas d'exception, net 99 000 ; l'événement suivant en crée 1000 de plus.
+
+**3. Remise à zéro au changement de forme/réactivation — DÉCISION MARCO (15/09)** : « À chaque
+changement de forme ou réactivation, le compteur et les points repartent de zéro, comme au
+premier jour. Les récompenses déjà gagnées restent dues. »
+- `nextActivatedAt` (lib/loyalty.ts) pose `now` dès que `nextMode !== "OFF"` ET
+  `nextMode !== prevMode` (OFF → actif, ou changement de forme active) ; inchangé si la forme
+  reste la même (changer N ou un pourcentage ne remet rien à zéro), et inchangé au passage à
+  `OFF` (couper ne remet rien à zéro — seule une RÉACTIVATION le fait).
+- `sumVisits`/`sumPoints` (`lib/loyalty-db.ts`, moteur net utilisé par
+  `issueRewardsWhileNetReached` ET `accountSummary`) n'agrègent QUE les lignes
+  `occurredAt >= activatedAt`, quel que soit leur `kind` (VISIT/POINTS/ADJUST/REWARD/REVERSAL) ;
+  `activatedAt` NULL → 0 compté. `creditPoints` gagne la même garde d'écriture que `creditVisit`
+  (`occurredAt < activatedAt` → rien n'est écrit — utile pour un règlement différé d'une caisse
+  hors ligne antérieur à l'activation).
+- La disponibilité d'une récompense (`isRewardAvailable`) NE dépend PAS de `activatedAt` — une
+  récompense gagnée avant un changement reste consommable après.
+- `accountSummary` renvoie désormais aussi `activatedAt` (affichage écran) et calcule le
+  programme réel via `tx.loyaltyProgram.findFirst` au lieu d'un paramètre implicite.
+- Tests dans `lib/loyalty-checkout.test.ts` : 3 visites VISITS N=5 → POINTS → VISITS → 2 visites
+  → 0 récompense, net 2 ; récompense gagnée → OFF → réactivation → récompense toujours
+  disponible, compteur à 0 ; changement de N sans changement de forme → net conservé. Sabotage
+  (retrait du filtre `occurredAt >= activatedAt`) → le premier de ces tests rougit → restauré.
+
+**Suite** : 360 tests, tous verts (`npm test`). `tsc --noEmit` et `prisma validate` verts.
+
+🔴 **2026-09-16, correctif contre-QA supplémentaire** : `reverseSale` posait `occurredAt: new Date()` sur ses `REVERSAL` (l'instant de l'annulation, pas celui du crédit annulé), ce qui faisait entrer la reprise d'un ticket ancien dans le NET du cycle courant après une réactivation — corrigé en reprenant l'`occurredAt` de la ligne `POINTS`/`REDEEM` d'origine (`reverseSaleLoyalty` n'a donc plus besoin d'`occurredAt` en entrée) ; suite à 365 tests, tous verts.
+
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — ✅ MIGRATION JOUÉE ET PROUVÉE (accord Marco), code livré le 15/09 (PR #46)
 
 Branche `claude/caisse-fidelite-schema-20260916` (worktree jetable `_wt/caisse-fidelite-c1`), tâche
 d'exécution cadrée : plan Salon-Reference (fidélité, 3 formes réglables : compteur/visites/points),

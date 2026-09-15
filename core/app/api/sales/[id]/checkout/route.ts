@@ -9,6 +9,10 @@ export const runtime = "nodejs";
 
 const VALID_METHODS: PayMethod[] = ["CASH", "CARD", "TRANSFER", "CHEQUE", "OTHER"];
 
+/** UUID strict — dupliqué (comme lib/sale-lock.ts, app/api/loyalty/accounts/route.ts) pour ne
+ *  rien tirer de plus que Next ici. */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 /**
  * POST /api/sales/:id/checkout
  * ENCAISSE un ticket (S2S, X-Core-Key) : enregistre le(s) paiement(s) offline, calcule le rendu monnaie,
@@ -59,6 +63,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     /** Vente À CRÉDIT (échéancier, lot A, 2026-09-15) : `dueAt` = date (YYYY-MM-DD) de la
      *  DERNIÈRE échéance. `payments` ci-dessus porte alors le 1er versement. */
     credit?: { dueAt?: string };
+    /** Fidélité (lot C2) — rattache la vente à une fiche pour créditer des points en mode
+     *  POINTS. Absent = comportement inchangé, aucune écriture de fidélité. */
+    loyalty?: { clientFicheId?: string; displayName?: string };
+    /** Fidélité (lot C2) — consomme une récompense déjà posée sur le ticket (ligne `OTHER`
+     *  négative). Absent = comportement inchangé. */
+    redeemLoyalty?: { rewardEntryId?: string; by?: string | null; byName?: string | null };
   };
   try {
     body = await req.json();
@@ -130,15 +140,48 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     credit = { dueAt: body.credit.dueAt };
   }
 
+  // Fidélité (lot C2) : `loyalty` rattache la vente à une fiche pour créditer des points en
+  // mode POINTS ; `redeemLoyalty` consomme une récompense déjà posée sur le ticket. Même
+  // discipline que `credit`/`paidAt` ci-dessus : forme invalide refusée ici (400), AVANT tout
+  // encaissement ; la route transmet, elle ne juge pas le métier (ça reste dans checkoutSale).
+  let loyalty: { clientFicheId: string; displayName: string } | undefined;
+  if (body.loyalty) {
+    const clientFicheId = typeof body.loyalty.clientFicheId === "string" ? body.loyalty.clientFicheId.trim() : "";
+    if (!UUID_RE.test(clientFicheId)) {
+      return NextResponse.json({ error: "loyalty.clientFicheId invalide (UUID attendu)" }, { status: 400 });
+    }
+    const displayName = typeof body.loyalty.displayName === "string" ? body.loyalty.displayName.trim() : "";
+    if (!displayName || displayName.length > 200) {
+      return NextResponse.json({ error: "loyalty.displayName requis (1 à 200 caractères)" }, { status: 400 });
+    }
+    loyalty = { clientFicheId, displayName };
+  }
+
+  let redeemLoyalty: { rewardEntryId: string; by?: string | null; byName?: string | null } | undefined;
+  if (body.redeemLoyalty) {
+    const rewardEntryId = typeof body.redeemLoyalty.rewardEntryId === "string" ? body.redeemLoyalty.rewardEntryId.trim() : "";
+    if (!UUID_RE.test(rewardEntryId)) {
+      return NextResponse.json({ error: "redeemLoyalty.rewardEntryId invalide (UUID attendu)" }, { status: 400 });
+    }
+    redeemLoyalty = {
+      rewardEntryId,
+      by: typeof body.redeemLoyalty.by === "string" ? body.redeemLoyalty.by : null,
+      byName: typeof body.redeemLoyalty.byName === "string" ? body.redeemLoyalty.byName : null,
+    };
+  }
+
   // On n'ajoute la clé d'options QUE si elle porte quelque chose : sans
-  // `giftCards` ni `paidAt` ni `credit`, l'appel reste à l'octet près celui d'avant.
+  // `giftCards` ni `paidAt` ni `credit` ni `loyalty` ni `redeemLoyalty`, l'appel reste à
+  // l'octet près celui d'avant.
   const options =
-    giftCards || paidAt || redeemGiftCards || credit
+    giftCards || paidAt || redeemGiftCards || credit || loyalty || redeemLoyalty
       ? {
           ...(giftCards ? { giftCards } : {}),
           ...(paidAt ? { paidAt } : {}),
           ...(redeemGiftCards ? { redeemGiftCards } : {}),
           ...(credit ? { credit } : {}),
+          ...(loyalty ? { loyalty } : {}),
+          ...(redeemLoyalty ? { redeemLoyalty } : {}),
         }
       : undefined;
   const result = await checkoutSale(tenantId, saleId, parsed, options);
@@ -161,6 +204,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       // du body suffit).
       CREDIT_NOT_NEEDED: 409,
       CREDIT_NEEDS_DEPOSIT: 422,
+      // Fidélité (lot C2) : refus AVANT tout encaissement, même famille que les bons cadeaux
+      // ci-dessus (conflit d'état, pas une requête malformée).
+      LOYALTY_NOT_REDEEMABLE: 409,
+      LOYALTY_AMOUNT_MISMATCH: 409,
+      LOYALTY_ACCOUNT_MISMATCH: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

@@ -174,14 +174,26 @@ export function validateProgram(input: LoyaltyProgramInput): ValidateProgramResu
 
 // ── nextActivatedAt ──────────────────────────────────────────────────────────────────────────
 
-/** `now` au passage OFF -> mode actif ; inchangé sinon (y compris entre deux modes actifs). */
+/**
+ * `now` à tout CHANGEMENT DE FORME vers un mode actif : OFF -> actif, ou un mode actif vers une
+ * AUTRE forme active (ex. VISITS -> POINTS). Inchangé si la forme active reste la même (on ne
+ * fait que changer une valeur : N, pourcentage…) et inchangé si `nextMode === "OFF"` (couper le
+ * programme ne remet rien à zéro — seule une RÉACTIVATION le fait).
+ *
+ * DÉCISION MARCO (15/09) : « À chaque changement de forme ou réactivation, le compteur et les
+ * points repartent de zéro, comme au premier jour. Les récompenses déjà gagnées restent dues. »
+ * — `activatedAt` est le pivot de cette remise à zéro : `sumVisits`/`sumPoints`
+ * (lib/loyalty-db.ts) ne comptent que les lignes `occurredAt >= activatedAt`, alors que la
+ * disponibilité d'une récompense (`isRewardAvailable`) n'en dépend PAS — une récompense gagnée
+ * avant un changement reste utilisable après.
+ */
 export function nextActivatedAt(
   prev: Date | null,
   prevMode: string,
   nextMode: string,
   now: Date,
 ): Date | null {
-  if (prevMode === "OFF" && nextMode !== "OFF") return now;
+  if (nextMode !== "OFF" && nextMode !== prevMode) return now;
   return prev;
 }
 
@@ -275,13 +287,6 @@ export function rewardDiscountXpf(
 
   const cap = base - 1n;
   return result < cap ? result : cap;
-}
-
-// ── rewardsToCreate ──────────────────────────────────────────────────────────────────────────
-
-/** Nombre de récompenses à créer pour un solde cumulé donné (visites ou points). */
-export function rewardsToCreate(sumAfter: number, perReward: number): number {
-  return perReward > 0 ? Math.floor(sumAfter / perReward) : 0;
 }
 
 // ── expiresAtFor ─────────────────────────────────────────────────────────────────────────────
