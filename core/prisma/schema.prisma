@@ -350,3 +350,81 @@ model GiftCard {
   @@index([tenantId, issuedAt])
   @@index([tenantId, saleId])
 }
+
+// ── FIDÉLITÉ ───────────────────────────────────────────────────────────────────────────────
+//
+// Un JOURNAL, pas un solde en cache. On n'écrit jamais que des lignes nouvelles (LoyaltyEntry),
+// sauf pour poser `redeemedAt`/`redeemedSaleId` sur une récompense au moment où elle est
+// consommée. Tous les soldes (compteur de visites, points, récompenses disponibles) sont
+// DÉRIVÉS à la lecture — voir lib/loyalty.ts. Le statut « expiré » d'une récompense n'est jamais
+// stocké, même logique que GiftCard ci-dessus.
+//
+// PAS DE NOUVEL ENUM : une valeur d'enum PostgreSQL ne se retire jamais. `mode`, `kind`,
+// `rewardKind`, `rewardBase`, `pointsBase`, `sourceType` sont des `String` validés par
+// lib/loyalty.ts.
+
+// Réglages du programme de fidélité, un par marchand.
+model LoyaltyProgram {
+  tenantId             String    @id @db.Uuid
+  mode                 String    @default("OFF")      // OFF | COUNTER | VISITS | POINTS
+  visitsPerReward      Int?                            // VISITS : 2..50
+  pointsPerHundredXpf  Int?                            // POINTS : 1..100 points par tranche de 100 F
+  pointsBase           String    @default("SERVICES") // SERVICES | ALL
+  pointsPerReward      Int?                            // POINTS : 1..1000000
+  rewardKind           String?                         // PERCENT | AMOUNT
+  rewardPercent        Int?                            // 1..99
+  rewardAmountXpf      BigInt?                         // 1..1000000
+  rewardBase           String    @default("SERVICES") // SERVICES | ALL
+  rewardValidityMonths Int?                            // null = sans expiration ; 1..60
+  clientPortalVisible  Boolean   @default(false)
+  activatedAt          DateTime?                       // posé par le moteur au passage OFF -> actif
+  updatedAt            DateTime  @updatedAt
+  updatedBy            String?
+}
+
+// Compte de fidélité d'une cliente chez un marchand. Rattaché à la fiche core_auth par
+// `clientFicheId`, SANS FK : Core-Caisse et Core-Auth sont deux bases distinctes.
+model LoyaltyAccount {
+  id            String         @id @default(uuid()) @db.Uuid
+  tenantId      String         @db.Uuid
+  clientFicheId String         @db.Uuid              // core_auth Client.id, sans FK (autre base)
+  displayName   String
+  createdAt     DateTime       @default(now())
+  entries       LoyaltyEntry[]
+  @@unique([tenantId, clientFicheId])
+  @@index([tenantId])
+}
+
+// Ligne du journal de fidélité. Chaque récompense fige la règle du moment (type, valeur,
+// montant, assiette, expiration) : modifier le programme ne change jamais une récompense déjà
+// acquise. Idempotence par `(tenantId, ref)` — voir le tableau des `ref` dans le plan.
+model LoyaltyEntry {
+  id              String         @id @default(uuid()) @db.Uuid
+  tenantId        String         @db.Uuid
+  accountId       String         @db.Uuid
+  account         LoyaltyAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  kind            String                               // VISIT|POINTS|REWARD|REDEEM|REVERSAL|ADJUST
+  visits          Int            @default(0)           // signé
+  points          Int            @default(0)           // signé
+  rewardKind      String?
+  rewardPercent   Int?
+  rewardAmountXpf BigInt?
+  rewardBase      String?
+  expiresAt       DateTime?
+  redeemedAt      DateTime?                            // REWARD seulement (garde de course)
+  redeemedSaleId  String?        @db.Uuid
+  rewardEntryId   String?        @db.Uuid              // REDEEM / REVERSAL -> REWARD visée
+  discountXpf     BigInt?                              // REDEEM : montant de la ligne OTHER (positif)
+  sourceType      String                               // rdv | sale | manual
+  sourceId        String
+  ref             String
+  saleId          String?        @db.Uuid
+  actorId         String?
+  actorName       String?
+  reason          String?
+  occurredAt      DateTime
+  createdAt       DateTime       @default(now())
+  @@unique([tenantId, ref])
+  @@index([tenantId, accountId, occurredAt])
+  @@index([tenantId, kind, redeemedAt])
+}
