@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { adjustLoyaltyAccount } from "@/lib/caisse";
+import { log } from "@/lib/log";
 
 export const runtime = "nodejs";
 
@@ -14,6 +15,8 @@ export const runtime = "nodejs";
  *   `reason` : 3 caractères au moins. `ref` : doit commencer par "adjust:" (idempotence côté
  *   appelant — l'écran fournit un identifiant unique).
  * Réponse 200 : { ok:true, rewardsCreated } · 400 { error:REASON_TOO_SHORT|NO_CHANGE|REF_INVALID }
+ *   · 500 { error:"Erreur interne" } sur toute exception inattendue (jamais de pile exposée —
+ *   correction manuelle d'argent, pas de fuite d'implémentation vers l'appelant).
  */
 export async function POST(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -39,17 +42,25 @@ export async function POST(req: NextRequest) {
   const reason = typeof body.reason === "string" ? body.reason.trim() : "";
   const ref = typeof body.ref === "string" ? body.ref.trim() : "";
 
-  const result = await adjustLoyaltyAccount(tenantId, {
-    clientFicheId,
-    displayName,
-    visits,
-    points,
-    reason,
-    ref,
-    by: typeof body.by === "string" ? body.by : null,
-    byName: typeof body.byName === "string" ? body.byName : null,
-  });
+  try {
+    const result = await adjustLoyaltyAccount(tenantId, {
+      clientFicheId,
+      displayName,
+      visits,
+      points,
+      reason,
+      ref,
+      by: typeof body.by === "string" ? body.by : null,
+      byName: typeof body.byName === "string" ? body.byName : null,
+    });
 
-  if (!result.ok) return NextResponse.json(result, { status: 400 });
-  return NextResponse.json(result);
+    if (!result.ok) return NextResponse.json(result, { status: 400 });
+    return NextResponse.json(result);
+  } catch (e) {
+    // Socle observabilité (cf. app/api/cron/repair-sales/route.ts) : une correction ADMIN
+    // manipule de l'argent (points, visites, remises) — toute exception inattendue est tracée
+    // ET renvoyée en JSON propre, jamais une pile brute vers l'appelant.
+    log.error("api.loyalty.adjust", e, { tenantId, clientFicheId });
+    return NextResponse.json({ error: "Erreur interne" }, { status: 500 });
+  }
 }

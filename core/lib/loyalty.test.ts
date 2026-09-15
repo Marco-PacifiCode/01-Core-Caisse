@@ -140,10 +140,27 @@ test("nextActivatedAt : OFF -> VISITS pose now", () => {
   assert.equal(nextActivatedAt(null, "OFF", "VISITS", now), now);
 });
 
-test("nextActivatedAt : VISITS -> POINTS garde la date précédente", () => {
+test("nextActivatedAt : VISITS -> POINTS (changement de FORME active) pose now — décision Marco 15/09", () => {
   const prev = new Date("2026-01-01T00:00:00Z");
   const now = new Date("2026-09-15T00:00:00Z");
-  assert.equal(nextActivatedAt(prev, "VISITS", "POINTS", now), prev);
+  assert.equal(nextActivatedAt(prev, "VISITS", "POINTS", now), now);
+});
+
+test("nextActivatedAt : VISITS -> VISITS (même forme, une valeur change) garde la date précédente", () => {
+  const prev = new Date("2026-01-01T00:00:00Z");
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(prev, "VISITS", "VISITS", now), prev);
+});
+
+test("nextActivatedAt : VISITS -> OFF garde la date précédente (couper ne remet rien à zéro)", () => {
+  const prev = new Date("2026-01-01T00:00:00Z");
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(prev, "VISITS", "OFF", now), prev);
+});
+
+test("nextActivatedAt : OFF -> VISITS -> OFF -> VISITS (réactivation) pose now", () => {
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(nextActivatedAt(new Date("2026-01-01T00:00:00Z"), "OFF", "VISITS", now), now);
 });
 
 test("isRewardAvailable : ni consommée ni expirée → true", () => {

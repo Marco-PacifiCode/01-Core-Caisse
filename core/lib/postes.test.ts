@@ -94,11 +94,12 @@ test("checkout n'ajoute d'options que s'il y a quelque chose à transmettre", ()
   // d'avant : `undefined`, et non un objet vide qui changerait la signature observée.
   //
   // ⚠️ La liste des porteurs s'allonge (2026-09-04 : consommation d'un bon cadeau pendant
-  //    l'encaissement ; 2026-09-15 : vente à crédit) ; ce qui NE doit pas changer, c'est qu'aucun
-  //    d'eux n'est présent ⇒ `undefined`. On épingle donc la forme du ternaire, pas le nombre de
-  //    termes.
-  assert.match(routeCheckout, /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit\s*\?/);
-  assert.match(routeCheckout, /: undefined;/);
+  //    l'encaissement ; 2026-09-15 : vente à crédit ; 2026-09-16 : fidélité lot C2) ; ce qui NE
+  //    doit pas changer, c'est qu'aucun d'eux n'est présent ⇒ `undefined`. On épingle donc la
+  //    PRÉSENCE de ces quatre porteurs dans la condition et la forme du ternaire, pas le nombre
+  //    total de termes (d'autres peuvent s'ajouter après `credit`).
+  assert.match(routeCheckout, /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit/);
+  assert.match(routeCheckout, /\?\s*\{[\s\S]*?\}\s*:\s*undefined;/);
 });
 
 // ── Rétrocompatibilité, la promesse centrale ─────────────────────────────────

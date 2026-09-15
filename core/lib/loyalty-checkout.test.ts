@@ -24,10 +24,12 @@ import {
   redeemReward,
   reverseSale,
   adjustLoyalty,
+  accountSummary,
   offProgram,
   type LoyaltyTx,
   type LoyaltyProgramRow,
 } from "./loyalty-db.ts";
+import { nextActivatedAt, isRewardAvailable } from "./loyalty.ts";
 
 const TENANT = "00000000-0000-4000-8000-000000000001";
 
@@ -65,7 +67,16 @@ type FakeEntry = {
 
 function matchesWhere(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
   for (const key of Object.keys(where)) {
-    if (row[key] !== where[key]) return false;
+    const expected = where[key];
+    // Support minimal du filtre `{ gte: Date }` (activatedAt, correctif 2026-09-16) : le seul
+    // opérateur Prisma réellement utilisé sur `occurredAt` dans loyalty-db.ts.
+    if (expected !== null && typeof expected === "object" && !(expected instanceof Date) && "gte" in (expected as object)) {
+      const bound = (expected as { gte: Date }).gte;
+      const actual = row[key];
+      if (!(actual instanceof Date) || actual.getTime() < bound.getTime()) return false;
+      continue;
+    }
+    if (row[key] !== expected) return false;
   }
   return true;
 }
@@ -864,6 +875,214 @@ test("adjustLoyalty : correction valide écrit ADJUST et peut créer une récomp
   if (out.ok) assert.equal(out.rewardsCreated, 1);
   assert.equal(entries.filter((e) => e.kind === "ADJUST").length, 1);
   assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// PLAFOND SANS EXCEPTION — correctif contre-QA (2026-09-16)
+//
+// DÉFAUT PROUVÉ : `issueRewardsWhileNetReached` pouvait LEVER au-delà de 1000 récompenses en un
+// seul événement — atteignable avec un réglage extrême (1 point pour une récompense, un ticket
+// de 1 000 F à 100 pts/100F ⇒ 100 000 pts d'un coup). La boucle tournant DANS la transaction de
+// `checkoutSale` APRÈS l'insertion des paiements, l'exception aurait fait échouer un encaissement
+// déjà persisté. Décision : ne plus jamais lever — s'arrêter à 1000 récompenses par événement, le
+// net excédentaire (encore ≥ perReward) reste dans le journal et est repris par le PROCHAIN
+// événement, sans rien perdre.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("plafond : ADJUST de +100 000 points au seuil 1 -> exactement 1000 récompenses, PAS d'exception, net 99 000 ; l'événement suivant en crée 1000 de plus", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = pointsProgram({ pointsPerReward: 1 });
+
+  const out1 = await adjustLoyalty(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-plafond",
+    displayName: "Cliente Plafond",
+    visits: 0,
+    points: 100_000,
+    reason: "correction exceptionnelle — reprise historique",
+    ref: "adjust:99999999-9999-4999-8999-999999999991",
+    occurredAt: new Date("2026-09-16T10:00:00Z"),
+  });
+  assert.equal(out1.ok, true);
+  if (out1.ok) assert.equal(out1.rewardsCreated, 1000);
+
+  const rewardsAfter1 = entries.filter((e) => e.kind === "REWARD");
+  assert.equal(rewardsAfter1.length, 1000);
+  const netAfter1 = entries
+    .filter((e) => e.accountId === rewardsAfter1[0].accountId)
+    .reduce((t, e) => t + e.points, 0);
+  assert.equal(netAfter1, 99_000);
+
+  // Événement suivant : le net excédentaire (>= perReward) n'a pas été perdu — il est repris et
+  // continue de produire des récompenses, plafonnées à 1000 de plus par événement.
+  const out2 = await adjustLoyalty(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-plafond",
+    displayName: "Cliente Plafond",
+    visits: 0,
+    points: 1,
+    reason: "petit ajustement suivant",
+    ref: "adjust:99999999-9999-4999-8999-999999999992",
+    occurredAt: new Date("2026-09-16T11:00:00Z"),
+  });
+  assert.equal(out2.ok, true);
+  if (out2.ok) assert.equal(out2.rewardsCreated, 1000);
+
+  const rewardsAfter2 = entries.filter((e) => e.kind === "REWARD");
+  assert.equal(rewardsAfter2.length, 2000);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// DÉCISION MARCO (15/09) : « À chaque changement de forme ou réactivation, le compteur et les
+// points repartent de zéro, comme au premier jour. Les récompenses déjà gagnées restent dues. »
+//
+// Pivot : `activatedAt` (lib/loyalty.ts#nextActivatedAt). `sumVisits`/`sumPoints` (moteur net,
+// lib/loyalty-db.ts) n'agrègent QUE les lignes `occurredAt >= activatedAt`, quel que soit leur
+// `kind` — un ADJUST ou un REWARD antérieur ne pèse pas plus qu'un VISIT antérieur. La
+// disponibilité d'une récompense (`isRewardAvailable`), elle, n'en dépend PAS.
+//
+// ⚠️ SABOTAGE : retirer `if (!activatedAt) return 0;` ET le filtre `occurredAt: { gte:
+// activatedAt }` de `sumVisits`/`sumPoints` (lib/loyalty-db.ts) fait ROUGIR le premier test
+// ci-dessous (« changement de forme active repart de zéro »). Le rétablir le fait revert au vert.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("décision Marco 15/09 : changement de FORME active repart de zéro — 3 visites VISITS N=5 -> POINTS -> VISITS -> 2 visites -> 0 récompense, net 2", async () => {
+  const { tx, entries } = makeFakeTx();
+  const date1 = new Date("2026-01-01T00:00:00Z");
+  let program = visitsProgram({ activatedAt: date1, visitsPerReward: 5 });
+
+  for (let i = 1; i <= 3; i++) {
+    const out = await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-forme",
+      displayName: "Cliente Forme",
+      appointmentId: `rdv-forme-${i}`,
+      occurredAt: new Date(`2026-01-0${i + 1}T10:00:00Z`),
+    });
+    assert.equal(out.rewardsCreated, 0);
+  }
+  assert.equal(entries.filter((e) => e.kind === "VISIT").length, 3);
+
+  // VISITS -> POINTS : changement de forme, nouveau pivot.
+  const date2 = new Date("2026-03-01T00:00:00Z");
+  const activatedAt2 = nextActivatedAt(date1, "VISITS", "POINTS", date2);
+  assert.equal(activatedAt2?.getTime(), date2.getTime());
+
+  // POINTS -> VISITS : nouveau changement de forme, nouveau pivot (indépendant du précédent).
+  const date3 = new Date("2026-06-01T00:00:00Z");
+  const activatedAt3 = nextActivatedAt(activatedAt2, "POINTS", "VISITS", date3);
+  assert.equal(activatedAt3?.getTime(), date3.getTime());
+
+  program = visitsProgram({ activatedAt: activatedAt3, visitsPerReward: 5 });
+  let lastOut: { credited: boolean; rewardsCreated: number } | undefined;
+  for (let i = 1; i <= 2; i++) {
+    lastOut = await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-forme",
+      displayName: "Cliente Forme",
+      appointmentId: `rdv-forme-new-${i}`,
+      occurredAt: new Date(`2026-06-0${i + 1}T10:00:00Z`),
+    });
+  }
+  assert.equal(lastOut?.rewardsCreated, 0);
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 0);
+
+  tx.loyaltyProgram.findFirst = async () => program;
+  const summary = await accountSummary(tx, TENANT, ["fiche-forme"]);
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].visits, 2); // les 3 anciennes visites (avant activatedAt3) ne comptent plus
+  assert.equal(summary[0].activatedAt?.getTime(), activatedAt3.getTime());
+});
+
+test("décision Marco 15/09 : récompense gagnée, puis OFF, puis réactivation -> récompense toujours disponible, compteur à 0", async () => {
+  const { tx, entries } = makeFakeTx();
+  const date1 = new Date("2026-01-01T00:00:00Z");
+  const program1 = visitsProgram({ activatedAt: date1, visitsPerReward: 5 });
+
+  for (let i = 1; i <= 5; i++) {
+    await creditVisit(tx, {
+      tenantId: TENANT,
+      program: program1,
+      clientFicheId: "fiche-off",
+      displayName: "Cliente OFF",
+      appointmentId: `rdv-off-${i}`,
+      occurredAt: new Date(`2026-01-0${i}T10:00:00Z`),
+    });
+  }
+  const reward = entries.find((e) => e.kind === "REWARD");
+  assert.ok(reward);
+  assert.equal(isRewardAvailable({ redeemedAt: reward!.redeemedAt, expiresAt: reward!.expiresAt }), true);
+
+  // OFF : couper le programme ne remet RIEN à zéro (activatedAt reste date1).
+  const dateOff = new Date("2026-02-01T00:00:00Z");
+  const activatedAtOff = nextActivatedAt(date1, "VISITS", "OFF", dateOff);
+  assert.equal(activatedAtOff?.getTime(), date1.getTime());
+
+  // Réactivation : OFF -> VISITS, nouveau pivot.
+  const dateReactivation = new Date("2026-03-01T00:00:00Z");
+  const activatedAt2 = nextActivatedAt(activatedAtOff, "OFF", "VISITS", dateReactivation);
+  assert.equal(activatedAt2?.getTime(), dateReactivation.getTime());
+
+  const program2 = visitsProgram({ activatedAt: activatedAt2, visitsPerReward: 5 });
+  tx.loyaltyProgram.findFirst = async () => program2;
+  const summary = await accountSummary(tx, TENANT, ["fiche-off"]);
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].visits, 0);
+  assert.equal(summary[0].activatedAt?.getTime(), activatedAt2.getTime());
+
+  const rewardView = summary[0].rewards.find((r) => r.id === reward!.id);
+  assert.ok(rewardView);
+  assert.equal(rewardView!.redeemedAt, null);
+  assert.equal(isRewardAvailable(rewardView!), true);
+});
+
+test("décision Marco 15/09 : changement de N SANS changement de forme -> net conservé (activatedAt inchangé)", async () => {
+  const { tx } = makeFakeTx();
+  const date1 = new Date("2026-01-01T00:00:00Z");
+  let program = visitsProgram({ activatedAt: date1, visitsPerReward: 10 });
+
+  for (let i = 1; i <= 3; i++) {
+    await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-n",
+      displayName: "Cliente N",
+      appointmentId: `rdv-n-${i}`,
+      occurredAt: new Date(`2026-01-0${i}T10:00:00Z`),
+    });
+  }
+
+  // Changement de RÉGLAGE (N: 10 -> 5), MÊME forme (VISITS -> VISITS) : activatedAt inchangé.
+  const dateChange = new Date("2026-02-01T00:00:00Z");
+  const activatedAtAfter = nextActivatedAt(date1, "VISITS", "VISITS", dateChange);
+  assert.equal(activatedAtAfter?.getTime(), date1.getTime());
+
+  program = visitsProgram({ activatedAt: activatedAtAfter, visitsPerReward: 5 });
+  const out1 = await creditVisit(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-n",
+    displayName: "Cliente N",
+    appointmentId: "rdv-n-4",
+    occurredAt: new Date("2026-02-02T10:00:00Z"),
+  });
+  // net = 3 (conservées) + 1 = 4, sous le NOUVEAU seuil de 5 -> pas encore de récompense.
+  assert.equal(out1.rewardsCreated, 0);
+
+  const out2 = await creditVisit(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-n",
+    displayName: "Cliente N",
+    appointmentId: "rdv-n-5",
+    occurredAt: new Date("2026-02-03T10:00:00Z"),
+  });
+  // net = 5 -> franchit le nouveau seuil : preuve que les 3 anciennes visites ont bien compté.
+  assert.equal(out2.rewardsCreated, 1);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════

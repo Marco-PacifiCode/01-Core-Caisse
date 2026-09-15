@@ -20,6 +20,7 @@
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 import { expiresAtFor } from "./loyalty.ts";
+import { log } from "./log.ts";
 
 // ── Le sous-ensemble de Prisma.TransactionClient réellement utilisé ici ────────────────────────
 // Volontairement étroit (et paramètres en `any`) : la vraie `Prisma.TransactionClient` le
@@ -180,32 +181,65 @@ export async function insertEntry(tx: LoyaltyTx, data: InsertEntryData): Promise
 }
 
 // ── soldes dérivés (jamais un cache écrit) ──────────────────────────────────────────────────
+//
+// DÉCISION MARCO (15/09) : « À chaque changement de forme ou réactivation, le compteur et les
+// points repartent de zéro, comme au premier jour. Les récompenses déjà gagnées restent dues. »
+// `activatedAt` (lib/loyalty.ts#nextActivatedAt) est le pivot de cette remise à zéro : le NET
+// n'agrège JAMAIS les lignes antérieures à `activatedAt`, quel que soit leur `kind` (VISIT,
+// POINTS, ADJUST, REWARD, REVERSAL — un ancien REWARD ou ADJUST ne doit pas continuer de peser
+// sur le nouveau compteur). Si `activatedAt` est `null` (programme jamais activé, ou OFF depuis
+// toujours), RIEN n'est compté — pas de division par une date qui n'existe pas.
+//
+// ⚠️ SABOTAGE (contre-QA) : retirer le filtre `occurredAt: { gte: activatedAt }` ci-dessous fait
+// ROUGIR « 3 visites VISITS N=5 -> POINTS -> VISITS -> 2 visites -> 0 récompense, net 2 » de
+// lib/loyalty-checkout.test.ts. Le rétablir le fait revert au vert.
 
-async function sumVisits(tx: LoyaltyTx, tenantId: string, accountId: string): Promise<number> {
-  const agg = await tx.loyaltyEntry.aggregate({ where: { tenantId, accountId }, _sum: { visits: true } });
+async function sumVisits(
+  tx: LoyaltyTx,
+  tenantId: string,
+  accountId: string,
+  activatedAt: Date | null,
+): Promise<number> {
+  if (!activatedAt) return 0;
+  const agg = await tx.loyaltyEntry.aggregate({
+    where: { tenantId, accountId, occurredAt: { gte: activatedAt } },
+    _sum: { visits: true },
+  });
   return agg?._sum?.visits ?? 0;
 }
 
-async function sumPoints(tx: LoyaltyTx, tenantId: string, accountId: string): Promise<number> {
-  const agg = await tx.loyaltyEntry.aggregate({ where: { tenantId, accountId }, _sum: { points: true } });
+async function sumPoints(
+  tx: LoyaltyTx,
+  tenantId: string,
+  accountId: string,
+  activatedAt: Date | null,
+): Promise<number> {
+  if (!activatedAt) return 0;
+  const agg = await tx.loyaltyEntry.aggregate({
+    where: { tenantId, accountId, occurredAt: { gte: activatedAt } },
+    _sum: { points: true },
+  });
   return agg?._sum?.points ?? 0;
 }
 
 // ── émission des récompenses franchies (net réel du compte, jamais un quotient) ────────────────
 
-/** Plafond de sécurité : au-delà, un solde est aberrant — on refuse plutôt que boucler. */
+/**
+ * Plafond de sécurité PAR ÉVÉNEMENT (pas par compte) : au-delà, on s'ARRÊTE plutôt que de lever.
+ *
+ * 🔴 CORRECTIF (2026-09-16, contre-QA) : la version précédente LEVAIT `LoyaltyRewardOverflowError`
+ * au-delà de ce plafond — atteignable avec un réglage extrême (ex. 1 point pour une récompense,
+ * ticket de 1 000 F à 100 pts/100F), et l'exception pouvait alors faire échouer un encaissement
+ * APRÈS que les paiements soient déjà persistés (la boucle tourne dans la transaction de
+ * `checkoutSale`, après l'insertion des paiements). Décision : ne JAMAIS lever ici. On crée au
+ * plus `MAX_REWARDS_PER_EVENT` récompenses pour CET événement, puis on s'arrête ; le net restant
+ * (encore `>= perReward`) N'EST PAS PERDU — il reste dans le journal et sera repris par le
+ * PROCHAIN événement qui appelle cette fonction (prochaine visite/vente/ajustement sur ce
+ * compte), qui recalcule le net et repart devant. Seul effet du plafond : les récompenses
+ * excédentaires attendent un événement de plus pour être émises, au lieu de toutes sortir d'un
+ * coup. Un `log.warn` trace le dépassement pour investigation (compte + nombre émis).
+ */
 const MAX_REWARDS_PER_EVENT = 1000;
-
-export class LoyaltyRewardOverflowError extends Error {
-  constructor(tenantId: string, accountId: string) {
-    super(
-      `issueRewardsWhileNetReached : plafond de ${MAX_REWARDS_PER_EVENT} récompenses dépassé en ` +
-        `un seul événement (tenantId=${tenantId}, accountId=${accountId}) — solde probablement ` +
-        `aberrant, refusé plutôt que bouclé.`,
-    );
-    this.name = "LoyaltyRewardOverflowError";
-  }
-}
 
 /**
  * Émet les récompenses tant que le SOLDE NET du compte (visites OU points, `field`, dérivé à la
@@ -240,6 +274,9 @@ async function issueRewardsWhileNetReached(
     field: "visits" | "points";
     perReward: number;
     triggerRef: string;
+    /** Pivot de la remise à zéro (décision Marco 15/09, cf. sumVisits/sumPoints ci-dessus) : le
+     *  net n'agrège que les lignes `occurredAt >= activatedAt`. `null` -> net 0, rien émis. */
+    activatedAt: Date | null;
     snapshot: {
       rewardKind: string | null;
       rewardPercent: number | null;
@@ -258,14 +295,19 @@ async function issueRewardsWhileNetReached(
 
   let net =
     args.field === "visits"
-      ? await sumVisits(tx, args.tenantId, args.accountId)
-      : await sumPoints(tx, args.tenantId, args.accountId);
+      ? await sumVisits(tx, args.tenantId, args.accountId, args.activatedAt)
+      : await sumPoints(tx, args.tenantId, args.accountId, args.activatedAt);
 
   let created = 0;
   let i = 0;
   while (net >= args.perReward) {
     if (i >= MAX_REWARDS_PER_EVENT) {
-      throw new LoyaltyRewardOverflowError(args.tenantId, args.accountId);
+      log.warn("loyalty.issueRewardsWhileNetReached.capped", {
+        tenantId: args.tenantId,
+        accountId: args.accountId,
+        rewardsCreated: created,
+      });
+      break;
     }
     const res = await insertEntry(tx, {
       tenantId: args.tenantId,
@@ -342,6 +384,7 @@ export async function creditVisit(tx: LoyaltyTx, args: CreditVisitArgs): Promise
       field: "visits",
       perReward: args.program.visitsPerReward,
       triggerRef: ref,
+      activatedAt: args.program.activatedAt,
       snapshot: {
         rewardKind: args.program.rewardKind,
         rewardPercent: args.program.rewardPercent,
@@ -373,10 +416,17 @@ export type CreditPointsArgs = {
   actorName?: string | null;
 };
 
-/** Crédite les points d'une vente. N'écrit rien hors mode `POINTS`, ni si `points <= 0`. */
+/**
+ * Crédite les points d'une vente. N'écrit rien hors mode `POINTS`, ni si `points <= 0`, ni si la
+ * vente est antérieure à `activatedAt` (même garde que `creditVisit` — un règlement différé d'une
+ * caisse hors ligne, `paidAt`, peut dater d'avant l'activation du programme).
+ */
 export async function creditPoints(tx: LoyaltyTx, args: CreditPointsArgs): Promise<CreditResult> {
   if (args.program.mode !== "POINTS") return { credited: false, rewardsCreated: 0 };
   if (args.points <= 0) return { credited: false, rewardsCreated: 0 };
+  if (args.program.activatedAt && args.occurredAt.getTime() < args.program.activatedAt.getTime()) {
+    return { credited: false, rewardsCreated: 0 };
+  }
 
   const account = await lockAccount(tx, args.tenantId, args.clientFicheId, args.displayName);
   const ref = `points:sale:${args.saleId}`;
@@ -403,6 +453,7 @@ export async function creditPoints(tx: LoyaltyTx, args: CreditPointsArgs): Promi
       field: "points",
       perReward: args.program.pointsPerReward,
       triggerRef: ref,
+      activatedAt: args.program.activatedAt,
       snapshot: {
         rewardKind: args.program.rewardKind,
         rewardPercent: args.program.rewardPercent,
@@ -555,6 +606,16 @@ export type AdjustLoyaltyResult =
   | { ok: true; rewardsCreated: number }
   | { ok: false; error: "REASON_TOO_SHORT" | "NO_CHANGE" | "REF_INVALID" };
 
+/**
+ * Correction manuelle ADMIN. `args.occurredAt` : l'appelant (`adjustLoyaltyAccount`,
+ * lib/caisse.ts) pose TOUJOURS `new Date()` — un ADJUST prend `occurredAt = now`, jamais une
+ * date passée reconstituée. `activatedAt` est nécessairement déjà dans le passé à cet instant
+ * (`nextActivatedAt` ne pose jamais autre chose que `now` d'UNE requête PUT antérieure) : la garde
+ * `occurredAt < activatedAt` de `creditVisit`/`creditPoints` n'a donc structurellement rien à
+ * faire ici — mais l'AGRÉGATION (`sumVisits`/`sumPoints`, filtrée sur `occurredAt >= activatedAt`)
+ * s'applique bien à CE `kind` comme aux autres : un ADJUST antérieur à une réactivation ne compte
+ * plus dans le nouveau net, exactement comme un VISIT ou un POINTS (§2.2, décision Marco 15/09).
+ */
 export async function adjustLoyalty(tx: LoyaltyTx, args: AdjustLoyaltyArgs): Promise<AdjustLoyaltyResult> {
   if (!args.reason || args.reason.trim().length < 3) return { ok: false, error: "REASON_TOO_SHORT" };
   if (args.visits === 0 && args.points === 0) return { ok: false, error: "NO_CHANGE" };
@@ -585,6 +646,7 @@ export async function adjustLoyalty(tx: LoyaltyTx, args: AdjustLoyaltyArgs): Pro
       field: "visits",
       perReward: args.program.visitsPerReward,
       triggerRef: args.ref,
+      activatedAt: args.program.activatedAt,
       snapshot: {
         rewardKind: args.program.rewardKind,
         rewardPercent: args.program.rewardPercent,
@@ -606,6 +668,7 @@ export async function adjustLoyalty(tx: LoyaltyTx, args: AdjustLoyaltyArgs): Pro
       field: "points",
       perReward: args.program.pointsPerReward,
       triggerRef: args.ref,
+      activatedAt: args.program.activatedAt,
       snapshot: {
         rewardKind: args.program.rewardKind,
         rewardPercent: args.program.rewardPercent,
@@ -642,14 +705,26 @@ export type LoyaltyAccountSummary = {
   points: number;
   rewards: LoyaltyRewardView[];
   lastEntries: any[];
+  /** Pivot de la remise à zéro (décision Marco 15/09) — pour affichage écran. `null` = programme
+   *  jamais activé (ou OFF depuis toujours) : `visits`/`points` valent alors 0. */
+  activatedAt: Date | null;
 };
 
-/** Soldes et récompenses de N fiches, TOUS dérivés à la lecture (§2.2 du plan) — rien n'écrit. */
+/**
+ * Soldes et récompenses de N fiches, TOUS dérivés à la lecture (§2.2 du plan) — rien n'écrit.
+ * `visits`/`points` n'agrègent que les lignes postérieures à `activatedAt` du programme COURANT
+ * (décision Marco 15/09 : un changement de forme ou une réactivation repart de zéro) ; les
+ * récompenses (`rewards`), elles, restent visibles et consommables quelle que soit leur date —
+ * leur disponibilité ne dépend que de `redeemedAt`/`expiresAt` (`isRewardAvailable`).
+ */
 export async function accountSummary(
   tx: LoyaltyTx,
   tenantId: string,
   ficheIds: string[],
 ): Promise<LoyaltyAccountSummary[]> {
+  const program = (await tx.loyaltyProgram.findFirst({ where: { tenantId } })) ?? offProgram(tenantId);
+  const activatedAt = program.activatedAt;
+
   const accounts = await tx.loyaltyAccount.findMany({
     where: { tenantId, clientFicheId: { in: ficheIds } },
   });
@@ -657,8 +732,8 @@ export async function accountSummary(
   const results: LoyaltyAccountSummary[] = [];
   for (const acc of accounts) {
     const [visits, points, rewardRows, lastEntries] = await Promise.all([
-      sumVisits(tx, tenantId, acc.id),
-      sumPoints(tx, tenantId, acc.id),
+      sumVisits(tx, tenantId, acc.id, activatedAt),
+      sumPoints(tx, tenantId, acc.id, activatedAt),
       tx.loyaltyEntry.findMany({
         where: { tenantId, accountId: acc.id, kind: "REWARD" },
         orderBy: { occurredAt: "asc" },
@@ -684,6 +759,7 @@ export async function accountSummary(
         redeemedAt: r.redeemedAt,
       })),
       lastEntries,
+      activatedAt,
     });
   }
   return results;
