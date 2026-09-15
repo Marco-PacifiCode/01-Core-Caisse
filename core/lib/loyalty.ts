@@ -277,13 +277,6 @@ export function rewardDiscountXpf(
   return result < cap ? result : cap;
 }
 
-// ── rewardsToCreate ──────────────────────────────────────────────────────────────────────────
-
-/** Nombre de récompenses à créer pour un solde cumulé donné (visites ou points). */
-export function rewardsToCreate(sumAfter: number, perReward: number): number {
-  return perReward > 0 ? Math.floor(sumAfter / perReward) : 0;
-}
-
 // ── expiresAtFor ─────────────────────────────────────────────────────────────────────────────
 
 /**

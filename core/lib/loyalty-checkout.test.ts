@@ -311,8 +311,9 @@ test("creditVisit : mode VISITS, 5 visites -> 1 récompense créée exactement �
   assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1);
 
   // 🔴 LE TEST QUI COMPTE : les visites 6 à 9 ne créent PAS de 2e récompense sous un ref
-  // différent (piège d'une lecture littérale de la boucle "0..rewardsToCreate(sum,N)-1" du
-  // plan sans tenir compte du delta déjà émis — cf. lib/loyalty-db.ts#issueRewardsForDelta).
+  // différent — le net retombe à 0 après la récompense de la 5e visite (5 + REWARD(-5) = 0),
+  // et `issueRewardsWhileNetReached` (lib/loyalty-db.ts) n'émet QUE tant que le net atteint le
+  // seuil : 1, 2, 3, 4 ne le franchissent jamais.
   for (let i = 6; i <= 9; i++) {
     const out = await creditVisit(tx, {
       tenantId: TENANT,
@@ -415,6 +416,233 @@ test("creditPoints : franchit le seuil pointsPerReward une seule fois, pas à ch
   });
   assert.equal(after.rewardsCreated, 0);
   assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// SOLDE NET NÉGATIF — correctif QA (2026-09-16)
+//
+// DÉFAUT PROUVÉ sur l'ancienne version (`issueRewardsForDelta`, retirée) : le solde net inclut
+// les REWARD (-N), les REVERSAL et les ADJUST négatifs. `Math.floor` arrondit vers -∞ sur un
+// solde négatif, donc `rewardsToCreate(sumAvant,N)` mentait dès que le compte était repassé sous
+// zéro (récompense déjà émise puis vente annulée, ou correction ADMIN négative) — une récompense
+// renaissait sur un `ref` neuf sans que la cliente ait regagné le seuil. `issueRewardsWhileNetReached`
+// (lib/loyalty-db.ts) ne divise plus : il consomme le NET par tranches tant qu'il atteint le
+// seuil, jamais en dessous.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("🔴 (a) vente 600 pts (1 récompense, net 100) ; annulation (net -500) ; vente de 500 pts -> AUCUNE 2e récompense, net final 0", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = pointsProgram({ pointsPerReward: 500 });
+
+  const saleA = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-A",
+    points: 600,
+    occurredAt: new Date("2026-09-15T10:00:00Z"),
+  });
+  assert.equal(saleA.rewardsCreated, 1, "600 pts franchit le seuil de 500 une fois : net 100 ensuite");
+
+  // Annulation de la vente A (même écriture que `annulerVente` en réel) : reprend les 600 pts.
+  // Net après reprise : 600 (POINTS) - 500 (REWARD) - 600 (REVERSAL) = -500.
+  await reverseSale(tx, { tenantId: TENANT, saleId: "sale-A", occurredAt: new Date("2026-09-15T11:00:00Z") });
+
+  const saleB = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-B",
+    points: 500,
+    occurredAt: new Date("2026-09-15T12:00:00Z"),
+  });
+  // 🔴 LE DÉFAUT PROUVÉ : l'ancien calcul comparait rewardsToCreate(-500,500)=Math.floor(-1)=-1 à
+  // rewardsToCreate(0,500)=0, et la boucle `for i=-1; i<0; i++` créait UNE récompense fantôme —
+  // alors que le net n'était REVENU qu'à 0, jamais remonté au seuil de 500.
+  assert.equal(saleB.rewardsCreated, 0, "le net n'atteint que 0, jamais le seuil de 500 : aucune récompense");
+
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1, "1 seule récompense au total");
+  const account = entries.find((e) => e.kind === "POINTS")!.accountId;
+  const netFinal = entries.filter((e) => e.accountId === account).reduce((t, e) => t + e.points, 0);
+  assert.equal(netFinal, 0, "net final : 600 + 500 - 500 (reward) - 600 (reversal) = 0");
+});
+
+test("🔴 (b) 5 visites (1 récompense, net 0) ; ADJUST -3 (net -3) ; 6 visites -> AUCUNE 2e récompense, net final 3", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = visitsProgram({ visitsPerReward: 5 });
+
+  for (let i = 1; i <= 5; i++) {
+    await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-1",
+      displayName: "Mélanie",
+      appointmentId: `rdv-${i}`,
+      occurredAt: new Date("2026-09-15T10:00:00Z"),
+    });
+  }
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1, "1 récompense après les 5 premières visites (net 0)");
+
+  const adjust = await adjustLoyalty(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    visits: -3,
+    points: 0,
+    reason: "correction carnet papier",
+    ref: "adjust:22222222-2222-4222-8222-222222222222",
+    occurredAt: new Date("2026-09-16T09:00:00Z"),
+  });
+  assert.equal(adjust.ok, true);
+  if (adjust.ok) assert.equal(adjust.rewardsCreated, 0, "un ADJUST négatif ne crée jamais de récompense");
+
+  // 🔴 LE DÉFAUT PROUVÉ : le net est retombé à -3. SIX visites supplémentaires (une par une) le
+  // ramènent à 3 (-3, -2, -1, 0, 1, 2, 3) — jamais au seuil de 5. L'ancien calcul par quotient
+  // aurait pourtant créé une récompense fantôme dès la première visite qui suit l'ADJUST négatif
+  // (`rewardsToCreate(-3,5)=Math.floor(-3/5)=-1`, `rewardsToCreate(-2,5)=Math.floor(-2/5)=-1`…
+  // jusqu'à ce que le quotient remonte à 0, ce qui se produit AVANT que le net atteigne 5).
+  for (let i = 6; i <= 11; i++) {
+    const out = await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-1",
+      displayName: "Mélanie",
+      appointmentId: `rdv-${i}`,
+      occurredAt: new Date("2026-09-16T10:00:00Z"),
+    });
+    assert.equal(out.rewardsCreated, 0, `visite ${i} : le seuil de 5 n'est pas encore franchi`);
+  }
+
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1, "toujours UNE seule récompense au total");
+  const account = entries.find((e) => e.kind === "VISIT")!.accountId;
+  const netFinal = entries.filter((e) => e.accountId === account).reduce((t, e) => t + e.visits, 0);
+  assert.equal(netFinal, 3, "net final : 5 - 5 (reward) - 3 (adjust) + 6 (visites) = 3");
+});
+
+test("11 visites, seuil 5 -> 2 récompenses (à la 5e et à la 10e), net final 1", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = visitsProgram({ visitsPerReward: 5 });
+  const rewardsAt: number[] = [];
+  for (let i = 1; i <= 11; i++) {
+    const out = await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-1",
+      displayName: "Mélanie",
+      appointmentId: `rdv-${i}`,
+      occurredAt: new Date("2026-09-15T10:00:00Z"),
+    });
+    if (out.rewardsCreated > 0) rewardsAt.push(i);
+  }
+  assert.deepEqual(rewardsAt, [5, 10]);
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 2);
+  const account = entries.find((e) => e.kind === "VISIT")!.accountId;
+  const netFinal = entries.filter((e) => e.accountId === account).reduce((t, e) => t + e.visits, 0);
+  assert.equal(netFinal, 1, "11 - 5 - 5 = 1");
+});
+
+test("ventes 300 / 300 / 600, seuil 500 -> 2 récompenses au total, net final 200", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = pointsProgram({ pointsPerReward: 500 });
+
+  const r1 = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-1",
+    points: 300,
+    occurredAt: new Date("2026-09-15T10:00:00Z"),
+  });
+  assert.equal(r1.rewardsCreated, 0, "net 300 : sous le seuil");
+
+  const r2 = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-2",
+    points: 300,
+    occurredAt: new Date("2026-09-15T11:00:00Z"),
+  });
+  assert.equal(r2.rewardsCreated, 1, "net 600 : franchit 500, retombe à 100");
+
+  const r3 = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-3",
+    points: 600,
+    occurredAt: new Date("2026-09-15T12:00:00Z"),
+  });
+  assert.equal(r3.rewardsCreated, 1, "net 700 : franchit 500 une 2e fois, retombe à 200");
+
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 2);
+  const account = entries.find((e) => e.kind === "POINTS")!.accountId;
+  const netFinal = entries.filter((e) => e.accountId === account).reduce((t, e) => t + e.points, 0);
+  assert.equal(netFinal, 200, "300 + 300 + 600 - 500 - 500 = 200");
+});
+
+test("vente unique de 1200 pts, seuil 500 -> 2 récompenses dans la MÊME fournée (:0 et :1), net final 200", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = pointsProgram({ pointsPerReward: 500 });
+
+  const out = await creditPoints(tx, {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    saleId: "sale-big",
+    points: 1200,
+    occurredAt: new Date("2026-09-15T10:00:00Z"),
+  });
+  assert.equal(out.rewardsCreated, 2, "1200 franchit 500 deux fois d'un coup (net 700 puis 200)");
+
+  const rewards = entries.filter((e) => e.kind === "REWARD");
+  assert.equal(rewards.length, 2);
+  assert.ok(rewards.some((r) => r.ref === "reward:points:sale:sale-big:0"), "1re récompense de la fournée : index 0");
+  assert.ok(rewards.some((r) => r.ref === "reward:points:sale:sale-big:1"), "2e récompense de la MÊME fournée : index 1");
+
+  const account = entries.find((e) => e.kind === "POINTS")!.accountId;
+  const netFinal = entries.filter((e) => e.accountId === account).reduce((t, e) => t + e.points, 0);
+  assert.equal(netFinal, 200, "1200 - 500 - 500 = 200");
+});
+
+test("rejeu du même appointmentId au moment du franchissement du seuil -> AUCUNE récompense de plus", async () => {
+  const { tx, entries } = makeFakeTx();
+  const program = visitsProgram({ visitsPerReward: 5 });
+  for (let i = 1; i <= 4; i++) {
+    await creditVisit(tx, {
+      tenantId: TENANT,
+      program,
+      clientFicheId: "fiche-1",
+      displayName: "Mélanie",
+      appointmentId: `rdv-${i}`,
+      occurredAt: new Date("2026-09-15T10:00:00Z"),
+    });
+  }
+  const fifth = {
+    tenantId: TENANT,
+    program,
+    clientFicheId: "fiche-1",
+    displayName: "Mélanie",
+    appointmentId: "rdv-5",
+    occurredAt: new Date("2026-09-15T10:00:00Z"),
+  };
+  const first = await creditVisit(tx, fifth);
+  assert.equal(first.rewardsCreated, 1);
+
+  // Rejeu du MÊME appointmentId (webhook réessayé, requête doublée…) : la ligne VISIT est un
+  // doublon sur (tenantId, ref) -> court-circuit AVANT tout calcul de récompense.
+  const replay = await creditVisit(tx, fifth);
+  assert.equal(replay.credited, false);
+  assert.equal(replay.rewardsCreated, 0);
+
+  assert.equal(entries.filter((e) => e.kind === "REWARD").length, 1, "aucune récompense de plus au rejeu");
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════

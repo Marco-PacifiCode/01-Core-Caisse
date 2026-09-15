@@ -11,14 +11,22 @@ mémoire, sans DB ni contexte Next — `lib/loyalty-checkout.test.ts`) : `lockAc
 `FOR UPDATE`), `insertEntry` (P2002 → `{duplicate:true}`, jamais levé), `creditVisit`,
 `creditPoints`, `redeemReward` (update conditionnel `redeemedAt: null`, symétrique du bon
 cadeau), `reverseSale` (reprise à l'annulation), `adjustLoyalty` (correction ADMIN),
-`accountSummary` (lecture pure). ⚠️ **Écart assumé par rapport au pseudo-code littéral du
-plan §5** : la boucle d'émission des récompenses (`issueRewardsForDelta`) crée le **delta**
-entre `rewardsToCreate(sumAvant,N)` et `rewardsToCreate(sumAprès,N)`, pas `0..rewardsToCreate
-(sumAprès,N)-1` à chaque événement — une lecture littérale aurait ré-émis une récompense déjà
-acquise sous un `ref` différent à CHAQUE visite/vente suivante qui ne franchit aucun nouveau
-seuil (le `ref` est ancré sur l'événement DÉCLENCHEUR, qui change à chaque fois). Test qui
-aurait détecté le bug s'il avait été codé au pied de la lettre : « mode VISITS, 5 visites → 1
-récompense, jamais 2 » (`loyalty-checkout.test.ts`).
+`accountSummary` (lecture pure). 🔴 **Correctif QA du 2026-09-16 : `issueRewardsForDelta`
+(delta de quotients) remplacée par `issueRewardsWhileNetReached` (retour au plan §2.2, au
+pied de la lettre).** Défaut prouvé sur l'ancienne version : elle comparait
+`Math.floor(sumAvant/N)` à `Math.floor(sumAprès/N)`, un quotient entier qui MENT dès que le
+solde net devient négatif (REWARD retranche N, REVERSAL et ADJUST peuvent être négatifs ;
+`Math.floor` arrondit vers -∞). Deux cas reproduits par la QA : (a) vente de 600 pts (seuil
+500) → 1 récompense, net 100 ; annulation → net -500 ; vente de 500 pts → une 2ᵉ récompense
+était créée à tort (la cliente n'avait pourtant gagné que 500 pts nets) ; (b) 5 visites → 1
+récompense (net 0) ; correction ADMIN de -3 → net -3 ; 3 visites de plus → une 2ᵉ récompense
+à tort. `issueRewardsWhileNetReached` ne divise plus jamais : sous le verrou de compte, elle
+calcule le net APRÈS la ligne déclenchante, puis consomme ce net par tranches de N
+(`while (net >= N) { REWARD(-N) ; net -= N }`, `ref = reward:<triggerRef>:<i>`, borne de
+sécurité 1000 itérations). `rewardsToCreate` (le quotient pur) a été retirée de `loyalty.ts`
+— un solde de fidélité est signé, un quotient entier ne s'applique qu'à un solde qui ne
+descend jamais sous zéro. Tests couvrant les deux cas QA + rejeu + franchissement multiple en
+une seule fournée : `loyalty-checkout.test.ts`.
 
 **`checkoutSale`** (`lib/caisse.ts`) gagne `options.loyalty` (rattache la vente à une fiche
 pour créditer des points en mode `POINTS`) et `options.redeemLoyalty` (consomme une

@@ -19,7 +19,7 @@
 // sans avoir à construire la classe d'erreur réelle de Prisma.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-import { expiresAtFor, rewardsToCreate } from "./loyalty.ts";
+import { expiresAtFor } from "./loyalty.ts";
 
 // ── Le sous-ensemble de Prisma.TransactionClient réellement utilisé ici ────────────────────────
 // Volontairement étroit (et paramètres en `any`) : la vraie `Prisma.TransactionClient` le
@@ -191,28 +191,62 @@ async function sumPoints(tx: LoyaltyTx, tenantId: string, accountId: string): Pr
   return agg?._sum?.points ?? 0;
 }
 
-// ── émission des récompenses franchies ──────────────────────────────────────────────────────
+// ── émission des récompenses franchies (net réel du compte, jamais un quotient) ────────────────
+
+/** Plafond de sécurité : au-delà, un solde est aberrant — on refuse plutôt que boucler. */
+const MAX_REWARDS_PER_EVENT = 1000;
+
+export class LoyaltyRewardOverflowError extends Error {
+  constructor(tenantId: string, accountId: string) {
+    super(
+      `issueRewardsWhileNetReached : plafond de ${MAX_REWARDS_PER_EVENT} récompenses dépassé en ` +
+        `un seul événement (tenantId=${tenantId}, accountId=${accountId}) — solde probablement ` +
+        `aberrant, refusé plutôt que bouclé.`,
+    );
+    this.name = "LoyaltyRewardOverflowError";
+  }
+}
 
 /**
- * Émet les récompenses franchies ENTRE `sumBefore` et `sumAfter` (jamais de `sumAfter=0` à
- * `rewardsToCreate(sumAfter,N)-1` à chaque appel : un compte qui a DÉJÀ sa 1ʳᵉ récompense ne doit
- * pas s'en voir recréer une 2ᵉ sous un `ref` différent à la visite suivante qui ne franchit
- * aucun nouveau seuil). Chaque récompense de cette fournée porte un `ref` unique
- * `reward:<triggerRef>:<i>`, `i` continuant la numérotation globale des seuils déjà franchis —
- * c'est ce qui rend le `ref` unique même pour DEUX récompenses nées d'un même événement (un
- * ajustement manuel ou une grosse vente peut franchir plusieurs seuils d'un coup).
+ * Émet les récompenses tant que le SOLDE NET du compte (visites OU points, `field`, dérivé à la
+ * lecture — §2.2 du plan) atteint le seuil `perReward`. Le net est recalculé par `aggregate` APRÈS
+ * l'insertion de la ligne déclenchante, SOUS LE VERROU de compte déjà pris par `lockAccount` — pas
+ * de course possible entre la lecture et l'écriture qui suit.
+ *
+ * 🔴 CORRECTIF (2026-09-16, QA — remplace `issueRewardsForDelta`, supprimée). L'ancienne version
+ * comparait `rewardsToCreate(sumAvant,N)` à `rewardsToCreate(sumAprès,N)` — un quotient entier
+ * (`Math.floor`) qui ARRONDIT VERS -∞ sur un solde NÉGATIF. Le solde net inclut pourtant les
+ * `REWARD` (-N), les `REVERSAL` et les `ADJUST` négatifs : un compte dont le net était retombé
+ * sous zéro (récompense déjà émise puis vente annulée, ou correction ADMIN négative) faisait
+ * mentir `Math.floor` et une récompense renaissait sur un `ref` neuf sans que la cliente ait
+ * regagné le seuil. Preuve : vente 600 pts (seuil 500) → 1 récompense, net 100 ; annulation →
+ * net -500 ; vente de 500 pts → l'ancien calcul en créait une 2ᵉ alors que le net n'était qu'à 0.
+ * `rewardsToCreate` (lib/loyalty.ts) n'a donc plus AUCUN appelant sur un solde net et a été
+ * retirée avec son test — ne pas la réintroduire ici, un quotient ment sur un solde signé.
+ *
+ * Cette version ne divise JAMAIS : elle consomme le net par tranches de `perReward` tant qu'il
+ * les atteint, jamais en dessous (`net >= perReward`, jamais `net > 0`). Un net négatif ou
+ * `< perReward` ne crée rien. `i` numérote les récompenses de CETTE fournée — une seule ligne
+ * déclenchante peut en franchir plusieurs d'un coup (grosse vente, gros ajustement) — d'où
+ * `ref = reward:<triggerRef>:<i>`, toujours neuf : `triggerRef` n'est réutilisé QUE si la ligne
+ * déclenchante elle-même est un doublon, auquel cas l'appelant ne va jamais jusqu'ici (cf.
+ * `creditVisit`/`creditPoints`/`adjustLoyalty` : `if (inserted.duplicate) return …` AVANT ce point).
  */
-async function issueRewardsForDelta(
+async function issueRewardsWhileNetReached(
   tx: LoyaltyTx,
   args: {
     tenantId: string;
     accountId: string;
-    program: LoyaltyProgramRow;
+    field: "visits" | "points";
     perReward: number;
-    isVisits: boolean; // true = visits négatifs sur la récompense, false = points négatifs
-    sumBefore: number;
-    sumAfter: number;
     triggerRef: string;
+    snapshot: {
+      rewardKind: string | null;
+      rewardPercent: number | null;
+      rewardAmountXpf: bigint | null;
+      rewardBase: string | null;
+      rewardValidityMonths: number | null;
+    };
     sourceType: string;
     sourceId: string;
     occurredAt: Date;
@@ -220,21 +254,30 @@ async function issueRewardsForDelta(
     actorName?: string | null;
   },
 ): Promise<number> {
-  const before = rewardsToCreate(args.sumBefore, args.perReward);
-  const after = rewardsToCreate(args.sumAfter, args.perReward);
+  if (args.perReward <= 0) return 0;
+
+  let net =
+    args.field === "visits"
+      ? await sumVisits(tx, args.tenantId, args.accountId)
+      : await sumPoints(tx, args.tenantId, args.accountId);
+
   let created = 0;
-  for (let i = before; i < after; i++) {
+  let i = 0;
+  while (net >= args.perReward) {
+    if (i >= MAX_REWARDS_PER_EVENT) {
+      throw new LoyaltyRewardOverflowError(args.tenantId, args.accountId);
+    }
     const res = await insertEntry(tx, {
       tenantId: args.tenantId,
       accountId: args.accountId,
       kind: "REWARD",
-      visits: args.isVisits ? -args.perReward : 0,
-      points: args.isVisits ? 0 : -args.perReward,
-      rewardKind: args.program.rewardKind,
-      rewardPercent: args.program.rewardPercent,
-      rewardAmountXpf: args.program.rewardAmountXpf,
-      rewardBase: args.program.rewardBase,
-      expiresAt: expiresAtFor(args.occurredAt, args.program.rewardValidityMonths),
+      visits: args.field === "visits" ? -args.perReward : 0,
+      points: args.field === "points" ? -args.perReward : 0,
+      rewardKind: args.snapshot.rewardKind,
+      rewardPercent: args.snapshot.rewardPercent,
+      rewardAmountXpf: args.snapshot.rewardAmountXpf,
+      rewardBase: args.snapshot.rewardBase,
+      expiresAt: expiresAtFor(args.occurredAt, args.snapshot.rewardValidityMonths),
       sourceType: args.sourceType,
       sourceId: args.sourceId,
       ref: `reward:${args.triggerRef}:${i}`,
@@ -243,6 +286,8 @@ async function issueRewardsForDelta(
       occurredAt: args.occurredAt,
     });
     if (!res.duplicate) created++;
+    net -= args.perReward;
+    i++;
   }
   return created;
 }
@@ -291,16 +336,19 @@ export async function creditVisit(tx: LoyaltyTx, args: CreditVisitArgs): Promise
 
   let rewardsCreated = 0;
   if (args.program.mode === "VISITS" && args.program.visitsPerReward) {
-    const sumAfter = await sumVisits(tx, args.tenantId, account.id);
-    rewardsCreated = await issueRewardsForDelta(tx, {
+    rewardsCreated = await issueRewardsWhileNetReached(tx, {
       tenantId: args.tenantId,
       accountId: account.id,
-      program: args.program,
+      field: "visits",
       perReward: args.program.visitsPerReward,
-      isVisits: true,
-      sumBefore: sumAfter - 1,
-      sumAfter,
       triggerRef: ref,
+      snapshot: {
+        rewardKind: args.program.rewardKind,
+        rewardPercent: args.program.rewardPercent,
+        rewardAmountXpf: args.program.rewardAmountXpf,
+        rewardBase: args.program.rewardBase,
+        rewardValidityMonths: args.program.rewardValidityMonths,
+      },
       sourceType: "rdv",
       sourceId: args.appointmentId,
       occurredAt: args.occurredAt,
@@ -349,16 +397,19 @@ export async function creditPoints(tx: LoyaltyTx, args: CreditPointsArgs): Promi
 
   let rewardsCreated = 0;
   if (args.program.pointsPerReward) {
-    const sumAfter = await sumPoints(tx, args.tenantId, account.id);
-    rewardsCreated = await issueRewardsForDelta(tx, {
+    rewardsCreated = await issueRewardsWhileNetReached(tx, {
       tenantId: args.tenantId,
       accountId: account.id,
-      program: args.program,
+      field: "points",
       perReward: args.program.pointsPerReward,
-      isVisits: false,
-      sumBefore: sumAfter - args.points,
-      sumAfter,
       triggerRef: ref,
+      snapshot: {
+        rewardKind: args.program.rewardKind,
+        rewardPercent: args.program.rewardPercent,
+        rewardAmountXpf: args.program.rewardAmountXpf,
+        rewardBase: args.program.rewardBase,
+        rewardValidityMonths: args.program.rewardValidityMonths,
+      },
       sourceType: "sale",
       sourceId: args.saleId,
       occurredAt: args.occurredAt,
@@ -528,16 +579,19 @@ export async function adjustLoyalty(tx: LoyaltyTx, args: AdjustLoyaltyArgs): Pro
 
   let rewardsCreated = 0;
   if (args.program.mode === "VISITS" && args.program.visitsPerReward && args.visits !== 0) {
-    const sumAfter = await sumVisits(tx, args.tenantId, account.id);
-    rewardsCreated += await issueRewardsForDelta(tx, {
+    rewardsCreated += await issueRewardsWhileNetReached(tx, {
       tenantId: args.tenantId,
       accountId: account.id,
-      program: args.program,
+      field: "visits",
       perReward: args.program.visitsPerReward,
-      isVisits: true,
-      sumBefore: sumAfter - args.visits,
-      sumAfter,
       triggerRef: args.ref,
+      snapshot: {
+        rewardKind: args.program.rewardKind,
+        rewardPercent: args.program.rewardPercent,
+        rewardAmountXpf: args.program.rewardAmountXpf,
+        rewardBase: args.program.rewardBase,
+        rewardValidityMonths: args.program.rewardValidityMonths,
+      },
       sourceType: "manual",
       sourceId: args.ref,
       occurredAt: args.occurredAt,
@@ -546,16 +600,19 @@ export async function adjustLoyalty(tx: LoyaltyTx, args: AdjustLoyaltyArgs): Pro
     });
   }
   if (args.program.mode === "POINTS" && args.program.pointsPerReward && args.points !== 0) {
-    const sumAfter = await sumPoints(tx, args.tenantId, account.id);
-    rewardsCreated += await issueRewardsForDelta(tx, {
+    rewardsCreated += await issueRewardsWhileNetReached(tx, {
       tenantId: args.tenantId,
       accountId: account.id,
-      program: args.program,
+      field: "points",
       perReward: args.program.pointsPerReward,
-      isVisits: false,
-      sumBefore: sumAfter - args.points,
-      sumAfter,
       triggerRef: args.ref,
+      snapshot: {
+        rewardKind: args.program.rewardKind,
+        rewardPercent: args.program.rewardPercent,
+        rewardAmountXpf: args.program.rewardAmountXpf,
+        rewardBase: args.program.rewardBase,
+        rewardValidityMonths: args.program.rewardValidityMonths,
+      },
       sourceType: "manual",
       sourceId: args.ref,
       occurredAt: args.occurredAt,

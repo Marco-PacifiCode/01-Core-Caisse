@@ -15,7 +15,6 @@ import {
   nextActivatedAt,
   pointsForSale,
   rewardDiscountXpf,
-  rewardsToCreate,
   expiresAtFor,
   isRewardAvailable,
 } from "./loyalty.ts";
@@ -113,12 +112,16 @@ test("validateProgram : VISITS complet et valide est accepté", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
-// rewardsToCreate / expiresAtFor / nextActivatedAt / isRewardAvailable
+// expiresAtFor / nextActivatedAt / isRewardAvailable
+//
+// `rewardsToCreate` a été RETIRÉE (2026-09-16, correctif QA) : c'était un quotient entier
+// (`Math.floor(sum/perReward)`) qui MENT sur un solde NÉGATIF (arrondit vers -∞). Le moteur
+// d'émission des récompenses (`lib/loyalty-db.ts#issueRewardsWhileNetReached`) ne divise plus
+// jamais — il consomme le NET par tranches tant qu'il atteint le seuil. Ne pas réintroduire un
+// quotient ici : un solde de fidélité est signé (REWARD, REVERSAL et ADJUST peuvent être
+// négatifs), et un quotient entier ne s'applique correctement qu'à un solde qui ne descend
+// jamais sous zéro.
 // ══════════════════════════════════════════════════════════════════════════════════════════
-
-test("rewardsToCreate(20, 10) → 2", () => {
-  assert.equal(rewardsToCreate(20, 10), 2);
-});
 
 test("expiresAtFor(31/01, 1) tombe au 28 ou 29/02", () => {
   const occurredAt = new Date(Date.UTC(2026, 0, 31, 12, 0, 0));
