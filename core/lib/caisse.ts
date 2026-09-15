@@ -650,7 +650,7 @@ export type CheckoutError =
 
 type LoadedSale = NonNullable<Awaited<ReturnType<typeof getSale>>>;
 
-function toSnapshot(sale: LoadedSale, creditDueAtIso?: string | null): SyncSaleSnapshot {
+function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
   return {
     id: sale.id,
     tenantId: sale.tenantId,
@@ -661,9 +661,13 @@ function toSnapshot(sale: LoadedSale, creditDueAtIso?: string | null): SyncSaleS
     invoiceNumber: sale.invoiceNumber,
     comptaSyncedAt: sale.comptaSyncedAt,
     stockSyncedAt: sale.stockSyncedAt,
-    // Vente à crédit (lot A) : fourni UNIQUEMENT dans la même requête que l'encaissement (cf.
-    // lib/sync.ts#SyncSaleSnapshot.dueAt — pas de champ dédié sur `Sale`, angle mort assumé).
-    dueAt: creditDueAtIso ?? null,
+    // Vente à crédit (lot A, 2026-09-15) : relu depuis `Sale.dueAt` (migration
+    // 20260915200000_sale_due_at), posé UNE fois dans la transaction du passage à PAID (cf.
+    // checkoutSale). Cette lecture couvre UNIFORMÉMENT les trois appelants de `toSnapshot` : le
+    // rejeu idempotent d'une vente déjà PAID, la synchro nominale juste après le commit, ET la
+    // reprise différée (`repairSale` / cron `repair-sales`) — cette dernière ne connaissait plus
+    // l'échéance avant cette migration.
+    dueAt: sale.dueAt ? sale.dueAt.toISOString() : null,
     lines: sale.lines.map((l) => ({
       id: l.id,
       kind: l.kind,
@@ -698,9 +702,9 @@ function persistFor(tenantId: string, saleId: string): SyncPersist {
  * Rejoue les étapes de synchro MANQUANTES d'une vente déjà chargée (PAID attendu).
  * N'échoue jamais sur un échec core : l'issue est retournée + persistée (syncError/syncAttempts).
  */
-async function syncLoadedSale(sale: LoadedSale, creditDueAtIso?: string | null): Promise<SyncOutcome> {
+async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
   const outcome = await runSaleSync(
-    toSnapshot(sale, creditDueAtIso),
+    toSnapshot(sale),
     comptaClient(),
     stockClient(),
     persistFor(sale.tenantId, sale.id),
@@ -834,15 +838,18 @@ export async function checkoutSale(
 
   const compta = comptaClient();
 
-  // Vente à crédit (lot A) : calculé UNE fois, réutilisé aux deux appels de synchro de cette
-  // requête (rejeu idempotent ci-dessous + synchro nominale plus bas). `null` sans `credit`.
+  // Vente à crédit (lot A) : calculée ici pour être écrite sur `Sale.dueAt` (migration
+  // 20260915200000_sale_due_at) dans la transaction du passage à PAID, plus bas. `null` sans
+  // `credit`. `syncLoadedSale`/`toSnapshot` n'en ont PAS besoin en paramètre : une fois persisté,
+  // `sale.dueAt` est relu directement depuis la DB — y compris par le rejeu idempotent
+  // ci-dessous, sur une vente déjà PAID dont l'échéance a été écrite à un appel précédent.
   const creditDueAtIso = options?.credit ? dueAtNoonUtcIso(options.credit.dueAt) : null;
 
   // Idempotence : si déjà PAID, ne pas ré-encaisser — mais retenter la synchro si elle est incomplète.
   if (sale.status === "PAID") {
     const paid = sale.payments.reduce((t, p) => t + p.amountXpf, 0n);
     const pending = !sale.comptaSyncedAt || !sale.stockSyncedAt;
-    const outcome = pending ? await syncLoadedSale(sale, creditDueAtIso) : null;
+    const outcome = pending ? await syncLoadedSale(sale) : null;
     const invoiceId = outcome ? outcome.invoiceId : sale.invoiceId;
     return {
       ok: true,
@@ -991,9 +998,14 @@ export async function checkoutSale(
     // à PAID et la création des bons cadeaux sont dans la MÊME transaction. Un
     // update multiligne introduit une fermeture intermédiaire qui tronque son
     // extraction, et le test échoue sur du code pourtant correct.
+    //
+    // Vente à crédit (lot A) : `dueAt` (Sale.dueAt, migration 20260915200000_sale_due_at) est
+    // posé DANS CETTE MÊME transaction, uniquement quand `options.credit` est fourni — c'est ce
+    // que relit `repairSale` plus bas si la synchro Compta initiale échoue et doit être rejouée
+    // hors de cette requête (cf. lib/sync.ts#SyncSaleSnapshot.dueAt).
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
-    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement } });
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
     // 🔴 LES BONS SE CONSOMMENT ICI, dans la MÊME transaction que le passage à PAID — pour la
     //    raison exactement symétrique de leur création : zéro fenêtre entre « le bon est brûlé »
     //    et « la vente est payée ». L'UPDATE est CONDITIONNEL (`redeemedAt: null`) : s'il rend
@@ -1046,8 +1058,9 @@ export async function checkoutSale(
   }
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
+  // `reloaded.dueAt` porte déjà l'échéance : la transaction ci-dessus l'a persistée avant ce commit.
   const reloaded = await getSale(tenantId, saleId);
-  const outcome = await syncLoadedSale(reloaded!, creditDueAtIso);
+  const outcome = await syncLoadedSale(reloaded!);
 
   // Numéro de la facture d'ACHAT (au nom de l'acheteur) reporté sur les bons : simple
   // annotation de rapprochement, faite APRÈS la synchro parce que le numéro n'existe pas

@@ -55,12 +55,12 @@ export type SyncSaleSnapshot = {
   invoiceNumber: string | null;
   comptaSyncedAt: Date | null;
   stockSyncedAt: Date | null;
-  /** Vente À CRÉDIT (lot A, 2026-09-15) : ISO 8601 à MIDI UTC de la dernière échéance (déjà
-   *  calculée par l'appelant — cf. lib/credit.ts#dueAtNoonUtcIso), transmis TEL QUEL à
-   *  `compta.createInvoice`. `null`/absent = facture sans échéance, comportement inchangé.
-   *  ⚠️ Ni stocké ni relu ici : l'appelant (checkoutSale) ne le fournit QUE dans le même
-   *  requête que l'encaissement — un `repairSale` ultérieur (après échec Compta) le perd, faute
-   *  de champ dédié sur `Sale` (angle mort assumé, cf. AGENT_BRIEF.md 2026-09-15). */
+  /** Vente À CRÉDIT (lot A, 2026-09-15) : ISO 8601 à MIDI UTC de la dernière échéance, transmis
+   *  TEL QUEL à `compta.createInvoice`. `null`/absent = facture sans échéance, comportement
+   *  inchangé. Relu par l'appelant (`lib/caisse.ts#toSnapshot`) depuis `Sale.dueAt` (migration
+   *  `20260915200000_sale_due_at`), posé une fois dans la transaction du passage à PAID — donc
+   *  disponible aussi bien à la synchro nominale qu'à une reprise différée (`repairSale` / cron
+   *  `repair-sales`) après un échec du premier `createInvoice`. */
   dueAt?: string | null;
   lines: SyncLine[];
   payments: SyncPayment[];
