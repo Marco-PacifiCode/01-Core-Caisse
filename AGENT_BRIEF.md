@@ -1,6 +1,6 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — 🛑 NON DÉPLOYÉ
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — ✅ LIVRÉ le 16/09 (PR #47, main 434de39)
 
 Branche `claude/caisse-fidelite-moteur-20260916` (worktree jetable `_wt/caisse-fidelite-c2`,
 empilée sur C1, base `235b5d9`), tâche d'exécution cadrée. **Ne déploie rien, aucune commande
