@@ -58,7 +58,7 @@ impératif avant tout déploiement** : migration C1 (`ops.sh migrate core-caisse
 Marco) → `rls.sql` rejoué → déploiement de ce Core → écrans surface (hors de ce lot). Argent
 en jeu (points/récompenses) → accord Marco explicite avant tout `ng-deploy`.
 
-## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — 🛑 MIGRATION NON JOUÉE, ACCORD MARCO REQUIS
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C1 : schéma + calculs purs) — ✅ MIGRATION JOUÉE ET PROUVÉE (accord Marco), code livré le 15/09 (PR #46)
 
 Branche `claude/caisse-fidelite-schema-20260916` (worktree jetable `_wt/caisse-fidelite-c1`), tâche
 d'exécution cadrée : plan Salon-Reference (fidélité, 3 formes réglables : compteur/visites/points),
