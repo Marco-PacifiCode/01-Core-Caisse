@@ -28,3 +28,26 @@ export function expectedXpfPourRapport(
   if (session.status === "CLOSED" && session.expectedXpf != null) return session.expectedXpf;
   return expectedRecalcule;
 }
+
+// ─── VENTE À CRÉDIT (échéancier, lot A, 2026-09-15) — « dont à crédit » du Z ────────────────────
+// Décision Marco : le Z compte UNIQUEMENT ce qui est ENCAISSÉ. `cashSalesXpf`/`byMethod`/
+// `totalSalesXpf` (lib/caisse.ts#closeSession) le font déjà — une vente à crédit n'y ajoute que ce
+// qui a réellement été payé (`SalePayment`, jamais `Sale.totalXpf`). `creditXpf` est une ligne
+// PUREMENT INFORMATIVE, symétrique de `giftCardRedeemedXpf` : elle explique un écart entre le CA
+// (`totalSalesXpf`, qui compte le total facturé) et l'encaissé, elle n'entre NULLE PART ailleurs.
+
+/** Reste dû d'UNE vente PAID, jamais négatif (0 si soldée — ou trop payée, ce qui ne devrait pas arriver). */
+export function creditDueXpf(totalXpf: bigint, paidXpf: bigint): bigint {
+  const due = totalXpf - paidXpf;
+  return due > 0n ? due : 0n;
+}
+
+/**
+ * Σ `creditDueXpf` sur les ventes PAID de la session — c'est `ZReport.creditXpf`.
+ * Recalculée à CHAQUE lecture, y compris sur une session CLOSED : même régime que
+ * `cashSalesXpf`/`byMethod`/`totalSalesXpf` (elles décrivent les VENTES, pas le tiroir — cf.
+ * en-tête du fichier). Seul `expectedXpf` (le tiroir) est figé à la clôture.
+ */
+export function creditXpfPourRapport(sales: { totalXpf: bigint; paidXpf: bigint }[]): bigint {
+  return sales.reduce((t, s) => t + creditDueXpf(s.totalXpf, s.paidXpf), 0n);
+}

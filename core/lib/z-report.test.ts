@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { expectedXpfPourRapport } from "./z-report.ts";
+import { expectedXpfPourRapport, creditDueXpf, creditXpfPourRapport } from "./z-report.ts";
 
 // ─── Session CLOSE : le Z ne bouge pas ──────────────────────────────────────────────────────────
 
@@ -53,4 +53,30 @@ test("session OPEN : même si expectedXpf porte une valeur en base (ne devrait p
   // aussi `status === "CLOSED"` — une session encore ouverte ne fige jamais son attendu.
   const session = { status: "OPEN" as const, expectedXpf: 999_999n };
   assert.equal(expectedXpfPourRapport(session, 8_000n), 8_000n);
+});
+
+// ─── Vente à crédit (échéancier, lot A, 2026-09-15) — « dont à crédit » du Z ───────────────────
+
+test("creditDueXpf — vente à crédit, 2 000 F payés sur 10 000 F → reste dû 8 000 F", () => {
+  assert.equal(creditDueXpf(10_000n, 2_000n), 8_000n);
+});
+
+test("creditDueXpf — vente soldée → 0", () => {
+  assert.equal(creditDueXpf(10_000n, 10_000n), 0n);
+});
+
+test("creditDueXpf — jamais négatif (payé > total ne devrait pas arriver, mais 0 pas -500)", () => {
+  assert.equal(creditDueXpf(10_000n, 10_500n), 0n);
+});
+
+test("creditXpfPourRapport — somme les restes dus, les ventes soldées n'y ajoutent rien", () => {
+  const sales = [
+    { totalXpf: 10_000n, paidXpf: 2_000n }, // vente à crédit : reste 8 000
+    { totalXpf: 5_000n, paidXpf: 5_000n }, // vente ordinaire : reste 0
+  ];
+  assert.equal(creditXpfPourRapport(sales), 8_000n);
+});
+
+test("creditXpfPourRapport — session sans vente à crédit → 0", () => {
+  assert.equal(creditXpfPourRapport([{ totalXpf: 5_000n, paidXpf: 5_000n }]), 0n);
 });

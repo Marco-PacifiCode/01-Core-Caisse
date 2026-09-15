@@ -55,6 +55,13 @@ export type SyncSaleSnapshot = {
   invoiceNumber: string | null;
   comptaSyncedAt: Date | null;
   stockSyncedAt: Date | null;
+  /** Vente À CRÉDIT (lot A, 2026-09-15) : ISO 8601 à MIDI UTC de la dernière échéance, transmis
+   *  TEL QUEL à `compta.createInvoice`. `null`/absent = facture sans échéance, comportement
+   *  inchangé. Relu par l'appelant (`lib/caisse.ts#toSnapshot`) depuis `Sale.dueAt` (migration
+   *  `20260915200000_sale_due_at`), posé une fois dans la transaction du passage à PAID — donc
+   *  disponible aussi bien à la synchro nominale qu'à une reprise différée (`repairSale` / cron
+   *  `repair-sales`) après un échec du premier `createInvoice`. */
+  dueAt?: string | null;
   lines: SyncLine[];
   payments: SyncPayment[];
 };
@@ -136,6 +143,8 @@ export async function runSaleSync(
           sourceId: sale.id,
           ticketRef: sale.sourceId,
           clientName: sale.clientName,
+          // Vente à crédit (lot A) : omis quand non renseigné — PAS de fallback à une date bidon.
+          ...(sale.dueAt ? { dueAt: sale.dueAt } : {}),
           lines: sale.lines.map((l) => ({
             label: l.label,
             qty: l.qty,

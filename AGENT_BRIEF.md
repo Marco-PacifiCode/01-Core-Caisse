@@ -1,5 +1,46 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — codé, NON déployé — **migration DÉPOSÉE, PAS JOUÉE**
+
+Branche `claude/caisse-checkout-credit` (worktree `_wt/core-caisse-credit`), tâche d'exécution
+cadrée par un Lead Opus : autoriser une vente à CRÉDIT (1er versement + échéances ultérieures)
+sans casser le chemin existant.
+
+**But** : `checkoutSale` peut désormais passer une vente PAID sous-payée quand l'appelant fournit
+`credit: { dueAt }` (YYYY-MM-DD, dernière échéance) — le 1er versement est libre, strictement > 0,
+encaissé le jour même (décision Marco 15/09). Sans `credit`, comportement **strictement inchangé**
+(garde UNDERPAID classique). Nouveaux refus AVANT encaissement : `CREDIT_NOT_NEEDED` (payé ≥ total,
+409) et `CREDIT_NEEDS_DEPOSIT` (payé ≤ 0, 422). Route `POST /api/sales/:id/checkout` : `credit.dueAt`
+invalide → 400. Décision pure extraite dans `core/lib/credit.ts` (`checkoutUnderpaidGuard`,
+`parseDueAt`, `dueAtNoonUtcIso` — ancrage MIDI UTC, piège +11 NC).
+
+**Argent — accord Marco requis avant déploiement.** Cette branche touche l'encaissement et la
+facturation ; elle n'a **pas** été déployée par cet exécutant (interdiction du mandat). Le Z
+(`closeSession`) compte toujours UNIQUEMENT l'encaissé et expose une ligne informative `creditXpf`
+(« dont à crédit », `core/lib/z-report.ts#creditXpfPourRapport`) — n'entre ni dans `totalSalesXpf`
+ni dans `expectedXpf`, même régime que `giftCardRedeemedXpf`.
+
+**Consommateur** : surface Salon-Reference (lots B/C à venir — UI de saisie du crédit côté caisse,
+écran des échéances). Les échéances ultérieures restent un encaissement MANUEL, HORS de ce lot A.
+
+🛑 **Migration additive DÉPOSÉE (2e décision Marco du 15/09), PAS jouée, aucun accès prod** :
+`core/prisma/migrations/20260915200000_sale_due_at/migration.sql` — `Sale.dueAt DateTime?`
+(`ALTER TABLE "Sale" ADD COLUMN "dueAt" TIMESTAMP(3);`). Elle referme l'angle mort initialement
+assumé (cf. mémoire `angle-mort-declare-ne-se-referme-pas`) : `Sale.dueAt` est posé dans LA MÊME
+transaction que le passage PAID (`checkoutSale`, uniquement quand `options.credit` est fourni), et
+`toSnapshot`/`syncLoadedSale` le RELISENT depuis la DB (plus depuis un paramètre volatile de la
+requête d'origine) — donc `repairSale` et le cron `repair-sales` transmettent maintenant l'échéance
+à Core-Compta même si le 1er `createInvoice` a échoué et que la facture est recréée hors de la
+requête initiale. **Ordre à respecter avant tout déploiement, même esprit que l'entrée bon cadeau
+ci-dessous** : migration (`ops.sh migrate core-caisse`, accord Marco) → déploiement de ce Core
+(`--confirm-schema`) → déploiement des surfaces.
+
+272→296 tests verts (+24 : `lib/credit.test.ts`, +5 dans `lib/z-report.test.ts`, +2 dans
+`lib/sync.test.ts`, `lib/checkout-route.test.ts`, `lib/credit-repair.test.ts`, +1 régénéré dans
+`lib/postes.test.ts`), `tsc --noEmit` vert (`prisma generate` rejoué après ajout du champ).
+Contrôle anti-fantôme fait à deux reprises (garde crédit sabotée → 3 tests rouges → restaurée ;
+lecture `sale.dueAt` sabotée → 1 test rouge → restaurée).
+
 ## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — **MIGRATION JOUÉE + CORE DÉPLOYÉ**
 
 ✅ **En prod le 15/09.** Migration appliquée par `ops.sh migrate core-caisse` (accord Marco) :

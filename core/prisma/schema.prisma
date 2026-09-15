@@ -121,6 +121,12 @@ model Sale {
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
+  // Vente À CRÉDIT (échéancier, lot A, 2026-09-15) : date (ISO, midi UTC) de la DERNIÈRE
+  // échéance, posée UNIQUEMENT quand l'encaissement fournit `options.credit` (cf.
+  // lib/caisse.ts#checkoutSale). Lue par la reprise de synchro (repairSale / cron
+  // repair-sales) pour transmettre l'échéance à Core-Compta même si le 1er `createInvoice`
+  // a échoué et que la facture est recréée plus tard, hors de la requête d'origine.
+  dueAt       DateTime?
   // ── État de synchro post-encaissement (chantier fiabilité 2026-07, cf. lib/sync.ts) ──
   // Vente « à réparer » ⇔ status=PAID ET (comptaSyncedAt IS NULL OU stockSyncedAt IS NULL).
   // Index PARTIEL de balayage `idx_sale_sync_pending` dans prisma/rls.sql (non modélisable ici).
