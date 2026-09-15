@@ -1,6 +1,12 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — codé, NON déployé — **migration DÉPOSÉE, PAS JOUÉE**
+## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — ✅ EN PRODUCTION
+
+✅ **Accord Marco (15/09)** : migration `20260915200000_sale_due_at` **JOUÉE** en prod par
+`ops.sh migrate` (preuves RLS vertes, colonne `Sale.dueAt` vérifiée via `information_schema`), puis
+Core déployé (PR #44, release 20260915-210624). Aucune surface ne l'utilise encore : lots B (pad
+d'encaissement) et C (ligne compta dépliable) en cours dans Salon-Reference, déploiement = accord Marco.
+Les mentions « non déployé / non jouée » ci-dessous sont historiques.
 
 Branche `claude/caisse-checkout-credit` (worktree `_wt/core-caisse-credit`), tâche d'exécution
 cadrée par un Lead Opus : autoriser une vente à CRÉDIT (1er versement + échéances ultérieures)
