@@ -7,14 +7,11 @@ name: CI
 # complet (trop lent ; tsc --noEmit suffit pour la doctrine). Aucun secret : Prisma a juste
 # besoin que DATABASE_URL existe pour generer le client.
 
+# CI GitHub coupée le 2026-09-29 (Marco) : vérification en local
+# (gh-self-merge.ps1 sans -NoCiLocal / _routine/deploy/ci-local.sh). Relançable à la main.
 on:
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - '.github/**'
-      - '**/*.md'
-      - 'docs/**'
   workflow_dispatch:
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
