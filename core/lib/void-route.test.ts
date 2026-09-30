@@ -14,7 +14,8 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runVoidSale, runLockedVoidAction, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { runPreparedVoidSale, runVoidSale, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
 import type { ComptaClient, CreditNoteInput, CreditNoteResult } from "./clients.ts";
 
 const libDir = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +23,15 @@ const routeFile = path.join(libDir, "..", "app", "api", "sales", "[id]", "void",
 const caisseFile = path.join(libDir, "caisse.ts");
 
 const TENANT = "00000000-0000-4000-8000-000000000001";
+const connectionContext = new AsyncLocalStorage<{ active: number; max: number }>();
+
+async function fakeTransaction<T>(run: () => Promise<T>): Promise<T> {
+  const state = connectionContext.getStore();
+  assert.ok(state, "transaction simulée hors contexte d'annulation");
+  state.max = Math.max(state.max, ++state.active);
+  assert.equal(state.active, 1, "une transaction ne doit pas ouvrir une seconde connexion");
+  try { return await run(); } finally { state.active--; }
+}
 
 // ─── Fakes (même schéma que sync.test.ts) ─────────────────────────────────────
 
@@ -38,6 +48,7 @@ function makeSale(overrides: Partial<VoidSaleSnapshot> = {}): VoidSaleSnapshot {
 
 function makeCompta(opts: { failCreditNote?: Error } = {}) {
   const calls = { creditNote: 0 };
+  const issued = new Map<string, CreditNoteResult>();
   const client: ComptaClient = {
     async createInvoice() {
       throw new Error("non utilisé par ce test");
@@ -46,27 +57,33 @@ function makeCompta(opts: { failCreditNote?: Error } = {}) {
       throw new Error("non utilisé par ce test");
     },
     async creditNote(input: CreditNoteInput): Promise<CreditNoteResult> {
+      assert.equal(connectionContext.getStore()?.active ?? 0, 0, "Compta doit être hors transaction");
       calls.creditNote++;
       if (opts.failCreditNote) throw opts.failCreditNote;
-      return {
+      const existing = issued.get(input.invoiceId);
+      if (existing) return { ...existing, alreadyExisted: true };
+      const result: CreditNoteResult = {
         creditNoteId: "cn-1",
         number: "AVOIR-1",
         totalXpf: 0,
         alreadyExisted: false,
         origin: { id: input.invoiceId, number: "FAC-1" },
       };
+      issued.set(input.invoiceId, result);
+      return result;
     },
     receiptUrl: (invoiceId) => `http://compta/receipt/${invoiceId}`,
   };
-  return { client, calls, opts };
+  return { client, calls, opts, issued };
 }
 
 function makePersist() {
   const state = { status: "DRAFT" as string, calls: 0 };
   const persist: VoidPersist = {
-    async markVoid() {
+    async markVoid(creditNoteId) {
       state.calls++;
       state.status = "VOID";
+      return { alreadyVoid: false, creditNoteId };
     },
   };
   return { persist, state };
@@ -179,7 +196,7 @@ test("une vente inconnue rend SALE_NOT_FOUND (annulerVente)", () => {
   const debut = src.indexOf("export async function annulerVente");
   assert.ok(debut > -1, "annulerVente introuvable dans caisse.ts");
   const body = src.slice(debut);
-  assert.match(body, /if\s*\(!sale\)\s*return\s*\{\s*ok:\s*false,\s*error:\s*"SALE_NOT_FOUND"\s*\}/);
+  assert.match(body, /if \(!sale\) return \{ error: "SALE_NOT_FOUND" as const \}/);
 });
 
 test("la route d'annulation existe et exige la clé de service", () => {
@@ -200,7 +217,7 @@ test("la route mappe les erreurs sur les bons statuts HTTP", () => {
 function harness() {
   const sale = makeSale({ status: "PAID", invoiceId: "inv-1" });
   const compta = makeCompta();
-  const actions = new Map<string, string>();
+  const actions = new Map<string, { saleId: string; status: string }>();
   const tails = new Map<string, Promise<void>>();
   const sales = new Map([[sale.id, sale], ['sale-2', makeSale({ id: 'sale-2', status: 'PAID', invoiceId: 'inv-2' })]]);
   async function lock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -211,28 +228,47 @@ function harness() {
     try { return await fn(); } finally { release(); }
   }
   let failPersist = false;
-  const run = (actionId?: string, saleId = sale.id) => runLockedVoidAction({
-    async withLock(fn) {
-      const runSale = () => lock('sale:' + saleId, fn);
-      return actionId ? lock('action:' + actionId, runSale) : runSale();
-    },
-    async checkAction() {
-      return actionId && actions.has(actionId) && actions.get(actionId) !== saleId
-        ? { ok: false as const, error: "ACTION_ID_CONFLICT" as const } : null;
-    },
-    execute: () => {
-      if (actionId) actions.set(actionId, saleId);
-      return runVoidSale(sales.get(saleId)!, TENANT, compta.client, {
+  let voidWrites = 0;
+  const connectionMaxima: number[] = [];
+  const run = async (actionId?: string, saleId = sale.id) => {
+    const attempt = { active: 0, max: 0 };
+    return connectionContext.run(attempt, async () => {
+      const result = await runPreparedVoidSale({
+      async prepare() {
+        return fakeTransaction(() => {
+          const prepareSale = async () => {
+            if (actionId && actions.has(actionId) && actions.get(actionId)!.saleId !== saleId)
+              return { error: "ACTION_ID_CONFLICT" as const };
+            const current = sales.get(saleId)!;
+            if (current.status === "VOID") return current;
+            if (actionId && !actions.has(actionId)) actions.set(actionId, { saleId, status: "PENDING" });
+            return { ...current };
+          };
+          return actionId
+            ? lock('action:' + actionId, () => lock('sale:' + saleId, prepareSale))
+            : lock('sale:' + saleId, prepareSale);
+        });
+      },
+      compta: compta.client, tenantId: TENANT, reason: undefined,
+      persist: {
       async markVoid(creditNoteId) {
         if (failPersist) throw new Error("transaction interrompue");
-        sales.get(saleId)!.status = "VOID";
-        sales.get(saleId)!.creditNoteId = creditNoteId;
-        if (actionId) actions.set(actionId, saleId);
+        return fakeTransaction(() => lock('sale:' + saleId, async () => {
+          const current = sales.get(saleId)!;
+          if (current.status === "VOID") return { alreadyVoid: true, creditNoteId: current.creditNoteId ?? null };
+          voidWrites++;
+          current.status = "VOID";
+          current.creditNoteId = creditNoteId;
+          if (actionId) actions.set(actionId, { saleId, status: "DONE" });
+          return { alreadyVoid: false, creditNoteId };
+        }));
       },
+    }});
+      connectionMaxima.push(attempt.max);
+      return result;
     });
-    },
-  });
-  return { run, compta, actions, sales, setFailPersist(value: boolean) { failPersist = value; } };
+  };
+  return { run, compta, actions, sales, connectionMaxima, get voidWrites() { return voidWrites; }, setFailPersist(value: boolean) { failPersist = value; } };
 }
 
 for (const nextKey of ["key-1", "key-2"]) {
@@ -244,8 +280,20 @@ for (const nextKey of ["key-1", "key-2"]) {
     h.compta.opts.failCreditNote = undefined;
     assert.equal((await h.run(nextKey)).ok, true);
     assert.equal(h.compta.calls.creditNote, 2);
+    assert.equal(h.compta.issued.size, 1);
+    assert.ok(h.connectionMaxima.every(max => max === 1));
   });
 }
+
+test("échec Compta puis rejeu sans clé réussit et n'émet qu'un avoir", async () => {
+  const h = harness();
+  h.compta.opts.failCreditNote = new Error("timeout Compta");
+  assert.equal((await h.run(undefined)).ok, false);
+  h.compta.opts.failCreditNote = undefined;
+  assert.equal((await h.run(undefined)).ok, true);
+  assert.equal(h.compta.issued.size, 1);
+  assert.ok(h.connectionMaxima.every(max => max === 1));
+});
 
 test("succ?s puis toute cle ou aucune rend l'avoir existant", async () => {
   const h = harness();
@@ -254,6 +302,7 @@ test("succ?s puis toute cle ou aucune rend l'avoir existant", async () => {
     assert.deepEqual(await h.run(key), { ok: true, alreadyVoid: true, creditNoteId: "cn-1" });
   }
   assert.equal(h.compta.calls.creditNote, 1);
+  assert.ok(h.connectionMaxima.every(max => max === 1));
 });
 
 for (const keys of [[undefined, "key-1"], ["key-1", undefined], ["key-1", "key-2"]]) {
@@ -261,7 +310,9 @@ for (const keys of [[undefined, "key-1"], ["key-1", undefined], ["key-1", "key-2
     const h = harness();
     const results = await Promise.all(keys.map(key => h.run(key)));
     assert.equal(results.filter(r => r.ok && !r.alreadyVoid).length, 1);
-    assert.equal(h.compta.calls.creditNote, 1);
+    assert.equal(h.compta.calls.creditNote, 2);
+    assert.equal(h.compta.issued.size, 1);
+    assert.ok(h.connectionMaxima.every(max => max === 1));
   });
 }
 
@@ -281,6 +332,15 @@ test("meme cle sur une autre vente : conflit", async () => {
   assert.equal(h.compta.calls.creditNote, 1);
 });
 
+test("deux annulations legacy simultanées effectuent une seule écriture VOID", async () => {
+  const h = harness();
+  await Promise.all([h.run(), h.run()]);
+  assert.equal(h.sales.get("sale-1")!.status, "VOID");
+  assert.equal(h.voidWrites, 1);
+  assert.equal(h.compta.issued.size, 1);
+  assert.ok(h.connectionMaxima.every(max => max === 1));
+});
+
 test("route actionId UUID", () => {
  const body = readRoute();
  assert.match(body, /Idempotency-Key/);
@@ -295,14 +355,16 @@ test("migration additive avec index action et RLS", () => {
  assert.doesNotMatch(migration, /DROP/i);
 });
 
-test("production wiring uses short row transactions and ordered advisory locks", () => {
+test("production wiring uses short preparation and finalization transactions", () => {
  const src = readCaisse();
  const body = src.slice(src.indexOf("export async function annulerVente"), src.indexOf("export type LoyaltyProgramView"));
- assert.match(body, /prisma\.\$transaction/);
- assert.match(body, /lockSaleRow\(prepareTx, saleId, safeTenantId\)/);
- assert.ok(body.indexOf("lockSaleRow") < body.indexOf("prepareTx.sale.findFirst"));
+ assert.doesNotMatch(body, /prisma\.\$transaction/);
+ assert.match(body, /lockSaleRow\(tx, saleId, safeTenantId\)/);
+ const prepareBody = body.slice(body.indexOf("async prepare()"), body.indexOf("compta: comptaClient()"));
+ assert.ok(prepareBody.indexOf("lockSaleRow") < prepareBody.indexOf("tx.sale.findFirst"));
  assert.match(body, /tx\.sale\.update/);
- assert.match(body, /prepareTx\.voidAction\.upsert/);
+ assert.match(body, /voidAction\.create\(\{ data: \{ tenantId: safeTenantId, saleId, actionId, status: "PENDING" \} \}\)/);
+ assert.match(body, /status: "DONE"/);
  assert.doesNotMatch(body, /ACTION_IN_PROGRESS|ACTION_ALREADY_USED|getSale\(/);
  assert.match(readRoute(), /catch\s*\{/);
  assert.doesNotMatch(readRoute(), /ACTION_IN_PROGRESS|ACTION_ALREADY_USED/);
@@ -333,11 +395,13 @@ test("production wiring uses short row transactions and ordered advisory locks",
   await Promise.all([h.run('key-1'), h.run('key-2', 'sale-2')]);
   assert.equal(h.compta.calls.creditNote, 2);
  });
- test("preparation et finalisation courtes, Compta hors verrou de ligne", () => {
+test("préparation et finalisation courtes, Compta hors verrou de ligne", () => {
   const src = readCaisse();
   const body = src.slice(src.indexOf('export async function annulerVente'), src.indexOf('export type LoyaltyProgramView'));
-  assert.ok(body.indexOf("'action:'") < body.indexOf("'sale:'"));
-  assert.ok(body.indexOf('prepareTx.voidAction.upsert') < body.indexOf('return runVoidSale'));
-  assert.match(body, /await withTenant\(safeTenantId, async \(tx\)/);
-  assert.ok(body.indexOf("await lockVoidResource") < body.indexOf("lockSaleRow(prepareTx"));
+  const prepareBody = body.slice(body.indexOf("async prepare()"), body.indexOf("compta: comptaClient()"));
+  assert.ok(prepareBody.indexOf("lockVoidResource(tx, safeTenantId, 'action:'") < prepareBody.indexOf("lockSaleRow(tx"));
+  assert.ok(body.indexOf('voidAction.create') > body.indexOf('async prepare()'));
+  assert.doesNotMatch(body, /prisma\.\$transaction\s*\(/);
+  assert.equal((body.match(/withTenant\(safeTenantId, async \(tx\)/g) ?? []).length, 2);
+ assert.ok(prepareBody.indexOf("lockVoidResource") < prepareBody.indexOf("lockSaleRow(tx"));
  });

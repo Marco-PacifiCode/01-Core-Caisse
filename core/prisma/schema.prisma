@@ -436,6 +436,7 @@ model VoidAction {
   tenantId  String   @db.Uuid
   actionId  String   @db.Uuid
   saleId    String   @db.Uuid
+  status    String   @default("PENDING")
   outcome   Json?
   createdAt DateTime @default(now())
 

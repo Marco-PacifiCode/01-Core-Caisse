@@ -4,6 +4,7 @@ CREATE TABLE "VoidAction" (
   "tenantId" UUID NOT NULL,
   "actionId" UUID NOT NULL,
   "saleId" UUID NOT NULL,
+  "status" TEXT NOT NULL DEFAULT 'PENDING',
   "outcome" JSONB,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "VoidAction_pkey" PRIMARY KEY ("id")

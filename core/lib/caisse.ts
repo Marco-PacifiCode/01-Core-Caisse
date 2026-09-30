@@ -37,7 +37,7 @@ import {
   type GiftCardRefusal,
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
-import { runVoidSale, runLockedVoidAction, type VoidPersist } from "./void-sale";
+import { runPreparedVoidSale, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
   type PaymentCorrectionDeps,
@@ -1295,62 +1295,57 @@ export async function annulerVente(
   const safeTenantId = assertTenantId(tenantId);
   const actionId = opts?.actionId?.toLowerCase();
   try {
-    return await prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
-      return runLockedVoidAction<AnnulerVenteResult>({
-        async withLock(run) {
-          // Ordre invariant : cle, puis vente. Aucun verrou de ligne pendant Compta.
-          if (actionId) await lockVoidResource(tx, safeTenantId, 'action:' + actionId);
-          await lockVoidResource(tx, safeTenantId, 'sale:' + saleId.toLowerCase());
-          return run();
-        },
-        async checkAction() {
-          if (!actionId) return null;
-          const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
-          return existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()
-            ? { ok: false, error: "ACTION_ID_CONFLICT" } : null;
-        },
-        async execute() {
-          const sale = await withTenant(safeTenantId, async (prepareTx) => {
-            if (!await lockSaleRow(prepareTx, saleId, safeTenantId)) return null;
-            const snapshot = await prepareTx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
-            // Reservation durable : outcome null reste rejouable sur la meme vente,
-            // meme apres une interruption. Aucun etat bloquant n'est ajoute a Sale.
-            if (snapshot && actionId) await prepareTx.voidAction.upsert({
-              where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
-              create: { tenantId: safeTenantId, saleId, actionId }, update: {},
-            });
-            return snapshot;
-          });
-          if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
-          // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
-          // Core-Compta verrouillé).
-          const persist: VoidPersist = {
-            async markVoid(creditNoteId) {
-              await withTenant(safeTenantId, async (tx) => {
-                if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
-                const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
-                if (!sale) throw new Error("SALE_NOT_FOUND");
-                if (sale.status !== "VOID") {
-                  await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
-                  if (sale.status === "PAID") {
-                    await reverseSaleLoyalty(tx, { tenantId, saleId });
-                  }
-                }
-                if (actionId) await tx.voidAction.update({
-                  where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
-                  data: { outcome: { ok: true, alreadyVoid: false, creditNoteId } },
-                });
+    // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
+    // Core-Compta verrouillé).
+    // Préparation : le verrou de clé arbitre les clés inter-ventes ; le verrou de vente
+    // protège la lecture et la réservation. Rien n'est tenu pendant l'appel Compta.
+    const persist: VoidPersist = {
+      async markVoid(creditNoteId) {
+        return withTenant(safeTenantId, async (tx) => {
+          if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
+          const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
+          if (!current) throw new Error("SALE_NOT_FOUND");
+          const sale = current;
+          if (current.status === "VOID") {
+            if (actionId) {
+              const action = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
+              if (action && action.saleId.toLowerCase() === saleId.toLowerCase()) await tx.voidAction.update({
+                where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
+                data: { status: "DONE", outcome: { ok: true, alreadyVoid: true, creditNoteId: current.creditNoteId ?? null } },
               });
-            },
-          };
-          // origin/main appelait Compta hors verrou de ligne : preserver ce comportement.
-          // La cle Compta deterministe (facture, total) protege le rejeu apres un
-          // avoir acquis mais une finalisation echouee ; la vente reste rejouable.
-          return runVoidSale(sale, safeTenantId, comptaClient(), persist, opts);
-        },
-      });
-    }, { timeout: 15000 }); // Compta borne a 8 s, hors verrou de ligne.
+            }
+            return { alreadyVoid: true, creditNoteId: current.creditNoteId ?? null };
+          }
+          await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
+          if (sale.status === "PAID") {
+            await reverseSaleLoyalty(tx, { tenantId, saleId });
+          }
+          if (actionId) await tx.voidAction.update({
+            where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
+            data: { status: "DONE", outcome: { ok: true, alreadyVoid: false, creditNoteId } },
+          });
+          return { alreadyVoid: false, creditNoteId };
+        });
+      },
+    };
+    return await runPreparedVoidSale({
+      async prepare() {
+        return withTenant(safeTenantId, async (tx) => {
+          if (actionId) await lockVoidResource(tx, safeTenantId, 'action:' + actionId);
+          if (!await lockSaleRow(tx, saleId, safeTenantId)) return { error: "SALE_NOT_FOUND" as const };
+          const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
+          if (!sale) return { error: "SALE_NOT_FOUND" as const };
+          if (sale.status === "VOID") return sale;
+          if (actionId) {
+            const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
+            if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { error: "ACTION_ID_CONFLICT" as const };
+            if (!existing) await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId, actionId, status: "PENDING" } });
+          }
+          return sale;
+        });
+      },
+      compta: comptaClient(), tenantId: safeTenantId, persist, reason: opts?.reason,
+    });
   } catch (error) {
     // Defense supplementaire : la cle est verifiee sous verrou avant Compta.
     if (actionId && error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
