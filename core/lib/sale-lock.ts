@@ -102,3 +102,14 @@ export async function lockSaleRow(
     throw err;
   }
 }
+
+/** Verrou d'annulation transactionnel, toujours cle puis vente. */
+export async function lockVoidResource(tx: Prisma.TransactionClient, tenantId: string, resource: string): Promise<void> {
+  try {
+    await tx.$executeRaw`SELECT set_config('lock_timeout', ${SALE_LOCK_TIMEOUT}, true)`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId.toLowerCase() + ':' + resource}, 0))`;
+  } catch (err) {
+    if (isLockTimeout(err)) throw new SaleLockTimeoutError();
+    throw err;
+  }
+}

@@ -201,30 +201,38 @@ function harness() {
   const sale = makeSale({ status: "PAID", invoiceId: "inv-1" });
   const compta = makeCompta();
   const actions = new Map<string, string>();
-  let tail = Promise.resolve();
+  const tails = new Map<string, Promise<void>>();
+  const sales = new Map([[sale.id, sale], ['sale-2', makeSale({ id: 'sale-2', status: 'PAID', invoiceId: 'inv-2' })]]);
+  async function lock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    tails.set(key, new Promise<void>(resolve => { release = resolve; }));
+    await previous;
+    try { return await fn(); } finally { release(); }
+  }
   let failPersist = false;
   const run = (actionId?: string, saleId = sale.id) => runLockedVoidAction({
     async withLock(fn) {
-      const previous = tail;
-      let release!: () => void;
-      tail = new Promise<void>(resolve => { release = resolve; });
-      await previous;
-      try { return await fn(); } finally { release(); }
+      const runSale = () => lock('sale:' + saleId, fn);
+      return actionId ? lock('action:' + actionId, runSale) : runSale();
     },
     async checkAction() {
       return actionId && actions.has(actionId) && actions.get(actionId) !== saleId
         ? { ok: false as const, error: "ACTION_ID_CONFLICT" as const } : null;
     },
-    execute: () => runVoidSale(sale, TENANT, compta.client, {
+    execute: () => {
+      if (actionId) actions.set(actionId, saleId);
+      return runVoidSale(sales.get(saleId)!, TENANT, compta.client, {
       async markVoid(creditNoteId) {
         if (failPersist) throw new Error("transaction interrompue");
-        sale.status = "VOID";
-        sale.creditNoteId = creditNoteId;
+        sales.get(saleId)!.status = "VOID";
+        sales.get(saleId)!.creditNoteId = creditNoteId;
         if (actionId) actions.set(actionId, saleId);
       },
-    }),
+    });
+    },
   });
-  return { run, compta, actions, setFailPersist(value: boolean) { failPersist = value; } };
+  return { run, compta, actions, sales, setFailPersist(value: boolean) { failPersist = value; } };
 }
 
 for (const nextKey of ["key-1", "key-2"]) {
@@ -232,14 +240,14 @@ for (const nextKey of ["key-1", "key-2"]) {
     const h = harness();
     h.compta.opts.failCreditNote = new Error("timeout Compta");
     assert.equal((await h.run("key-1")).ok, false);
-    assert.equal(h.actions.size, 0);
+    assert.equal(h.actions.size, 1);
     h.compta.opts.failCreditNote = undefined;
     assert.equal((await h.run(nextKey)).ok, true);
     assert.equal(h.compta.calls.creditNote, 2);
   });
 }
 
-test("succ?s puis toute cl? ou aucune rend l'avoir existant", async () => {
+test("succ?s puis toute cle ou aucune rend l'avoir existant", async () => {
   const h = harness();
   await h.run("key-1");
   for (const key of ["key-1", "key-2", undefined]) {
@@ -257,16 +265,16 @@ for (const keys of [[undefined, "key-1"], ["key-1", undefined], ["key-1", "key-2
   });
 }
 
-test("exception de transaction : aucune action et rejeu permis", async () => {
+test("exception de finalisation : reservation rejouable", async () => {
   const h = harness();
   h.setFailPersist(true);
   await assert.rejects(h.run("key-1"), /transaction interrompue/);
-  assert.equal(h.actions.size, 0);
+  assert.equal(h.actions.size, 1);
   h.setFailPersist(false);
   assert.equal((await h.run("key-1")).ok, true);
 });
 
-test("m?me cl? sur une autre vente : conflit", async () => {
+test("meme cle sur une autre vente : conflit", async () => {
   const h = harness();
   await h.run("key-1");
   assert.deepEqual(await h.run("key-1", "sale-2"), { ok: false, error: "ACTION_ID_CONFLICT" });
@@ -287,15 +295,49 @@ test("migration additive avec index action et RLS", () => {
  assert.doesNotMatch(migration, /DROP/i);
 });
 
-test("production wiring uses one transaction and the common sale lock", () => {
+test("production wiring uses short row transactions and ordered advisory locks", () => {
  const src = readCaisse();
  const body = src.slice(src.indexOf("export async function annulerVente"), src.indexOf("export type LoyaltyProgramView"));
  assert.match(body, /prisma\.\$transaction/);
- assert.match(body, /lockSaleRow\(tx, saleId, safeTenantId\)/);
- assert.ok(body.indexOf("lockSaleRow") < body.indexOf("tx.sale.findFirst"));
+ assert.match(body, /lockSaleRow\(prepareTx, saleId, safeTenantId\)/);
+ assert.ok(body.indexOf("lockSaleRow") < body.indexOf("prepareTx.sale.findFirst"));
  assert.match(body, /tx\.sale\.update/);
- assert.match(body, /tx\.voidAction\.create/);
- assert.doesNotMatch(body, /Reservation|ACTION_IN_PROGRESS|ACTION_ALREADY_USED|getSale\(/);
+ assert.match(body, /prepareTx\.voidAction\.upsert/);
+ assert.doesNotMatch(body, /ACTION_IN_PROGRESS|ACTION_ALREADY_USED|getSale\(/);
  assert.match(readRoute(), /catch\s*\{/);
  assert.doesNotMatch(readRoute(), /ACTION_IN_PROGRESS|ACTION_ALREADY_USED/);
 });
+
+ test("deux ventes simultanees, meme cle : un seul avoir, conflit sans mutation", async () => {
+  const h = harness();
+  const results = await Promise.all([h.run('key-1'), h.run('key-1', 'sale-2')]);
+  assert.deepEqual(results[1], { ok: false, error: 'ACTION_ID_CONFLICT' });
+  assert.equal(h.compta.calls.creditNote, 1);
+  assert.equal(h.sales.get('sale-1')!.status, 'VOID');
+  assert.equal(h.sales.get('sale-2')!.status, 'PAID');
+  assert.equal(h.sales.get('sale-2')!.creditNoteId, undefined);
+  assert.equal((await h.run('key-2', 'sale-2')).ok, true);
+  assert.equal(h.sales.get('sale-2')!.status, 'VOID');
+ });
+ test("les verrous independants permettent deux ventes en parallele", async () => {
+  const h = harness();
+  let entered = 0;
+  let release!: () => void;
+  const both = new Promise<void>(resolve => { release = resolve; });
+  const original = h.compta.client.creditNote;
+  h.compta.client.creditNote = async input => {
+    if (++entered === 2) release();
+    await both;
+    return original(input);
+  };
+  await Promise.all([h.run('key-1'), h.run('key-2', 'sale-2')]);
+  assert.equal(h.compta.calls.creditNote, 2);
+ });
+ test("preparation et finalisation courtes, Compta hors verrou de ligne", () => {
+  const src = readCaisse();
+  const body = src.slice(src.indexOf('export async function annulerVente'), src.indexOf('export type LoyaltyProgramView'));
+  assert.ok(body.indexOf("'action:'") < body.indexOf("'sale:'"));
+  assert.ok(body.indexOf('prepareTx.voidAction.upsert') < body.indexOf('return runVoidSale'));
+  assert.match(body, /await withTenant\(safeTenantId, async \(tx\)/);
+  assert.ok(body.indexOf("await lockVoidResource") < body.indexOf("lockSaleRow(prepareTx"));
+ });
