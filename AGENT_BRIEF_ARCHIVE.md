@@ -3,6 +3,201 @@
 > Historique purge du brief le 2026-08-05 (regle : garder ~2 semaines dans le brief vif).
 > Sections deplacees telles quelles, rien n'a ete reecrit.
 
+# Lot archivé le 2026-10-01 — sections datées avant le 2026-09-17
+
+> Déplacées telles quelles depuis `AGENT_BRIEF.md` par `_routine/brief-archive.py`.
+
+## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — ✅ LIVRÉ le 16/09 (PR #47, main 434de39)
+
+Branche `claude/caisse-fidelite-moteur-20260916` (worktree jetable `_wt/caisse-fidelite-c2`,
+empilée sur C1, base `235b5d9`), tâche d'exécution cadrée. **Ne déploie rien, aucune commande
+contre la prod** — même mandat que C1.
+
+**Nouveau `core/lib/loyalty-db.ts`, écritures DB** (reçoit `tx`, testable par un FAUX `tx` en
+mémoire, sans DB ni contexte Next — `lib/loyalty-checkout.test.ts`) : `lockAccount` (upsert +
+`FOR UPDATE`), `insertEntry` (P2002 → `{duplicate:true}`, jamais levé), `creditVisit`,
+`creditPoints`, `redeemReward` (update conditionnel `redeemedAt: null`, symétrique du bon
+cadeau), `reverseSale` (reprise à l'annulation), `adjustLoyalty` (correction ADMIN),
+`accountSummary` (lecture pure). 🔴 **Correctif QA du 2026-09-16 : `issueRewardsForDelta`
+(delta de quotients) remplacée par `issueRewardsWhileNetReached` (retour au plan §2.2, au
+pied de la lettre).** Défaut prouvé sur l'ancienne version : elle comparait
+`Math.floor(sumAvant/N)` à `Math.floor(sumAprès/N)`, un quotient entier qui MENT dès que le
+solde net devient négatif (REWARD retranche N, REVERSAL et ADJUST peuvent être négatifs ;
+`Math.floor` arrondit vers -∞). Deux cas reproduits par la QA : (a) vente de 600 pts (seuil
+500) → 1 récompense, net 100 ; annulation → net -500 ; vente de 500 pts → une 2ᵉ récompense
+était créée à tort (la cliente n'avait pourtant gagné que 500 pts nets) ; (b) 5 visites → 1
+récompense (net 0) ; correction ADMIN de -3 → net -3 ; 3 visites de plus → une 2ᵉ récompense
+à tort. `issueRewardsWhileNetReached` ne divise plus jamais : sous le verrou de compte, elle
+calcule le net APRÈS la ligne déclenchante, puis consomme ce net par tranches de N
+(`while (net >= N) { REWARD(-N) ; net -= N }`, `ref = reward:<triggerRef>:<i>`, borne de
+sécurité 1000 itérations). `rewardsToCreate` (le quotient pur) a été retirée de `loyalty.ts`
+— un solde de fidélité est signé, un quotient entier ne s'applique qu'à un solde qui ne
+descend jamais sous zéro. Tests couvrant les deux cas QA + rejeu + franchissement multiple en
+une seule fournée : `loyalty-checkout.test.ts`.
+
+**`checkoutSale`** (`lib/caisse.ts`) gagne `options.loyalty` (rattache la vente à une fiche
+pour créditer des points en mode `POINTS`) et `options.redeemLoyalty` (consomme une
+récompense). Contrôle de forme + disponibilité de la récompense **avant** tout paiement
+persisté (même schéma que les bons cadeaux) ; consommation + crédit de points **dans** la
+transaction du passage à PAID, **après** les bons. Course entre deux comptoirs → `LOYALTY_RACE`,
+traitée comme `GIFT_CARD_RACE`. Rejeu d'une vente déjà PAID → retour anticipé, **aucune**
+écriture fidélité (le bloc est après ce retour).
+
+💰 **`giftCardSalesXpf` (6ᵉ paramètre de `pointsForSale`, décision Marco du 15/09 sur C1)** :
+calculé en sommant les `amountXpf` de `giftCardsToIssue` (les bons émis PAR cette vente,
+donnée d'entrée déjà validée) — jamais en inspectant les lignes ni en relisant `GiftCard` en
+base. Test : ticket 3 000 F prestations + bon 10 000 F émis, assiette `ALL` → 30 points.
+
+**`annulerVente`** : reprise fidélité (`reverseSale`) dans la **même** transaction que le
+passage à VOID, **uniquement** si la vente était PAID (une vente DRAFT n'a jamais rien écrit
+en fidélité). Un avoir émis **directement** depuis Core-Compta (verrouillé) ne repasse pas par
+`annulerVente` : commentaire `TODO fidélité` laissé à cet endroit, reprise **non automatique**
+dans ce lot (correction ADMIN manuelle prévue plus tard) — décision Marco du 15/09.
+
+**Routes** (`app/api/loyalty/{program,accounts,visits,adjust}/route.ts`), gardées par
+`hasServiceKey`, sur le modèle de `app/api/gift-cards/route.ts` : `GET/PUT /program`,
+`GET /accounts` (50 fiches au plus, lecture pure — aucune fiche créée), `POST /visits`
+(best-effort côté appelant, silencieux ici), `POST /adjust` (ADMIN, motif ≥ 3 caractères,
+`ref` préfixé `adjust:`). 🔒 **Droits (décision Marco #2)** : la garde de rôle (ADMIN vs
+`caisse`) vit côté SURFACE — ce Core ne connaît que la clé de service S2S, rien n'est
+réinventé ici.
+
+**+29 tests** dans `lib/loyalty-checkout.test.ts` (18 exécutés réellement sur le moteur DB via
+faux `tx`, 11 structurels sur `checkoutSale`/`annulerVente`) → **343 tests** au total, tous
+verts. `tsc --noEmit` et `prisma validate` verts. Contrôle anti-fantôme fait : sabotage de
+`redeemReward` (retrait de `redeemedAt: null` du `where`) → les 2 tests de double consommation
+rougissent → restauré → suite verte.
+
+🛑 **Ne fait PAS** : jouer la migration C1, déployer ce Core, ni aucune surface. **Ordre
+impératif avant tout déploiement** : migration C1 (`ops.sh migrate core-caisse`, accord
+Marco) → `rls.sql` rejoué → déploiement de ce Core → écrans surface (hors de ce lot). Argent
+en jeu (points/récompenses) → accord Marco explicite avant tout `ng-deploy`.
+
+### 🔴 2026-09-16 — 3 correctifs contre-QA (câblage, plafond, remise à zéro)
+
+**1. Câblage manquant, corrigé** : `app/api/sales/[id]/checkout/route.ts` ne transmettait ni
+`loyalty` ni `redeemLoyalty` à `checkoutSale` — **aucune route HTTP n'atteignait le moteur de
+fidélité**, S2 (crédit de points au checkout) était inopérant côté surface bien que le moteur
+soit prêt côté Core. Ajouté : lecture + validation du corps (`loyalty.clientFicheId` UUID,
+`loyalty.displayName` 1-200 car., `redeemLoyalty.rewardEntryId` UUID → 400 sinon), transmission
+dans `options`, et mapping des erreurs `LOYALTY_NOT_REDEEMABLE`/`LOYALTY_AMOUNT_MISMATCH`/
+`LOYALTY_ACCOUNT_MISMATCH` sur 409 (même famille que les bons cadeaux). Tests dans
+`lib/checkout-route.test.ts` (contrat figé par lecture de source, même limite que les tests
+`credit`/`paidAt` du même fichier).
+
+**2. Plafond sans exception, corrigé** : `issueRewardsWhileNetReached` LEVAIT
+`LoyaltyRewardOverflowError` au-delà de 1000 récompenses en un seul événement — atteignable avec
+un réglage extrême (1 point pour une récompense, ticket à 100 pts/100F ⇒ des dizaines de milliers
+de points d'un coup), et la boucle tournant DANS la transaction du passage à PAID, l'exception
+pouvait faire échouer un encaissement **après persistance des paiements**. Décision : ne lève
+plus jamais — s'arrête à `MAX_REWARDS_PER_EVENT` (1000) récompenses pour CET événement, `log.warn`
+(compte + nombre émis), et le net excédentaire (encore ≥ perReward) N'EST PAS PERDU : il reste
+dans le journal et sera repris par le PROCHAIN événement sur ce compte. `LoyaltyRewardOverflowError`
+supprimée (plus aucun appelant). `POST /api/loyalty/adjust` protégé par un `try/catch` → 500 JSON
+propre (`{error:"Erreur interne"}`, jamais de pile), même schéma que
+`app/api/cron/repair-sales/route.ts`. Test : ADJUST de +100 000 points au seuil 1 → exactement
+1000 récompenses créées, pas d'exception, net 99 000 ; l'événement suivant en crée 1000 de plus.
+
+**3. Remise à zéro au changement de forme/réactivation — DÉCISION MARCO (15/09)** : « À chaque
+changement de forme ou réactivation, le compteur et les points repartent de zéro, comme au
+premier jour. Les récompenses déjà gagnées restent dues. »
+- `nextActivatedAt` (lib/loyalty.ts) pose `now` dès que `nextMode !== "OFF"` ET
+  `nextMode !== prevMode` (OFF → actif, ou changement de forme active) ; inchangé si la forme
+  reste la même (changer N ou un pourcentage ne remet rien à zéro), et inchangé au passage à
+  `OFF` (couper ne remet rien à zéro — seule une RÉACTIVATION le fait).
+- `sumVisits`/`sumPoints` (`lib/loyalty-db.ts`, moteur net utilisé par
+  `issueRewardsWhileNetReached` ET `accountSummary`) n'agrègent QUE les lignes
+  `occurredAt >= activatedAt`, quel que soit leur `kind` (VISIT/POINTS/ADJUST/REWARD/REVERSAL) ;
+  `activatedAt` NULL → 0 compté. `creditPoints` gagne la même garde d'écriture que `creditVisit`
+  (`occurredAt < activatedAt` → rien n'est écrit — utile pour un règlement différé d'une caisse
+  hors ligne antérieur à l'activation).
+- La disponibilité d'une récompense (`isRewardAvailable`) NE dépend PAS de `activatedAt` — une
+  récompense gagnée avant un changement reste consommable après.
+- `accountSummary` renvoie désormais aussi `activatedAt` (affichage écran) et calcule le
+  programme réel via `tx.loyaltyProgram.findFirst` au lieu d'un paramètre implicite.
+- Tests dans `lib/loyalty-checkout.test.ts` : 3 visites VISITS N=5 → POINTS → VISITS → 2 visites
+  → 0 récompense, net 2 ; récompense gagnée → OFF → réactivation → récompense toujours
+  disponible, compteur à 0 ; changement de N sans changement de forme → net conservé. Sabotage
+  (retrait du filtre `occurredAt >= activatedAt`) → le premier de ces tests rougit → restauré.
+
+**Suite** : 360 tests, tous verts (`npm test`). `tsc --noEmit` et `prisma validate` verts.
+
+🔴 **2026-09-16, correctif contre-QA supplémentaire** : `reverseSale` posait `occurredAt: new Date()` sur ses `REVERSAL` (l'instant de l'annulation, pas celui du crédit annulé), ce qui faisait entrer la reprise d'un ticket ancien dans le NET du cycle courant après une réactivation — corrigé en reprenant l'`occurredAt` de la ligne `POINTS`/`REDEEM` d'origine (`reverseSaleLoyalty` n'a donc plus besoin d'`occurredAt` en entrée) ; suite à 365 tests, tous verts.
+
+## 💳 2026-09-15 — VENTE À CRÉDIT (échéancier, lot A) — ✅ EN PRODUCTION
+
+✅ **Accord Marco (15/09)** : migration `20260915200000_sale_due_at` **JOUÉE** en prod par
+`ops.sh migrate` (preuves RLS vertes, colonne `Sale.dueAt` vérifiée via `information_schema`), puis
+Core déployé (PR #44, release 20260915-210624). Aucune surface ne l'utilise encore : lots B (pad
+d'encaissement) et C (ligne compta dépliable) en cours dans Salon-Reference, déploiement = accord Marco.
+Les mentions « non déployé / non jouée » ci-dessous sont historiques.
+
+Branche `claude/caisse-checkout-credit` (worktree `_wt/core-caisse-credit`), tâche d'exécution
+cadrée par un Lead Opus : autoriser une vente à CRÉDIT (1er versement + échéances ultérieures)
+sans casser le chemin existant.
+
+**But** : `checkoutSale` peut désormais passer une vente PAID sous-payée quand l'appelant fournit
+`credit: { dueAt }` (YYYY-MM-DD, dernière échéance) — le 1er versement est libre, strictement > 0,
+encaissé le jour même (décision Marco 15/09). Sans `credit`, comportement **strictement inchangé**
+(garde UNDERPAID classique). Nouveaux refus AVANT encaissement : `CREDIT_NOT_NEEDED` (payé ≥ total,
+409) et `CREDIT_NEEDS_DEPOSIT` (payé ≤ 0, 422). Route `POST /api/sales/:id/checkout` : `credit.dueAt`
+invalide → 400. Décision pure extraite dans `core/lib/credit.ts` (`checkoutUnderpaidGuard`,
+`parseDueAt`, `dueAtNoonUtcIso` — ancrage MIDI UTC, piège +11 NC).
+
+**Argent — accord Marco requis avant déploiement.** Cette branche touche l'encaissement et la
+facturation ; elle n'a **pas** été déployée par cet exécutant (interdiction du mandat). Le Z
+(`closeSession`) compte toujours UNIQUEMENT l'encaissé et expose une ligne informative `creditXpf`
+(« dont à crédit », `core/lib/z-report.ts#creditXpfPourRapport`) — n'entre ni dans `totalSalesXpf`
+ni dans `expectedXpf`, même régime que `giftCardRedeemedXpf`.
+
+**Consommateur** : surface Salon-Reference (lots B/C à venir — UI de saisie du crédit côté caisse,
+écran des échéances). Les échéances ultérieures restent un encaissement MANUEL, HORS de ce lot A.
+
+🛑 **Migration additive DÉPOSÉE (2e décision Marco du 15/09), PAS jouée, aucun accès prod** :
+`core/prisma/migrations/20260915200000_sale_due_at/migration.sql` — `Sale.dueAt DateTime?`
+(`ALTER TABLE "Sale" ADD COLUMN "dueAt" TIMESTAMP(3);`). Elle referme l'angle mort initialement
+assumé (cf. mémoire `angle-mort-declare-ne-se-referme-pas`) : `Sale.dueAt` est posé dans LA MÊME
+transaction que le passage PAID (`checkoutSale`, uniquement quand `options.credit` est fourni), et
+`toSnapshot`/`syncLoadedSale` le RELISENT depuis la DB (plus depuis un paramètre volatile de la
+requête d'origine) — donc `repairSale` et le cron `repair-sales` transmettent maintenant l'échéance
+à Core-Compta même si le 1er `createInvoice` a échoué et que la facture est recréée hors de la
+requête initiale. **Ordre à respecter avant tout déploiement, même esprit que l'entrée bon cadeau
+ci-dessous** : migration (`ops.sh migrate core-caisse`, accord Marco) → déploiement de ce Core
+(`--confirm-schema`) → déploiement des surfaces.
+
+272→296 tests verts (+24 : `lib/credit.test.ts`, +5 dans `lib/z-report.test.ts`, +2 dans
+`lib/sync.test.ts`, `lib/checkout-route.test.ts`, `lib/credit-repair.test.ts`, +1 régénéré dans
+`lib/postes.test.ts`), `tsc --noEmit` vert (`prisma generate` rejoué après ajout du champ).
+Contrôle anti-fantôme fait à deux reprises (garde crédit sabotée → 3 tests rouges → restaurée ;
+lecture `sale.dueAt` sabotée → 1 test rouge → restaurée).
+
+## 🎁 2026-09-15 — BON CADEAU CONSOMMÉ LIÉ AU RDV — **MIGRATION JOUÉE + CORE DÉPLOYÉ**
+
+✅ **En prod le 15/09.** Migration appliquée par `ops.sh migrate core-caisse` (accord Marco) :
+colonne `GiftCard.redeemedAppointmentId text NULL` vérifiée dans `information_schema`, `rls.sql`
+rejoué, isolation prouvée sous le rôle applicatif sur les 6 tables, sauvegarde de structure
+`C:\dev\_backup\core-caisse\ops-migrate-core-caisse-20260915T054704Z-avant.sql`. Puis Core
+déployé (PR #42, `main` = `2e5834f`, release `20260915-165401`) ; preuve bout en bout
+`GET /api/gift-cards` → 200. Retour arrière colonne : `DROP COLUMN "redeemedAppointmentId"`.
+Consommateur : surface Ellément (lot C2) ; V-Cut peut suivre avec le même code surface.
+
+Tâche d'exécution cadrée : lier un bon cadeau consommé au rendez-vous qu'il a réglé, pour qu'un RDV honoré par un
+bon SEUL (pas de reliquat en espèces/CB) ne reste pas affiché « à encaisser » côté surface.
+
+`GiftCard.redeemedAppointmentId` (nullable, sans FK, même patron que `Sale.sourceId`) est
+renseigné à la consommation par `checkoutSale` quand la vente EST le RDV honoré
+(`sale.sourceType === "rdv"`), et transmissible aussi via `POST /api/gift-cards/:id/redeem`.
+272 tests verts (271 + 1), `tsc --noEmit` vert, `prisma validate` vert.
+
+**Migration additive** (jouée le 15/09, cf. ci-dessus) :
+`core/prisma/migrations/20260915120000_gift_card_redeemed_appointment/migration.sql`.
+
+🛑 **Ordre impératif à respecter** : migration → déploiement de ce Core (avec
+`--confirm-schema`) → déploiement des surfaces qui lisent le nouveau champ. Si ce Core part
+**avant** la migration, la lecture des bons cadeaux casse pour **tous** les marchands (colonne
+attendue par le code, absente en base).
+
+
 # Lot archivé le 2026-09-29 — sections datées avant le 2026-09-15
 
 > Déplacées telles quelles depuis `AGENT_BRIEF.md` par `_routine/brief-archive.py`.
