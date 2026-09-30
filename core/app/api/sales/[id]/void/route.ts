@@ -37,7 +37,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const normalizedHeaderActionId = headerActionId?.toLowerCase();
   const normalizedBodyActionId = body.actionId?.toLowerCase();
   if (normalizedHeaderActionId && normalizedBodyActionId && normalizedHeaderActionId !== normalizedBodyActionId) {
-    return NextResponse.json({ error: "ACTION_ID_CONFLICT" }, { status: 409 });
+    return NextResponse.json({ error: "ACTION_ID_CONFLICT" }, { status: 400 });
   }
   const rawActionId = normalizedHeaderActionId ?? normalizedBodyActionId;
   if (rawActionId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawActionId)) {
@@ -45,7 +45,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
   const actionId = rawActionId;
 
-  const result = await annulerVente(tenantId, saleId, { ...(reason ? { reason } : {}), ...(actionId ? { actionId } : {}) });
+  let result;
+  try {
+    result = await annulerVente(tenantId, saleId, { ...(reason ? { reason } : {}), ...(actionId ? { actionId } : {}) });
+  } catch {
+    return NextResponse.json({ ok: false, error: "VOID_FAILED" }, { status: 502 });
+  }
 
   if (!result.ok) {
     const map: Record<string, number> = {
@@ -53,8 +58,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       STOCK_DECREMENTED: 409,
       CREDIT_NOTE_FAILED: 502,
       ACTION_ID_CONFLICT: 409,
-      ACTION_IN_PROGRESS: 409,
-      ACTION_ALREADY_USED: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }

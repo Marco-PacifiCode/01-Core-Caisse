@@ -15,7 +15,7 @@
 // il est tracé sur la vente (comptaSyncedAt/stockSyncedAt/syncError) et repris par repairSale
 // (endpoint /api/sales/:id/repair + balayage /api/cron/repair-sales).
 
-import { withTenant } from "./tenant";
+import { assertTenantId, withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
 import { log } from "./log";
 import { computeChange, lineTotalXpf, normalizePayments } from "./money";
@@ -37,7 +37,7 @@ import {
   type GiftCardRefusal,
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
-import { runVoidSale, runReservedVoidAction, type VoidPersist, type VoidActionReservation } from "./void-sale";
+import { runVoidSale, runLockedVoidAction, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
   type PaymentCorrectionDeps,
@@ -47,6 +47,7 @@ import {
 import { prepareClotureImport, type ImportClotureInput, type ImportClotureError } from "./import-cloture";
 import { expectedXpfPourRapport, creditXpfPourRapport } from "./z-report";
 import { checkoutUnderpaidGuard, dueAtNoonUtcIso, type CreditOptions } from "./credit";
+import { prisma } from "./prisma";
 import { lockSaleRow } from "./sale-lock";
 import {
   validateProgram,
@@ -1265,12 +1266,12 @@ export async function voidSale(tenantId: string, saleId: string) {
 }
 
 export type AnnulerVenteResult =
-  | { ok: true; alreadyVoid: true }
+  | { ok: true; alreadyVoid: true; creditNoteId: string | null }
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string }
-  | { ok: false; error: "ACTION_ID_CONFLICT" | "ACTION_IN_PROGRESS" | "ACTION_ALREADY_USED" };
+  | { ok: false; error: "ACTION_ID_CONFLICT" };
 
 /**
  * ANNULE une vente, quel que soit son état (DRAFT/PAID/VOID) — distincte de `voidSale` ci-dessus
@@ -1291,113 +1292,57 @@ export async function annulerVente(
   saleId: string,
   opts?: { reason?: string; actionId?: string },
 ): Promise<AnnulerVenteResult> {
-  if (opts?.actionId !== undefined) return annulerVenteAvecAction(tenantId, saleId, { ...opts, actionId: opts.actionId });
-  return annulerVenteLegacy(tenantId, saleId, opts);
-}
-
-async function annulerVenteAvecAction(
-  tenantId: string,
-  saleId: string,
-  opts: { reason?: string; actionId: string },
-): Promise<AnnulerVenteResult> {
-  const rejected = (error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "ACTION_IN_PROGRESS" | "ACTION_ALREADY_USED"): AnnulerVenteResult => ({ ok: false, error });
-  const readReservation = async (): Promise<VoidActionReservation<AnnulerVenteResult>> => {
-    try {
-      return await withTenant(tenantId, async (tx) => {
-        // Permet de signaler le conflit actionId/ticket même si le ticket cible n'existe pas.
-        const existingAction = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } });
-        if (existingAction) {
-          if (existingAction.saleId.toLowerCase() !== saleId.toLowerCase()) return { status: "rejected", outcome: rejected("ACTION_ID_CONFLICT") };
-          return existingAction.outcome
-            ? { status: "completed", outcome: existingAction.outcome as AnnulerVenteResult }
-            : { status: "pending" };
-        }
-        const rows = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Sale" WHERE "id" = ${saleId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
-        if (rows.length === 0) return { status: "rejected", outcome: rejected("SALE_NOT_FOUND") };
-        const byAction = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } });
-        if (byAction) {
-          if (byAction.saleId.toLowerCase() !== saleId.toLowerCase()) return { status: "rejected", outcome: rejected("ACTION_ID_CONFLICT") };
-          return byAction.outcome ? { status: "completed", outcome: byAction.outcome as AnnulerVenteResult } : { status: "pending" };
-        }
-        const bySale = await tx.voidAction.findUnique({ where: { tenantId_saleId: { tenantId, saleId } } });
-        if (bySale) return { status: "rejected", outcome: rejected("ACTION_ALREADY_USED") };
-        await tx.voidAction.create({ data: { tenantId, saleId, actionId: opts.actionId } });
-        return { status: "acquired" };
+  const safeTenantId = assertTenantId(tenantId);
+  const actionId = opts?.actionId?.toLowerCase();
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
+      return runLockedVoidAction<AnnulerVenteResult>({
+        async withLock(run) {
+          if (!await lockSaleRow(tx, saleId, safeTenantId)) return { ok: false, error: "SALE_NOT_FOUND" };
+          return run();
+        },
+        async checkAction() {
+          if (!actionId) return null;
+          const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
+          return existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()
+            ? { ok: false, error: "ACTION_ID_CONFLICT" } : null;
+        },
+        async execute() {
+          const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
+          if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
+          // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
+          // Core-Compta verrouillé).
+          const persist: VoidPersist = {
+            async markVoid(creditNoteId) {
+              await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
+              // Reprise fidelite atomique avec VOID, uniquement pour une vente PAID.
+              if (sale.status === "PAID") {
+                await reverseSaleLoyalty(tx, { tenantId, saleId });
+              }
+              if (actionId) await tx.voidAction.create({ data: {
+                tenantId: safeTenantId, saleId, actionId,
+                outcome: { ok: true, alreadyVoid: false, creditNoteId },
+              } });
+            },
+          };
+          // Compta impose la cle deterministe (facture, total) pour l'avoir total.
+          return runVoidSale(sale, safeTenantId, comptaClient(), persist, opts);
+        },
       });
-    } catch (error) {
-      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") throw error;
-      const byAction = await withTenant(tenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } }));
-      if (byAction?.saleId.toLowerCase() === saleId.toLowerCase()) return byAction.outcome ? { status: "completed", outcome: byAction.outcome as AnnulerVenteResult } : { status: "pending" };
-      return { status: "rejected", outcome: rejected(byAction ? "ACTION_ID_CONFLICT" : "ACTION_ALREADY_USED") };
+    }, { timeout: 15000 }); // Appel Compta borne a 8 s + ecritures, sous le verrou commun.
+  } catch (error) {
+    // Deux ventes distinctes peuvent tenter la meme cle : l'index arbitre au commit.
+    if (actionId && error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      const existing = await withTenant(safeTenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } }));
+      if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { ok: false, error: "ACTION_ID_CONFLICT" };
     }
-  };
-  return runReservedVoidAction({
-    reserve: readReservation,
-    async waitForOutcome() {
-      for (let attempt = 0; attempt < 40; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        const row = await withTenant(tenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } }, select: { saleId: true, outcome: true } }));
-        if (!row || row.saleId.toLowerCase() !== saleId.toLowerCase()) return rejected("ACTION_ID_CONFLICT");
-        if (row.outcome) return row.outcome as AnnulerVenteResult;
-      }
-      return null;
-    },
-    pendingOutcome: () => rejected("ACTION_IN_PROGRESS"),
-    execute: () => annulerVenteLegacy(tenantId, saleId, opts),
-    complete: (outcome) => withTenant(tenantId, async (tx) => {
-      await tx.voidAction.update({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } }, data: { outcome } });
-    }),
-  });
+    throw error;
+  }
 }
 
-async function annulerVenteLegacy(
-  tenantId: string,
-  saleId: string,
-  opts?: { reason?: string },
-): Promise<AnnulerVenteResult> {
-  const sale = await getSale(tenantId, saleId);
-  if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
 
-  const persist: VoidPersist = {
-    markVoid: () =>
-      withTenant(tenantId, async (tx) => {
-        await tx.sale.update({ where: { id: saleId }, data: { status: "VOID" } });
-        // Fidélité (lot C2) : reprise DANS LA MÊME transaction que le passage à VOID — soit les
-        // deux, soit ni l'un ni l'autre (§2.5 du plan). UNIQUEMENT si la vente était PAID : une
-        // vente DRAFT n'a jamais rien écrit en fidélité (points/récompense ne naissent que dans
-        // la transaction du passage à PAID de `checkoutSale`) — `sale.status` est celui lu par
-        // `getSale` ci-dessus, AVANT toute transition, donc non affecté par ce `markVoid` lui-même.
-        //
-        // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
-        // Core-Compta verrouillé). Un avoir émis DIRECTEMENT depuis Core-Compta ne repasse pas
-        // par `annulerVente` — il n'est donc jamais vu ici, et points/récompense restent
-        // acquis tant qu'une correction ADMIN manuelle (lib/loyalty-db.ts#adjustLoyalty) ne
-        // les reprend pas.
-        if (sale.status === "PAID") {
-          // Pas d'`occurredAt` ici : une reprise fidélité prend celui de la ligne qu'elle
-          // annule (le cycle du crédit d'origine), jamais l'instant de l'annulation — cf. le
-          // correctif du 2026-09-16 dans lib/loyalty-db.ts#reverseSale.
-          await reverseSaleLoyalty(tx, { tenantId, saleId });
-        }
-      }).then(() => undefined),
-  };
 
-  return runVoidSale(
-    {
-      id: sale.id,
-      status: sale.status,
-      invoiceId: sale.invoiceId,
-      stockSyncedAt: sale.stockSyncedAt,
-      lines: sale.lines.map((l) => ({ kind: l.kind, productId: l.productId })),
-    },
-    tenantId,
-    comptaClient(),
-    persist,
-    opts,
-  );
-}
-
-// ─── Fidélité (lot C2, plan Salon-Reference 2026-09-15) ────────────────────────────────────────
 // Branchement Prisma/withTenant des routes `app/api/loyalty/**` sur le moteur pur
 // (lib/loyalty.ts) et le moteur DB (lib/loyalty-db.ts, testable par un faux `tx`). Même schéma
 // que les bons cadeaux plus haut dans ce fichier : ces fonctions sont le SEUL endroit qui

@@ -118,6 +118,7 @@ model Sale {
   // Poste ayant émis la vente. NULL = marchand mono-caisse (comportement
   // d'origine, inchangé). Ajouté le 2026-08-15 : voir CashSession.posteId.
   posteId     String?
+  creditNoteId String? // reference conservee meme sans actionId
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
@@ -439,5 +440,5 @@ model VoidAction {
   createdAt DateTime @default(now())
 
   @@unique([tenantId, actionId])
-  @@unique([tenantId, saleId])
+  @@index([tenantId, saleId])
 }

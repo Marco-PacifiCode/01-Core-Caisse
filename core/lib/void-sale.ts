@@ -25,6 +25,7 @@ export type VoidSaleSnapshot = {
   id: string;
   status: string; // SaleStatus : DRAFT | PAID | VOID
   invoiceId: string | null;
+  creditNoteId?: string | null;
   stockSyncedAt: Date | null;
   lines: VoidSaleLine[];
 };
@@ -32,36 +33,23 @@ export type VoidSaleSnapshot = {
 /** Effets de persistance (implémentés via withTenant/Prisma par caisse.ts, en mémoire par les tests). */
 export type VoidPersist = {
   /** Passe la vente à VOID. */
-  markVoid(): Promise<void>;
+  markVoid(creditNoteId: string | null): Promise<void>;
 };
 
 export type VoidOutcome =
-  | { ok: true; alreadyVoid: true }
+  | { ok: true; alreadyVoid: true; creditNoteId: string | null }
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string };
 
-export type VoidActionReservation<T> =
-  | { status: "acquired" }
-  | { status: "completed"; outcome: T }
-  | { status: "pending" }
-  | { status: "rejected"; outcome: T };
-
-/** Orchestration d'une réservation durable injectée ; aucun appel externe au rejeu ou conflit. */
-export async function runReservedVoidAction<T>(deps: {
-  reserve(): Promise<VoidActionReservation<T>>;
-  waitForOutcome(): Promise<T | null>;
-  pendingOutcome(): T;
+export async function runLockedVoidAction<T>(deps: {
+  withLock(run: () => Promise<T>): Promise<T>;
+  checkAction(): Promise<T | null>;
   execute(): Promise<T>;
-  complete(outcome: T): Promise<void>;
 }): Promise<T> {
-  const reservation = await deps.reserve();
-  if (reservation.status === "completed" || reservation.status === "rejected") return reservation.outcome;
-  if (reservation.status === "pending") return (await deps.waitForOutcome()) ?? deps.pendingOutcome();
-  const outcome = await deps.execute();
-  await deps.complete(outcome);
-  return outcome;
+  return deps.withLock(async () => (await deps.checkAction()) ?? await deps.execute());
 }
+
 
 /**
  * Annule une vente déjà chargée. N'échoue JAMAIS sur une vente déjà VOID (idempotence).
@@ -74,10 +62,10 @@ export async function runVoidSale(
   persist: VoidPersist,
   opts?: { reason?: string },
 ): Promise<VoidOutcome> {
-  if (sale.status === "VOID") return { ok: true, alreadyVoid: true };
+  if (sale.status === "VOID") return { ok: true, alreadyVoid: true, creditNoteId: sale.creditNoteId ?? null };
 
   if (sale.status === "DRAFT") {
-    await persist.markVoid();
+    await persist.markVoid(null);
     return { ok: true, alreadyVoid: false, creditNoteId: null };
   }
 
@@ -88,7 +76,7 @@ export async function runVoidSale(
   }
 
   if (!sale.invoiceId) {
-    await persist.markVoid();
+    await persist.markVoid(null);
     return { ok: true, alreadyVoid: false, creditNoteId: null };
   }
 
@@ -103,6 +91,6 @@ export async function runVoidSale(
 
   // L'avoir est acquis côté Compta AVANT qu'on ne touche à la vente : si `markVoid` échoue
   // ensuite (erreur DB inattendue), elle remonte telle quelle — pas de faux `ok`.
-  await persist.markVoid();
+  await persist.markVoid(creditNoteId);
   return { ok: true, alreadyVoid: false, creditNoteId };
 }

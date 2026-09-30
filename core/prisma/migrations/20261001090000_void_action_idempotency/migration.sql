@@ -1,3 +1,4 @@
+ALTER TABLE "Sale" ADD COLUMN "creditNoteId" TEXT;
 CREATE TABLE "VoidAction" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
   "tenantId" UUID NOT NULL,
@@ -8,7 +9,7 @@ CREATE TABLE "VoidAction" (
   CONSTRAINT "VoidAction_pkey" PRIMARY KEY ("id")
 );
 CREATE UNIQUE INDEX "VoidAction_tenantId_actionId_key" ON "VoidAction"("tenantId", "actionId");
-CREATE UNIQUE INDEX "VoidAction_tenantId_saleId_key" ON "VoidAction"("tenantId", "saleId");
+CREATE INDEX "VoidAction_tenantId_saleId_idx" ON "VoidAction"("tenantId", "saleId");
 ALTER TABLE "VoidAction" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "VoidAction" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "VoidAction"
