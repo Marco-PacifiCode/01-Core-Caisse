@@ -428,3 +428,16 @@ model LoyaltyEntry {
   @@index([tenantId, accountId, occurredAt])
   @@index([tenantId, kind, redeemedAt])
 }
+
+// Réservation durable avant appel externe lors d'une annulation avec actionId.
+model VoidAction {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  actionId  String   @db.Uuid
+  saleId    String   @db.Uuid
+  outcome   Json?
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, actionId])
+  @@unique([tenantId, saleId])
+}

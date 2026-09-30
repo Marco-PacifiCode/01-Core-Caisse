@@ -41,6 +41,28 @@ export type VoidOutcome =
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string };
 
+export type VoidActionReservation<T> =
+  | { status: "acquired" }
+  | { status: "completed"; outcome: T }
+  | { status: "pending" }
+  | { status: "rejected"; outcome: T };
+
+/** Orchestration d'une réservation durable injectée ; aucun appel externe au rejeu ou conflit. */
+export async function runReservedVoidAction<T>(deps: {
+  reserve(): Promise<VoidActionReservation<T>>;
+  waitForOutcome(): Promise<T | null>;
+  pendingOutcome(): T;
+  execute(): Promise<T>;
+  complete(outcome: T): Promise<void>;
+}): Promise<T> {
+  const reservation = await deps.reserve();
+  if (reservation.status === "completed" || reservation.status === "rejected") return reservation.outcome;
+  if (reservation.status === "pending") return (await deps.waitForOutcome()) ?? deps.pendingOutcome();
+  const outcome = await deps.execute();
+  await deps.complete(outcome);
+  return outcome;
+}
+
 /**
  * Annule une vente déjà chargée. N'échoue JAMAIS sur une vente déjà VOID (idempotence).
  * `reason` est transmis tel quel à l'avoir Compta (facultatif).

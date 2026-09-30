@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runVoidSale, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
+import { runVoidSale, runReservedVoidAction, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
 import type { ComptaClient, CreditNoteInput, CreditNoteResult } from "./clients.ts";
 
 const libDir = path.dirname(fileURLToPath(import.meta.url));
@@ -193,4 +193,92 @@ test("la route mappe les erreurs sur les bons statuts HTTP", () => {
   assert.match(body, /SALE_NOT_FOUND:\s*404/);
   assert.match(body, /STOCK_DECREMENTED:\s*409/);
   assert.match(body, /CREDIT_NOTE_FAILED:\s*502/);
+  assert.match(body, /ACTION_ID_CONFLICT:\s*409/);
+  assert.match(body, /ACTION_IN_PROGRESS:\s*409/);
+});
+
+test("actionId rejoué : une réservation terminée réutilise la réponse sans écriture ni appel Compta", async () => {
+  let saved: Awaited<ReturnType<typeof runVoidSale>> | null = null;
+  const compta = makeCompta();
+  const { persist, state } = makePersist();
+  const deps = () => runReservedVoidAction({
+    async reserve() { return saved ? { status: "completed" as const, outcome: saved } : { status: "acquired" as const }; },
+    async waitForOutcome() { return saved; },
+    pendingOutcome() { throw new Error("inattendu"); },
+    execute: () => runVoidSale(makeSale({ status: "PAID", invoiceId: "inv-1" }), TENANT, compta.client, persist),
+    async complete(outcome) { saved = outcome; },
+  });
+  const first = await deps();
+  const replay = await deps();
+  assert.deepEqual(replay, first);
+  assert.equal(state.calls, 1, "une seule écriture métier de vente");
+  assert.equal(compta.calls.creditNote, 1, "un seul avoir Compta");
+});
+
+test("actionId simultané : le perdant attend la réponse du gagnant et ne rappelle pas Compta", async () => {
+  let reserved = false;
+  let result: Awaited<ReturnType<typeof runVoidSale>> | null = null;
+  const compta = makeCompta();
+  const { persist, state } = makePersist();
+  let releaseCompta!: () => void;
+  let started!: () => void;
+  let releaseDone!: () => void;
+  const comptaGate = new Promise<void>((resolve) => { releaseCompta = resolve; });
+  const startedGate = new Promise<void>((resolve) => { started = resolve; });
+  const doneGate = new Promise<void>((resolve) => { releaseDone = resolve; });
+  const makeDeps = () => runReservedVoidAction({
+    async reserve() { if (reserved) return { status: "pending" as const }; reserved = true; return { status: "acquired" as const }; },
+    async waitForOutcome() { await doneGate; return result; },
+    pendingOutcome() { throw new Error("inattendu"); },
+    async execute() { started(); await comptaGate; return runVoidSale(makeSale({ status: "PAID", invoiceId: "inv-1" }), TENANT, compta.client, persist); },
+    async complete(outcome) { result = outcome; releaseDone(); },
+  });
+  const firstPromise = makeDeps();
+  await startedGate;
+  const secondPromise = makeDeps();
+  releaseCompta();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  assert.deepEqual(second, first);
+  assert.equal(state.calls, 1, "une seule écriture métier de vente");
+  assert.equal(compta.calls.creditNote, 1, "un seul avoir Compta en course");
+});
+
+test("actionId réutilisé pour un autre ticket est refusé sans écriture", async () => {
+  let writes = 0;
+  type ConflictResult = { ok: true } | { ok: false; error: string };
+  const out = await runReservedVoidAction<ConflictResult>({
+    async reserve() { return { status: "rejected" as const, outcome: { ok: false as const, error: "ACTION_ID_CONFLICT" } }; },
+    async waitForOutcome() { return null; },
+    pendingOutcome() { return { ok: false as const, error: "ACTION_IN_PROGRESS" }; },
+    async execute() { writes++; return { ok: true as const }; },
+    async complete() { writes++; },
+  });
+  assert.deepEqual(out, { ok: false, error: "ACTION_ID_CONFLICT" });
+  assert.equal(writes, 0);
+});
+
+test("la route accepte actionId ou Idempotency-Key et valide un UUID", () => {
+  const body = readRoute();
+  assert.match(body, /Idempotency-Key/);
+  assert.match(body, /body\.actionId/);
+  assert.match(body, /actionId doit être un UUID/);
+});
+
+test("les actions sont réservées par tenant/actionId et par vente avant l'appel externe", () => {
+  const caisse = readCaisse();
+  const body = caisse.slice(caisse.indexOf("async function annulerVenteAvecAction"), caisse.indexOf("async function annulerVenteLegacy"));
+  assert.ok(body.indexOf("tx.voidAction.create") < body.indexOf("annulerVenteLegacy"));
+  assert.match(body, /tenantId_actionId/);
+  assert.match(body, /tenantId_saleId/);
+  assert.match(body, /ACTION_IN_PROGRESS/);
+  assert.match(body, /byAction\.saleId\.toLowerCase\(\) !== saleId\.toLowerCase\(\)/);
+});
+
+test("la migration d'idempotence est additive et protège la table par RLS", () => {
+  const migration = readFileSync(path.join(libDir, "..", "prisma", "migrations", "20261001090000_void_action_idempotency", "migration.sql"), "utf8");
+  assert.match(migration, /CREATE TABLE "VoidAction"/);
+  assert.match(migration, /UNIQUE INDEX "VoidAction_tenantId_actionId_key"/);
+  assert.match(migration, /ENABLE ROW LEVEL SECURITY/);
+  assert.match(migration, /FORCE ROW LEVEL SECURITY/);
+  assert.doesNotMatch(migration, /\bDROP\s+TABLE|\bDROP\s+COLUMN/i);
 });

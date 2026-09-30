@@ -37,7 +37,7 @@ import {
   type GiftCardRefusal,
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
-import { runVoidSale, type VoidPersist } from "./void-sale";
+import { runVoidSale, runReservedVoidAction, type VoidPersist, type VoidActionReservation } from "./void-sale";
 import {
   runPaymentCorrection,
   type PaymentCorrectionDeps,
@@ -1269,7 +1269,8 @@ export type AnnulerVenteResult =
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "STOCK_DECREMENTED" }
-  | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string };
+  | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string }
+  | { ok: false; error: "ACTION_ID_CONFLICT" | "ACTION_IN_PROGRESS" | "ACTION_ALREADY_USED" };
 
 /**
  * ANNULE une vente, quel que soit son état (DRAFT/PAID/VOID) — distincte de `voidSale` ci-dessus
@@ -1286,6 +1287,70 @@ export type AnnulerVenteResult =
  *         → pas de facture (jamais synchronisée) : VOID direct, `creditNoteId:null`.
  */
 export async function annulerVente(
+  tenantId: string,
+  saleId: string,
+  opts?: { reason?: string; actionId?: string },
+): Promise<AnnulerVenteResult> {
+  if (opts?.actionId !== undefined) return annulerVenteAvecAction(tenantId, saleId, { ...opts, actionId: opts.actionId });
+  return annulerVenteLegacy(tenantId, saleId, opts);
+}
+
+async function annulerVenteAvecAction(
+  tenantId: string,
+  saleId: string,
+  opts: { reason?: string; actionId: string },
+): Promise<AnnulerVenteResult> {
+  const rejected = (error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "ACTION_IN_PROGRESS" | "ACTION_ALREADY_USED"): AnnulerVenteResult => ({ ok: false, error });
+  const readReservation = async (): Promise<VoidActionReservation<AnnulerVenteResult>> => {
+    try {
+      return await withTenant(tenantId, async (tx) => {
+        // Permet de signaler le conflit actionId/ticket même si le ticket cible n'existe pas.
+        const existingAction = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } });
+        if (existingAction) {
+          if (existingAction.saleId.toLowerCase() !== saleId.toLowerCase()) return { status: "rejected", outcome: rejected("ACTION_ID_CONFLICT") };
+          return existingAction.outcome
+            ? { status: "completed", outcome: existingAction.outcome as AnnulerVenteResult }
+            : { status: "pending" };
+        }
+        const rows = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "Sale" WHERE "id" = ${saleId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
+        if (rows.length === 0) return { status: "rejected", outcome: rejected("SALE_NOT_FOUND") };
+        const byAction = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } });
+        if (byAction) {
+          if (byAction.saleId.toLowerCase() !== saleId.toLowerCase()) return { status: "rejected", outcome: rejected("ACTION_ID_CONFLICT") };
+          return byAction.outcome ? { status: "completed", outcome: byAction.outcome as AnnulerVenteResult } : { status: "pending" };
+        }
+        const bySale = await tx.voidAction.findUnique({ where: { tenantId_saleId: { tenantId, saleId } } });
+        if (bySale) return { status: "rejected", outcome: rejected("ACTION_ALREADY_USED") };
+        await tx.voidAction.create({ data: { tenantId, saleId, actionId: opts.actionId } });
+        return { status: "acquired" };
+      });
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") throw error;
+      const byAction = await withTenant(tenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } } }));
+      if (byAction?.saleId.toLowerCase() === saleId.toLowerCase()) return byAction.outcome ? { status: "completed", outcome: byAction.outcome as AnnulerVenteResult } : { status: "pending" };
+      return { status: "rejected", outcome: rejected(byAction ? "ACTION_ID_CONFLICT" : "ACTION_ALREADY_USED") };
+    }
+  };
+  return runReservedVoidAction({
+    reserve: readReservation,
+    async waitForOutcome() {
+      for (let attempt = 0; attempt < 40; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const row = await withTenant(tenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } }, select: { saleId: true, outcome: true } }));
+        if (!row || row.saleId.toLowerCase() !== saleId.toLowerCase()) return rejected("ACTION_ID_CONFLICT");
+        if (row.outcome) return row.outcome as AnnulerVenteResult;
+      }
+      return null;
+    },
+    pendingOutcome: () => rejected("ACTION_IN_PROGRESS"),
+    execute: () => annulerVenteLegacy(tenantId, saleId, opts),
+    complete: (outcome) => withTenant(tenantId, async (tx) => {
+      await tx.voidAction.update({ where: { tenantId_actionId: { tenantId, actionId: opts.actionId } }, data: { outcome } });
+    }),
+  });
+}
+
+async function annulerVenteLegacy(
   tenantId: string,
   saleId: string,
   opts?: { reason?: string },
