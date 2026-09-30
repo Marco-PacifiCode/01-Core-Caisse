@@ -4,6 +4,15 @@
 
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
+## 🔁 2026-10-01 — ANNULATION IDEMPOTENTE (`actionId`) — ✅ EN PRODUCTION (PR #52, be14a3c, accord QCM Marco « Oui, lot Core-Caisse »)
+
+- `POST /api/sales/:id/void` : `{ tenantId, reason?, actionId? }` (UUID, ou en-tête `Idempotency-Key`). Même clé rejouée → un seul avoir ; vente déjà VOID → succès `alreadyVoid:true` + `creditNoteId`, quelle que soit la clé ; clé déjà liée à une AUTRE vente → 409 définitif.
+- Trois étapes courtes, sans transaction englobante : préparation (verrou clé puis vente, `VoidAction` PENDING) → appel Compta hors verrou (clé d'avoir déterministe, Compta dédoublonne l'avoir « total ») → finalisation (verrou vente, relecture, VOID + `Sale.creditNoteId` + `VoidAction` DONE). Échec = rien de figé, rejouable.
+- Facture ou statut changé entre préparation et finalisation → 409 `VOID_RETRY_INVOICE_CHANGED` / `VOID_RETRY_STATUS_CHANGED`, rien écrit, **rejouable**.
+- Migration additive `20261001090000_void_action_idempotency` jouée et prouvée (RLS FORCE, DML `core_caisse_app` ok).
+- ⚠️ Dette connue, préexistante : une réparation concurrente (repair-sweep) peut sortir le stock avant la finalisation d'une annulation, qui n'est pas revalidée → vente VOID avec stock sorti. Non corrigée.
+- Client : surface Rôtisserie (file d'annulations persistante côté caisse, en cours).
+
 ## 🎯 2026-09-15 — FIDÉLITÉ (lot C2 : moteur d'écriture + routes) — ✅ LIVRÉ le 16/09 (PR #47, main 434de39)
 
 Branche `claude/caisse-fidelite-moteur-20260916` (worktree jetable `_wt/caisse-fidelite-c2`,
