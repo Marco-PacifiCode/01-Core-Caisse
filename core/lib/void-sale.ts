@@ -25,21 +25,44 @@ export type VoidSaleSnapshot = {
   id: string;
   status: string; // SaleStatus : DRAFT | PAID | VOID
   invoiceId: string | null;
+  creditNoteId?: string | null;
   stockSyncedAt: Date | null;
   lines: VoidSaleLine[];
 };
 
+export type VoidRetry = { ok: false; error: "VOID_RETRY_INVOICE_CHANGED" | "VOID_RETRY_STATUS_CHANGED"; message: string };
+export function checkVoidSnapshot(current: Pick<VoidSaleSnapshot, "invoiceId" | "status">, prepared: Pick<VoidSaleSnapshot, "invoiceId" | "status">): VoidRetry | null {
+  const message = "la vente a été mise à jour pendant l'annulation, réessayez";
+  if (current.invoiceId !== prepared.invoiceId) return { ok: false, error: "VOID_RETRY_INVOICE_CHANGED", message };
+  if (current.status !== prepared.status) return { ok: false, error: "VOID_RETRY_STATUS_CHANGED", message };
+  return null;
+}
+
 /** Effets de persistance (implémentés via withTenant/Prisma par caisse.ts, en mémoire par les tests). */
 export type VoidPersist = {
-  /** Passe la vente à VOID. */
-  markVoid(): Promise<void>;
+  /** Passe la vente à VOID et retourne l'avoir finalement attaché à la vente. */
+  markVoid(creditNoteId: string | null, prepared: Pick<VoidSaleSnapshot, "invoiceId" | "status">): Promise<void | VoidRetry | { alreadyVoid: boolean; creditNoteId: string | null }>;
 };
 
 export type VoidOutcome =
-  | { ok: true; alreadyVoid: true }
+  | VoidRetry
+  | { ok: true; alreadyVoid: true; creditNoteId: string | null }
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string };
+
+/** Orchestration commune : la préparation est déjà commitée quand Compta est appelé. */
+export async function runPreparedVoidSale<T extends VoidSaleSnapshot>(deps: {
+  prepare(): Promise<T | { error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" }>;
+  compta: ComptaClient;
+  tenantId: string;
+  persist: VoidPersist;
+  reason?: string;
+}): Promise<VoidOutcome | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" }> {
+  const prepared = await deps.prepare();
+  if ("error" in prepared) return { ok: false, error: prepared.error };
+  return runVoidSale(prepared, deps.tenantId, deps.compta, deps.persist, { reason: deps.reason });
+}
 
 /**
  * Annule une vente déjà chargée. N'échoue JAMAIS sur une vente déjà VOID (idempotence).
@@ -52,11 +75,12 @@ export async function runVoidSale(
   persist: VoidPersist,
   opts?: { reason?: string },
 ): Promise<VoidOutcome> {
-  if (sale.status === "VOID") return { ok: true, alreadyVoid: true };
+  if (sale.status === "VOID") return { ok: true, alreadyVoid: true, creditNoteId: sale.creditNoteId ?? null };
 
   if (sale.status === "DRAFT") {
-    await persist.markVoid();
-    return { ok: true, alreadyVoid: false, creditNoteId: null };
+    const finalized = await persist.markVoid(null, sale) ?? { alreadyVoid: false, creditNoteId: null };
+    if ("error" in finalized) return finalized;
+    return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
   }
 
   // status === "PAID" (seule valeur restante de SaleStatus)
@@ -66,8 +90,9 @@ export async function runVoidSale(
   }
 
   if (!sale.invoiceId) {
-    await persist.markVoid();
-    return { ok: true, alreadyVoid: false, creditNoteId: null };
+    const finalized = await persist.markVoid(null, sale) ?? { alreadyVoid: false, creditNoteId: null };
+    if ("error" in finalized) return finalized;
+    return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
   }
 
   let creditNoteId: string;
@@ -81,6 +106,7 @@ export async function runVoidSale(
 
   // L'avoir est acquis côté Compta AVANT qu'on ne touche à la vente : si `markVoid` échoue
   // ensuite (erreur DB inattendue), elle remonte telle quelle — pas de faux `ok`.
-  await persist.markVoid();
-  return { ok: true, alreadyVoid: false, creditNoteId };
+  const finalized = await persist.markVoid(creditNoteId, sale) ?? { alreadyVoid: false, creditNoteId };
+  if ("error" in finalized) return finalized;
+  return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
 }

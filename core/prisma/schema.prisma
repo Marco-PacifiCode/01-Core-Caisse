@@ -118,6 +118,7 @@ model Sale {
   // Poste ayant émis la vente. NULL = marchand mono-caisse (comportement
   // d'origine, inchangé). Ajouté le 2026-08-15 : voir CashSession.posteId.
   posteId     String?
+  creditNoteId String? // reference conservee meme sans actionId
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
@@ -427,4 +428,18 @@ model LoyaltyEntry {
   @@unique([tenantId, ref])
   @@index([tenantId, accountId, occurredAt])
   @@index([tenantId, kind, redeemedAt])
+}
+
+// Réservation durable avant appel externe lors d'une annulation avec actionId.
+model VoidAction {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  actionId  String   @db.Uuid
+  saleId    String   @db.Uuid
+  status    String   @default("PENDING")
+  outcome   Json?
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, actionId])
+  @@index([tenantId, saleId])
 }
