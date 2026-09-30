@@ -37,7 +37,7 @@ import {
   type GiftCardRefusal,
 } from "./gift-card";
 import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
-import { runPreparedVoidSale, type VoidPersist } from "./void-sale";
+import { checkVoidSnapshot, runPreparedVoidSale, type VoidRetry, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
   type PaymentCorrectionDeps,
@@ -1266,6 +1266,7 @@ export async function voidSale(tenantId: string, saleId: string) {
 }
 
 export type AnnulerVenteResult =
+  | VoidRetry
   | { ok: true; alreadyVoid: true; creditNoteId: string | null }
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "SALE_NOT_FOUND" }
@@ -1300,7 +1301,7 @@ export async function annulerVente(
     // Préparation : le verrou de clé arbitre les clés inter-ventes ; le verrou de vente
     // protège la lecture et la réservation. Rien n'est tenu pendant l'appel Compta.
     const persist: VoidPersist = {
-      async markVoid(creditNoteId) {
+      async markVoid(creditNoteId, prepared) {
         return withTenant(safeTenantId, async (tx) => {
           if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
           const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
@@ -1316,6 +1317,8 @@ export async function annulerVente(
             }
             return { alreadyVoid: true, creditNoteId: current.creditNoteId ?? null };
           }
+          const retry = checkVoidSnapshot(current, prepared);
+          if (retry) return retry;
           await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
           if (sale.status === "PAID") {
             await reverseSaleLoyalty(tx, { tenantId, saleId });

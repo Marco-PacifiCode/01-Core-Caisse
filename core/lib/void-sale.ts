@@ -30,13 +30,22 @@ export type VoidSaleSnapshot = {
   lines: VoidSaleLine[];
 };
 
+export type VoidRetry = { ok: false; error: "VOID_RETRY_INVOICE_CHANGED" | "VOID_RETRY_STATUS_CHANGED"; message: string };
+export function checkVoidSnapshot(current: Pick<VoidSaleSnapshot, "invoiceId" | "status">, prepared: Pick<VoidSaleSnapshot, "invoiceId" | "status">): VoidRetry | null {
+  const message = "la vente a été mise à jour pendant l'annulation, réessayez";
+  if (current.invoiceId !== prepared.invoiceId) return { ok: false, error: "VOID_RETRY_INVOICE_CHANGED", message };
+  if (current.status !== prepared.status) return { ok: false, error: "VOID_RETRY_STATUS_CHANGED", message };
+  return null;
+}
+
 /** Effets de persistance (implémentés via withTenant/Prisma par caisse.ts, en mémoire par les tests). */
 export type VoidPersist = {
   /** Passe la vente à VOID et retourne l'avoir finalement attaché à la vente. */
-  markVoid(creditNoteId: string | null): Promise<void | { alreadyVoid: boolean; creditNoteId: string | null }>;
+  markVoid(creditNoteId: string | null, prepared: Pick<VoidSaleSnapshot, "invoiceId" | "status">): Promise<void | VoidRetry | { alreadyVoid: boolean; creditNoteId: string | null }>;
 };
 
 export type VoidOutcome =
+  | VoidRetry
   | { ok: true; alreadyVoid: true; creditNoteId: string | null }
   | { ok: true; alreadyVoid: false; creditNoteId: string | null }
   | { ok: false; error: "STOCK_DECREMENTED" }
@@ -69,7 +78,8 @@ export async function runVoidSale(
   if (sale.status === "VOID") return { ok: true, alreadyVoid: true, creditNoteId: sale.creditNoteId ?? null };
 
   if (sale.status === "DRAFT") {
-    const finalized = await persist.markVoid(null) ?? { alreadyVoid: false, creditNoteId: null };
+    const finalized = await persist.markVoid(null, sale) ?? { alreadyVoid: false, creditNoteId: null };
+    if ("error" in finalized) return finalized;
     return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
   }
 
@@ -80,7 +90,8 @@ export async function runVoidSale(
   }
 
   if (!sale.invoiceId) {
-    const finalized = await persist.markVoid(null) ?? { alreadyVoid: false, creditNoteId: null };
+    const finalized = await persist.markVoid(null, sale) ?? { alreadyVoid: false, creditNoteId: null };
+    if ("error" in finalized) return finalized;
     return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
   }
 
@@ -95,6 +106,7 @@ export async function runVoidSale(
 
   // L'avoir est acquis côté Compta AVANT qu'on ne touche à la vente : si `markVoid` échoue
   // ensuite (erreur DB inattendue), elle remonte telle quelle — pas de faux `ok`.
-  const finalized = await persist.markVoid(creditNoteId) ?? { alreadyVoid: false, creditNoteId };
+  const finalized = await persist.markVoid(creditNoteId, sale) ?? { alreadyVoid: false, creditNoteId };
+  if ("error" in finalized) return finalized;
   return { ok: true, alreadyVoid: finalized.alreadyVoid, creditNoteId: finalized.creditNoteId };
 }

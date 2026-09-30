@@ -15,7 +15,7 @@ import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { runPreparedVoidSale, runVoidSale, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
+import { checkVoidSnapshot, runPreparedVoidSale, runVoidSale, type VoidSaleSnapshot, type VoidPersist } from "./void-sale.ts";
 import type { ComptaClient, CreditNoteInput, CreditNoteResult } from "./clients.ts";
 
 const libDir = path.dirname(fileURLToPath(import.meta.url));
@@ -227,6 +227,7 @@ function harness() {
     await previous;
     try { return await fn(); } finally { release(); }
   }
+  let beforeFinalize: (() => void) | undefined;
   let failPersist = false;
   let voidWrites = 0;
   const connectionMaxima: number[] = [];
@@ -251,11 +252,15 @@ function harness() {
       },
       compta: compta.client, tenantId: TENANT, reason: undefined,
       persist: {
-      async markVoid(creditNoteId) {
+      async markVoid(creditNoteId, prepared) {
+        beforeFinalize?.();
+        beforeFinalize = undefined;
         if (failPersist) throw new Error("transaction interrompue");
         return fakeTransaction(() => lock('sale:' + saleId, async () => {
           const current = sales.get(saleId)!;
           if (current.status === "VOID") return { alreadyVoid: true, creditNoteId: current.creditNoteId ?? null };
+          const retry = checkVoidSnapshot(current, prepared);
+          if (retry) return retry;
           voidWrites++;
           current.status = "VOID";
           current.creditNoteId = creditNoteId;
@@ -268,7 +273,7 @@ function harness() {
       return result;
     });
   };
-  return { run, compta, actions, sales, connectionMaxima, get voidWrites() { return voidWrites; }, setFailPersist(value: boolean) { failPersist = value; } };
+  return { run, compta, actions, sales, connectionMaxima, setBeforeFinalize(fn: () => void) { beforeFinalize = fn; }, get voidWrites() { return voidWrites; }, setFailPersist(value: boolean) { failPersist = value; } };
 }
 
 for (const nextKey of ["key-1", "key-2"]) {
@@ -405,3 +410,37 @@ test("préparation et finalisation courtes, Compta hors verrou de ligne", () => 
   assert.equal((body.match(/withTenant\(safeTenantId, async \(tx\)/g) ?? []).length, 2);
  assert.ok(prepareBody.indexOf("lockVoidResource") < prepareBody.indexOf("lockSaleRow(tx"));
  });
+for (const change of ["invoice", "status"] as const) {
+  test(`changement concurrent de ${change} : 409 rejouable puis rejeu`, async () => {
+    const h = harness();
+    const sale = h.sales.get("sale-1")!;
+    sale.invoiceId = null;
+    h.setBeforeFinalize(() => {
+      if (change === "invoice") sale.invoiceId = "inv-repaired";
+      else sale.status = "DRAFT";
+    });
+    const error = change === "invoice" ? "VOID_RETRY_INVOICE_CHANGED" : "VOID_RETRY_STATUS_CHANGED";
+    assert.deepEqual(await h.run("key-1"), { ok: false, error, message: "la vente a été mise à jour pendant l'annulation, réessayez" });
+    assert.notEqual(sale.status, "VOID");
+    assert.equal(h.voidWrites, 0);
+    assert.equal(h.actions.get("key-1")!.status, "PENDING");
+    assert.equal(h.compta.calls.creditNote, 0);
+    assert.match(readRoute(), new RegExp(error + ":\\s*409"));
+    assert.deepEqual(await h.run("key-1"), { ok: true, alreadyVoid: false, creditNoteId: change === "invoice" ? "cn-1" : null });
+    assert.equal(sale.status, "VOID");
+    assert.equal(h.actions.get("key-1")!.status, "DONE");
+    assert.equal(h.compta.calls.creditNote, change === "invoice" ? 1 : 0);
+    if (change === "invoice") {
+      assert.ok(h.compta.issued.has("inv-repaired"));
+      assert.equal(sale.creditNoteId, "cn-1");
+    }
+  });
+}
+
+test("la comparaison sous verrou précède les écritures de finalisation", () => {
+  const src = readCaisse();
+  const body = src.slice(src.indexOf("async markVoid(creditNoteId, prepared)"), src.indexOf("async prepare()"));
+  assert.ok(body.indexOf("lockSaleRow") < body.indexOf("tx.sale.findFirst"));
+  assert.ok(body.indexOf("checkVoidSnapshot(current, prepared)") > body.indexOf('current.status === "VOID"'));
+  assert.ok(body.indexOf("if (retry) return retry") < body.indexOf("tx.sale.update"));
+});

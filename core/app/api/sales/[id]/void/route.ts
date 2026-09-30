@@ -58,6 +58,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       STOCK_DECREMENTED: 409,
       CREDIT_NOTE_FAILED: 502,
       ACTION_ID_CONFLICT: 409,
+      VOID_RETRY_INVOICE_CHANGED: 409,
+      VOID_RETRY_STATUS_CHANGED: 409,
     };
     return NextResponse.json(result, { status: map[result.error] ?? 400 });
   }
