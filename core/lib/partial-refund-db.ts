@@ -1,5 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import type { ComptaClient } from "./clients";
+import { partialRefundMovementRef } from "./cash-movement.ts";
 import { planPartialRefund, refundFingerprint, refuse, runPartialRefund, type RefundInput, type RefundPlan, type RefundResult, type RefundSuccess, type RefundReservation } from "./partial-refund.ts";
 
 type Tx = Prisma.TransactionClient;
@@ -51,7 +52,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if ("ok" in plan) return plan;
         const session = input.refundMethod === "CASH" ? await openSession(tx, current.posteId) : null;
         if (input.refundMethod === "CASH" && !session) return refuse("NO_OPEN_SESSION");
-        if (input.refundMethod === "CASH" && await tx.cashMovement.findFirst({ where: { tenantId, ref: input.actionId } })) return refuse("REFUND_REF_CONFLICT");
+        if (input.refundMethod === "CASH" && await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } })) return refuse("REFUND_REF_CONFLICT");
         await tx.partialRefund.create({ data: { tenantId, saleId, actionId: input.actionId, sessionId: session?.id,
           input: input as unknown as Prisma.InputJsonValue, plan: plan as unknown as Prisma.InputJsonValue } });
         return { input, plan };
@@ -76,9 +77,9 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
           // a gagné la course, rien n'est écrit et l'action reste rejouable.
           const locked = await tx.cashSession.updateMany({ where: { id: session.id, tenantId, status: "OPEN" }, data: { status: "OPEN" } });
           if (locked.count !== 1) return refuse("SESSION_CLOSED");
-          const movement = await tx.cashMovement.findFirst({ where: { tenantId, ref: input.actionId } });
+          const movement = await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } });
           if (movement) return refuse("REFUND_REF_CONFLICT");
-          if (!movement) await tx.cashMovement.create({ data: { tenantId, sessionId: session.id, kind: "REFUND", ref: input.actionId,
+          if (!movement) await tx.cashMovement.create({ data: { tenantId, sessionId: session.id, kind: "REFUND", ref: partialRefundMovementRef(input.actionId),
             amountXpf: BigInt(reservation.plan.amountXpf), reason: input.reason, createdBy: input.createdBy, createdByName: input.createdByName } });
           await tx.partialRefund.update({ where: { id: action.id }, data: { sessionId: session.id } });
         }

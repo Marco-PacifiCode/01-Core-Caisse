@@ -120,7 +120,7 @@ test("rejeu actionId: réponse identique, aucun nouvel appel ni écriture", asyn
 test("CASH crée un REFUND idempotent et diminue l'attendu du Z", async () => {
   const f = fixture(); const value = input({ refundMethod: "CASH" }); const r = await f.run(value); assert.ok(r.ok);
   assert.deepEqual(await f.run(value), r); assert.equal(f.state.movements.length, 1);
-  const m = f.state.movements[0]; assert.equal(m.kind, "REFUND"); assert.equal(m.ref, A); assert.equal(m.amountXpf, 101n);
+  const m = f.state.movements[0]; assert.equal(m.kind, "REFUND"); assert.equal(m.ref, "avoir-partiel:" + A); assert.equal(m.amountXpf, 101n);
   assert.equal(expectedCashXpf({ openingFloatXpf: 1000n, cashSalesXpf: 303n, movements: f.state.movements }), 1202n);
 });
 for (const refundMethod of ["CARD", "TRANSFER", "OTHER"] as const) test(`${refundMethod}: pas de mouvement de tiroir`, async () => {

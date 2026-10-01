@@ -5,7 +5,7 @@ import {
   isCashMovementKind,
   normalizeMovementAmount,
   normalizeMovementReason,
-  normalizeMovementRef,
+  normalizeMovementRef, PARTIAL_REFUND_REF_PREFIX,
 } from "@/lib/cash-movement";
 
 /**
@@ -56,11 +56,14 @@ export async function POST(req: NextRequest) {
   const reason = normalizeMovementReason(body.reason);
   if (!reason) return NextResponse.json({ error: "REASON_REQUIRED" }, { status: 400 });
 
+  const ref = normalizeMovementRef(body.ref);
+  if (ref?.startsWith(PARTIAL_REFUND_REF_PREFIX)) return NextResponse.json({ error: "REF_RESERVED" }, { status: 400 });
+
   const result = await recordCashMovement(tenantId, {
     kind: body.kind,
     amountXpf: amount.amountXpf,
     reason,
-    ref: normalizeMovementRef(body.ref),
+    ref,
     createdBy: typeof body.createdBy === "string" ? body.createdBy : null,
     createdByName: typeof body.createdByName === "string" ? body.createdByName : null,
   });
