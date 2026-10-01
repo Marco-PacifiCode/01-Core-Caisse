@@ -458,6 +458,14 @@ historique).
 
 ## Dernières actions
 
+- `2026-10-01` — **AVOIR PARTIEL** (#55, `1e0f64f`, déployé avec accord Marco, migration additive
+  `20261001140000_avoir_partiel` jouée). `POST /api/sales/:id/partial-refund` `{tenantId, actionId,
+  reason, lines:[{lineId, qty}], refundMethod}` : avoir Compta par `lineIds` (lignes entières) ou
+  `amountXpf` (taux unique), `creditKey = caisse:<saleId>:<actionId>` ; CASH → REFUND tiroir sous la
+  ref réservée `avoir-partiel:<actionId>` (refusée sur `POST /api/movements`) ; table `PartialRefund`
+  (PENDING/DONE, RLS) ; `Sale.fullyRefundedAt` ; void total refusé après un avoir partiel
+  (`PARTIAL_REFUND_EXISTS`). Premier consommateur : caisse Rôtisserie.
+
 - `2026-07-16` — 💥 **LE MOTEUR IMPUTE ET REND LA MONNAIE (plus l'appelant)** — **#4 MERGÉE ET DÉPLOYÉE**
   (`bda6906`). *(Merge fait à la main par Marco : panne GitHub « Partially Degraded Service », API
   authentifiée en 503 — le self-merge par API était impossible.)*
