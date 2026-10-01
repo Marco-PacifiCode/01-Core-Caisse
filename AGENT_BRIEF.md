@@ -458,6 +458,12 @@ historique).
 
 ## Dernières actions
 
+- `2026-10-01` — **PR 57, prod 9b442b3** — champ optionnel `cashDrawer:"EXTERNAL"` sur
+  `POST /api/sales/:id/partial-refund` : CASH sans session ni mouvement de tiroir, tracé dans
+  input/outcome, dans l'empreinte d'idempotence seulement s'il est présent ; sans le champ
+  comportement inchangé. Usage : caisses qui importent leur Z (`/api/sessions/import`, expectedXpf
+  fourni par la tablette). 411 tests.
+
 - `2026-10-01` — **AVOIR PARTIEL** (#55, `1e0f64f`, déployé avec accord Marco, migration additive
   `20261001140000_avoir_partiel` jouée). `POST /api/sales/:id/partial-refund` `{tenantId, actionId,
   reason, lines:[{lineId, qty}], refundMethod}` : avoir Compta par `lineIds` (lignes entières) ou
