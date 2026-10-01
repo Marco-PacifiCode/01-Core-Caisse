@@ -192,6 +192,23 @@ test("validation: quantités fractionnaires, doublons, moyens et UUID invalides 
   assert.ok(validRefundInput(input()));
   for (const bad of [input({ lines: [{ lineId: LINE, qty: 0 }] }), input({ lines: [{ lineId: LINE, qty: 1.5 }] }), input({ lines: [{ lineId: LINE, qty: 1 }, { lineId: LINE, qty: 1 }] }), input({ reason: " " }), { ...input(), refundMethod: "CHEQUE" }, { ...input(), actionId: "bad" }, null]) assert.equal(validRefundInput(bad), false);
 });
+test("CASH + tiroir EXTERNAL: sans session, avoir émis, aucun mouvement, rejeu idempotent", async () => {
+  const f = fixture(); f.state.sessions[0].status = "CLOSED";
+  const value = input({ refundMethod: "CASH", cashDrawer: "EXTERNAL" }); const r = await f.run(value); assert.ok(r.ok);
+  assert.equal(r.cashDrawer, "EXTERNAL"); assert.equal(f.emitted.size, 1); assert.equal(f.state.movements.length, 0);
+  assert.equal(f.state.refunds[0].sessionId ?? null, null); assert.equal(f.state.refunds[0].input.cashDrawer, "EXTERNAL");
+  assert.deepEqual(await f.run(value), r); assert.equal(f.calls.length, 1); assert.equal(f.state.refunds.length, 1);
+  const conflict = await f.run(input({ refundMethod: "CASH" })); assert.ok(!conflict.ok); assert.equal(conflict.error, "ACTION_ID_CONFLICT");
+});
+test("CASH sans cashDrawer et sans session: NO_OPEN_SESSION inchangé", async () => {
+  const f = fixture(); f.state.sessions[0].status = "CLOSED";
+  assert.deepEqual(await f.run(input({ refundMethod: "CASH" })), { ok: false, error: "NO_OPEN_SESSION", status: 409 });
+});
+test("validation cashDrawer: EXTERNAL seulement, et seulement avec CASH", () => {
+  assert.ok(validRefundInput(input({ refundMethod: "CASH", cashDrawer: "EXTERNAL" })));
+  for (const bad of [{ ...input(), refundMethod: "CARD", cashDrawer: "EXTERNAL" }, { ...input(), refundMethod: "CASH", cashDrawer: "CORE" }, { ...input(), refundMethod: "CASH", cashDrawer: null }]) assert.equal(validRefundInput(bad), false);
+  assert.equal(refundFingerprint(input()).includes("cashDrawer"), false);
+});
 test("empreinte idempotente stable après réordonnancement des clés JSONB", () => {
   const original = input();
   const jsonb: RefundInput = { refundMethod: original.refundMethod, reason: original.reason,
