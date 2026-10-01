@@ -50,9 +50,10 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (refunds.some(r => r.status === "PENDING")) return refuse("REFUND_IN_PROGRESS");
         const plan = planPartialRefund(current, invoice, input, refunds.map(r => r.plan as unknown as RefundPlan));
         if ("ok" in plan) return plan;
-        const session = input.refundMethod === "CASH" ? await openSession(tx, current.posteId) : null;
-        if (input.refundMethod === "CASH" && !session) return refuse("NO_OPEN_SESSION");
-        if (input.refundMethod === "CASH" && await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } })) return refuse("REFUND_REF_CONFLICT");
+        const coreDrawer = input.refundMethod === "CASH" && input.cashDrawer !== "EXTERNAL";
+        const session = coreDrawer ? await openSession(tx, current.posteId) : null;
+        if (coreDrawer && !session) return refuse("NO_OPEN_SESSION");
+        if (coreDrawer && await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } })) return refuse("REFUND_REF_CONFLICT");
         await tx.partialRefund.create({ data: { tenantId, saleId, actionId: input.actionId, sessionId: session?.id,
           input: input as unknown as Prisma.InputJsonValue, plan: plan as unknown as Prisma.InputJsonValue } });
         return { input, plan };
@@ -68,7 +69,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (replay.outcome) return replay.outcome;
         const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId } });
         if (!sale || sale.status !== "PAID" || sale.invoiceId !== reservation.plan.invoiceId) return refuse("REFUND_RETRY_SALE_CHANGED");
-        if (input.refundMethod === "CASH") {
+        if (input.refundMethod === "CASH" && input.cashDrawer !== "EXTERNAL") {
           const action = await tx.partialRefund.findUniqueOrThrow({ where: key });
           // Le rejeu après clôture peut utiliser la nouvelle session du même poste.
           const session = await openSession(tx, sale.posteId);
@@ -83,7 +84,8 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
             amountXpf: BigInt(reservation.plan.amountXpf), reason: input.reason, createdBy: input.createdBy, createdByName: input.createdByName } });
           await tx.partialRefund.update({ where: { id: action.id }, data: { sessionId: session.id } });
         }
-        const outcome: RefundSuccess = { ok: true, actionId: input.actionId, creditNoteId, refundMethod: input.refundMethod, plan: reservation.plan };
+        const outcome: RefundSuccess = { ok: true, actionId: input.actionId, creditNoteId, refundMethod: input.refundMethod,
+          ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}), plan: reservation.plan };
         await tx.partialRefund.update({ where: key, data: { status: "DONE", creditNoteId, outcome: outcome as unknown as Prisma.InputJsonValue } });
         if (reservation.plan.fullyRefunded) await tx.sale.update({ where: { id: saleId }, data: { fullyRefundedAt: new Date() } });
         return outcome;

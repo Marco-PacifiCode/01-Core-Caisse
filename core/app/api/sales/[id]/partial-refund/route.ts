@@ -17,10 +17,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "INVALID_REFUND_INPUT" }, { status: 400 });
   }
   // tenantId n'appartient pas à l'empreinte métier ni au JSON de réservation.
-  const { actionId, reason, lines, refundMethod, createdBy, createdByName } = body;
+  const { actionId, reason, lines, refundMethod, cashDrawer, createdBy, createdByName } = body;
   try {
     const result = await rembourserPartiellement(tenantId, id, { actionId, reason, lines, refundMethod,
-      ...(createdBy !== undefined ? { createdBy } : {}), ...(createdByName !== undefined ? { createdByName } : {}) });
+      ...(cashDrawer !== undefined ? { cashDrawer } : {}), ...(createdBy !== undefined ? { createdBy } : {}), ...(createdByName !== undefined ? { createdByName } : {}) });
     return NextResponse.json(result, { status: result.ok ? 200 : result.status ?? 409 });
   } catch {
     return NextResponse.json({ ok: false, error: "REFUND_RETRY_REQUIRED" }, { status: 502 });

@@ -6,6 +6,8 @@ export type RefundInput = {
   actionId: string; reason: string;
   lines: { lineId: string; qty: number }[];
   refundMethod: "CASH" | "CARD" | "TRANSFER" | "OTHER";
+  // Espèces rendues par un tiroir hors session Core (Z importé déjà net des remboursements).
+  cashDrawer?: "EXTERNAL";
   createdBy?: string; createdByName?: string;
 };
 export type RefundSale = {
@@ -20,7 +22,7 @@ export type RefundPlan = {
   lineIds?: string[]; fullyRefunded: boolean;
 };
 export type RefundFailure = { ok: false; error: string; status?: number };
-export type RefundSuccess = { ok: true; creditNoteId: string; actionId: string; refundMethod: RefundInput["refundMethod"]; plan: RefundPlan };
+export type RefundSuccess = { ok: true; creditNoteId: string; actionId: string; refundMethod: RefundInput["refundMethod"]; cashDrawer?: "EXTERNAL"; plan: RefundPlan };
 export type RefundResult = RefundFailure | RefundSuccess;
 export const refuse = (error: string, status = 409): RefundFailure => ({ ok: false, error, status });
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -30,6 +32,7 @@ export function validRefundInput(input: unknown): input is RefundInput {
   return typeof x.actionId === "string" && uuid.test(x.actionId)
     && typeof x.reason === "string" && x.reason.trim().length > 0 && x.reason.length <= 1000
     && ["CASH", "CARD", "TRANSFER", "OTHER"].includes(x.refundMethod)
+    && (x.cashDrawer === undefined || x.cashDrawer === "EXTERNAL" && x.refundMethod === "CASH")
     && Array.isArray(x.lines) && x.lines.length > 0 && x.lines.length <= 1000
     && x.lines.every(l => l && typeof l.lineId === "string" && uuid.test(l.lineId) && Number.isSafeInteger(l.qty) && l.qty >= 1)
     && new Set(x.lines.map(l => l.lineId.toLowerCase())).size === x.lines.length
@@ -40,6 +43,7 @@ export function refundFingerprint(input: RefundInput): string {
   // PostgreSQL JSONB réordonne les clés: l'empreinte ne dépend jamais de leur ordre.
   return JSON.stringify({ actionId: input.actionId, reason: input.reason, refundMethod: input.refundMethod,
     createdBy: input.createdBy, createdByName: input.createdByName,
+    ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}),
     lines: [...input.lines].sort((a, b) => a.lineId.localeCompare(b.lineId)).map(l => ({ lineId: l.lineId, qty: l.qty })) });
 }
 const safe = (n: bigint) => n >= 0n && n <= BigInt(Number.MAX_SAFE_INTEGER);
