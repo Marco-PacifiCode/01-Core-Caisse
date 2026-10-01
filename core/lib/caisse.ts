@@ -49,6 +49,8 @@ import { expectedXpfPourRapport, creditXpfPourRapport } from "./z-report";
 import { checkoutUnderpaidGuard, dueAtNoonUtcIso, type CreditOptions } from "./credit";
 import { prisma } from "./prisma";
 import { lockSaleRow, lockVoidResource } from "./sale-lock";
+import { partialRefundWithPorts } from "./partial-refund-db";
+import { validRefundInput, refuse, type RefundInput, type RefundResult } from "./partial-refund";
 import {
   validateProgram,
   nextActivatedAt,
@@ -196,6 +198,9 @@ export async function closeSession(
   input: { sessionId: string; closedBy: string; closedByName?: string; closingCountedXpf: bigint },
 ): Promise<{ ok: false; error: "SESSION_NOT_FOUND" } | { ok: true; report: ZReport; alreadyClosed: boolean }> {
   return withTenant(tenantId, async (tx) => {
+    // Sérialise le Z avec la finalisation d'un REFUND: lecture après le verrou.
+    await tx.$executeRaw`SELECT set_config('lock_timeout', ${"3s"}, true)`;
+    await tx.$queryRaw`SELECT "id" FROM "CashSession" WHERE "id" = ${input.sessionId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
     const session = await tx.cashSession.findFirst({ where: { id: input.sessionId, tenantId } });
     if (!session) return { ok: false as const, error: "SESSION_NOT_FOUND" as const };
 
@@ -1272,7 +1277,7 @@ export type AnnulerVenteResult =
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string }
-  | { ok: false; error: "ACTION_ID_CONFLICT" };
+  | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" };
 
 /**
  * ANNULE une vente, quel que soit son état (DRAFT/PAID/VOID) — distincte de `voidSale` ci-dessus
@@ -1306,6 +1311,9 @@ export async function annulerVente(
           if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
           const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
           if (!current) throw new Error("SALE_NOT_FOUND");
+          if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) {
+            return { ok: false as const, error: "PARTIAL_REFUND_EXISTS" as const, message: "Une réservation ou un avoir partiel interdit le void total." };
+          }
           const sale = current;
           if (current.status === "VOID") {
             if (actionId) {
@@ -1339,10 +1347,14 @@ export async function annulerVente(
           const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
           if (!sale) return { error: "SALE_NOT_FOUND" as const };
           if (sale.status === "VOID") return sale;
+          if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) return { error: "PARTIAL_REFUND_EXISTS" as const };
           if (actionId) {
             const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
             if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { error: "ACTION_ID_CONFLICT" as const };
             if (!existing) await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId, actionId, status: "PENDING" } });
+          }
+          if (sale.status === "PAID" && sale.invoiceId && !(sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId))) {
+            await tx.sale.update({ where: { id: saleId }, data: { voidPreparedAt: sale.voidPreparedAt ?? new Date() } });
           }
           return sale;
         });
@@ -1357,6 +1369,22 @@ export async function annulerVente(
     }
     throw error;
   }
+}
+
+/** Avoir partiel: réservation/finalisation courtes sous RLS, Compta hors transaction. */
+export async function rembourserPartiellement(tenantId: string, saleId: string, input: RefundInput): Promise<RefundResult> {
+  const safeTenantId = assertTenantId(tenantId).toLowerCase();
+  if (!validRefundInput(input)) return refuse("INVALID_REFUND_INPUT", 400);
+  saleId = saleId.toLowerCase();
+  const normalized: RefundInput = { ...input, actionId: input.actionId.toLowerCase(), reason: input.reason.trim(),
+    lines: input.lines.map(l => ({ ...l, lineId: l.lineId.toLowerCase() })),
+    ...(input.createdBy ? { createdBy: input.createdBy.toLowerCase() } : {}) };
+  return partialRefundWithPorts(safeTenantId, saleId, normalized, {
+    transact: fn => withTenant(safeTenantId, fn),
+    lockAction: tx => lockVoidResource(tx, safeTenantId, "partial-action:" + normalized.actionId),
+    lockSale: tx => lockSaleRow(tx, saleId, safeTenantId),
+    compta: comptaClient(),
+  });
 }
 
 

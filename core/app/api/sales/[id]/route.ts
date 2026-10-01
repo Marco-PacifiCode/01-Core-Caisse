@@ -24,7 +24,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const sale = await withTenant(tenantId, (tx) =>
     tx.sale.findFirst({
       where: { id, tenantId },
-      include: { lines: { orderBy: { createdAt: "asc" } }, payments: true },
+      include: { lines: { orderBy: { createdAt: "asc" } }, payments: true, partialRefunds: { where: { tenantId }, orderBy: { createdAt: "asc" } } },
     }),
   );
 
@@ -35,6 +35,9 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     tenantId: sale.tenantId,
     sessionId: sale.sessionId,
     status: sale.status,
+    fullyRefundedAt: sale.fullyRefundedAt,
+    partialRefunds: sale.partialRefunds.map(r => ({ actionId: r.actionId, status: r.status, creditNoteId: r.creditNoteId,
+      input: r.input, plan: r.plan, createdAt: r.createdAt })),
     cashierId: sale.cashierId,
     clientName: sale.clientName,
     subtotalXpf: xpf(sale.subtotalXpf),
@@ -55,6 +58,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       qty: l.qty,
       unitXpf: xpf(l.unitXpf),
       lineXpf: xpf(l.lineXpf),
+      tgcRatePpm: l.tgcRatePpm,
     })),
     payments: sale.payments.map((p) => ({
       id: p.id,

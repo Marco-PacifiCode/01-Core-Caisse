@@ -56,6 +56,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const map: Record<string, number> = {
       SALE_NOT_FOUND: 404,
       STOCK_DECREMENTED: 409,
+      PARTIAL_REFUND_EXISTS: 409,
       CREDIT_NOTE_FAILED: 502,
       ACTION_ID_CONFLICT: 409,
       VOID_RETRY_INVOICE_CHANGED: 409,

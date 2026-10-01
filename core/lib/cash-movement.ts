@@ -122,6 +122,14 @@ export function normalizeMovementReason(raw: unknown): string | null {
 }
 
 /** Une `ref` vide vaut ABSENTE (`null`) : sinon `@@unique(tenantId, ref)` bloquerait au 2e "". */
+/** Préfixe réservé aux REFUND écrits par l'avoir partiel (lib/partial-refund-db.ts) :
+ *  refusé sur POST /api/movements pour qu'aucun mouvement manuel ne puisse occuper la référence
+ *  pendant l'appel Compta (sinon l'avoir serait émis sans REFUND enregistrable). */
+export const PARTIAL_REFUND_REF_PREFIX = "avoir-partiel:";
+export function partialRefundMovementRef(actionId: string): string {
+  return PARTIAL_REFUND_REF_PREFIX + actionId;
+}
+
 export function normalizeMovementRef(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const t = raw.trim();
