@@ -11,6 +11,40 @@ Auth.js v5 (beta)**. Argent en **XPF entier (BigInt)**, zéro centime. Port dev 
 
 ---
 
+## Avoir partiel d'une vente (01/10/2026)
+
+`POST /api/sales/:id/partial-refund`, authentification S2S `X-Core-Key` :
+`{ tenantId, actionId, reason, lines: [{ lineId, qty }], refundMethod, createdBy?, createdByName? }`.
+`actionId` et `lineId` sont des UUID; quantités entières >= 1; moyen `CASH|CARD|TRANSFER|OTHER`.
+Vente PAID, facture synchronisée et entièrement payée requises. Les montants envoyés par
+la surface ne sont jamais utilisés. Une même action et un même corps rendent exactement
+la même réponse; un corps différent ou une autre vente avec la même clé refusent en 409.
+
+Réponse : `{ ok:true, actionId, creditNoteId, refundMethod, plan }`, avec lignes/quantités,
+TTC et ventilation HT/TGC par taux. Lignes entières : `lineIds` Compta uniquement si la
+correspondance complète par libellé, quantité, prix et taux est unique. Sinon : montant TTC
+au taux unique, ou 409 `PARTIAL_QTY_MULTI_RATE`. Clé Compta : `caisse:<saleId>:<actionId>`.
+Les remises négatives sont réparties sur les lignes positives de même taux, proportionnellement
+au TTC, par cumul tronqué et ordre stable des ids. Chaque remboursement est la différence
+entre le prorata TTC cumulé tronqué et le TTC déjà rendu : la dernière quantité solde exactement
+le TTC net. HT = TTC / (1 + taux), arrondi entier au plus proche, demi vers le haut; TGC = TTC - HT.
+Les lignes de remise seules et les remboursements de zéro XPF sont refusés.
+
+`CASH` exige une session ouverte du même poste et écrit un `CashMovement REFUND`, `ref=actionId`,
+après émission de l'avoir. Les autres moyens sont tracés sans mouvement. Le Z existant soustrait
+ces REFUND de l'attendu. Une clôture concurrente peut laisser l'avoir émis et la réservation
+PENDING : rejouer **le même actionId** après ouverture d'une session du même poste finalise le tiroir.
+Tout échec conserve un plan rejouable; une autre action est bloquée (`REFUND_IN_PROGRESS`).
+Les erreurs métier Compta 404/409 sont transmises; les autres erreurs renvoient 502.
+
+Le détail `GET /api/sales/:id` expose `partialRefunds` (y compris les réservations PENDING) et
+`fullyRefundedAt`. Une vente entièrement remboursée reste PAID et porte cette date, sans void.
+Un void après réservation/avoir partiel refuse 409 `PARTIAL_REFUND_EXISTS`; un void payé déjà
+préparé bloque les nouveaux partiels (`VOID_IN_PROGRESS`), même après échec Compta : reprendre ce void.
+Le stock et la fidélité ne sont pas modifiés par ce parcours.
+Migration additive `20261001140000_avoir_partiel` à appliquer avant le code, avec FORCE RLS
+sur `PartialRefund`. Aucun appel réseau n'est effectué dans une transaction Caisse.
+
 ## Modèles Prisma (`prisma/schema.prisma`)
 
 Tous portent `tenantId` (UUID) + RLS PostgreSQL (`prisma/rls.sql`).

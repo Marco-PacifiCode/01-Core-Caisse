@@ -26,11 +26,12 @@ export type VoidSaleSnapshot = {
   status: string; // SaleStatus : DRAFT | PAID | VOID
   invoiceId: string | null;
   creditNoteId?: string | null;
+  partialRefunds?: unknown[];
   stockSyncedAt: Date | null;
   lines: VoidSaleLine[];
 };
 
-export type VoidRetry = { ok: false; error: "VOID_RETRY_INVOICE_CHANGED" | "VOID_RETRY_STATUS_CHANGED"; message: string };
+export type VoidRetry = { ok: false; error: "VOID_RETRY_INVOICE_CHANGED" | "VOID_RETRY_STATUS_CHANGED" | "PARTIAL_REFUND_EXISTS"; message: string };
 export function checkVoidSnapshot(current: Pick<VoidSaleSnapshot, "invoiceId" | "status">, prepared: Pick<VoidSaleSnapshot, "invoiceId" | "status">): VoidRetry | null {
   const message = "la vente a été mise à jour pendant l'annulation, réessayez";
   if (current.invoiceId !== prepared.invoiceId) return { ok: false, error: "VOID_RETRY_INVOICE_CHANGED", message };
@@ -53,12 +54,12 @@ export type VoidOutcome =
 
 /** Orchestration commune : la préparation est déjà commitée quand Compta est appelé. */
 export async function runPreparedVoidSale<T extends VoidSaleSnapshot>(deps: {
-  prepare(): Promise<T | { error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" }>;
+  prepare(): Promise<T | { error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" }>;
   compta: ComptaClient;
   tenantId: string;
   persist: VoidPersist;
   reason?: string;
-}): Promise<VoidOutcome | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" }> {
+}): Promise<VoidOutcome | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" }> {
   const prepared = await deps.prepare();
   if ("error" in prepared) return { ok: false, error: prepared.error };
   return runVoidSale(prepared, deps.tenantId, deps.compta, deps.persist, { reason: deps.reason });
@@ -76,6 +77,7 @@ export async function runVoidSale(
   opts?: { reason?: string },
 ): Promise<VoidOutcome> {
   if (sale.status === "VOID") return { ok: true, alreadyVoid: true, creditNoteId: sale.creditNoteId ?? null };
+  if (sale.partialRefunds?.length) return { ok: false, error: "PARTIAL_REFUND_EXISTS", message: "Un avoir partiel interdit le void total." };
 
   if (sale.status === "DRAFT") {
     const finalized = await persist.markVoid(null, sale) ?? { alreadyVoid: false, creditNoteId: null };

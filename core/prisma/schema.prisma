@@ -119,6 +119,8 @@ model Sale {
   // d'origine, inchangé). Ajouté le 2026-08-15 : voir CashSession.posteId.
   posteId     String?
   creditNoteId String? // reference conservee meme sans actionId
+  fullyRefundedAt DateTime?
+  voidPreparedAt DateTime? // réserve le void payé avant son appel Compta
   invoiceId   String? // rempli après le push facture Compta (idempotence de bout en bout)
   invoiceNumber String? // numéro lisible renvoyé par Compta (pour le reçu)
   paidAt      DateTime?
@@ -140,6 +142,7 @@ model Sale {
 
   lines    SaleLine[]
   payments SalePayment[]
+  partialRefunds PartialRefund[]
 
   // Idempotence source externe : une vente issue d'un même (sourceType, sourceId) n'est créée qu'une fois.
   @@index([tenantId, sourceType, sourceId])
@@ -440,6 +443,23 @@ model VoidAction {
   outcome   Json?
   createdAt DateTime @default(now())
 
+  @@unique([tenantId, actionId])
+  @@index([tenantId, saleId])
+}
+
+model PartialRefund {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  actionId String @db.Uuid
+  saleId String @db.Uuid
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  status String @default("PENDING")
+  input Json
+  plan Json
+  outcome Json?
+  creditNoteId String?
+  sessionId String? @db.Uuid
+  createdAt DateTime @default(now())
   @@unique([tenantId, actionId])
   @@index([tenantId, saleId])
 }

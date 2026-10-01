@@ -87,6 +87,19 @@ export type CreditNoteInput = {
   invoiceId: string;
   /** Motif facultatif de l'annulation, transmis tel quel à Compta. */
   reason?: string;
+  amountXpf?: number;
+  lineIds?: string[];
+  creditKey?: string;
+};
+
+export type InvoiceDetail = {
+  id: string;
+  sourceType: string | null;
+  sourceId: string | null;
+  totalXpf: number;
+  paidXpf: number;
+  tgcRatePpm: number | null;
+  lines: { id: string; label: string; qty: number; unitXpf: number; tgcRatePpm: number | null }[];
 };
 
 export type CreditNoteResult = {
@@ -160,6 +173,7 @@ export class CoreClientError extends Error {
 
 // ─── Interface commune ───────────────────────────────────────────────────────
 export interface ComptaClient {
+  invoiceDetail?(tenantId: string, invoiceId: string): Promise<InvoiceDetail>;
   createInvoice(input: CreateInvoiceInput): Promise<CreateInvoiceResult>;
   settle(input: SettleInput): Promise<SettleResult>;
   /** Émet la facture d'AVOIR compensant `invoiceId` — seul moyen d'annuler une pièce (cf. lib/void-sale.ts). */
@@ -211,6 +225,18 @@ async function postJson(
 }
 
 const httpCompta: ComptaClient = {
+  async invoiceDetail(tenantId, invoiceId) {
+    let res: Response;
+    try {
+      res = await fetch(`${comptaUrl()}/api/invoices/${encodeURIComponent(invoiceId)}?tenantId=${encodeURIComponent(tenantId)}`, {
+        headers: { "X-Core-Key": comptaKey() }, cache: "no-store", signal: AbortSignal.timeout(timeoutMs()),
+      });
+    } catch {
+      throw new CoreClientError("compta", "invoiceDetail", 0, "Lecture facture impossible", "network");
+    }
+    if (!res.ok) throw new CoreClientError("compta", "invoiceDetail", res.status, await safeText(res));
+    return await res.json() as InvoiceDetail;
+  },
   async createInvoice(input) {
     const res = await postJson("compta", "createInvoice", `${comptaUrl()}/api/invoices`, comptaKey(), {
       tenantId: input.tenantId,
@@ -241,7 +267,7 @@ const httpCompta: ComptaClient = {
       "creditNote",
       `${comptaUrl()}/api/invoices/${input.invoiceId}/credit-note`,
       comptaKey(),
-      { tenantId: input.tenantId, reason: input.reason },
+      { tenantId: input.tenantId, reason: input.reason, amountXpf: input.amountXpf, lineIds: input.lineIds, creditKey: input.creditKey },
     );
     return (await res.json()) as CreditNoteResult;
   },
@@ -297,10 +323,16 @@ const mockSettled = new Map<string, number>(); // clé: paymentRef → montant (
 const mockMovements = new Map<string, MovementResult>(); // clé: tenantId|sourceType|sourceId|productId
 const mockCreditNotes = new Map<string, CreditNoteResult>(); // clé: invoiceId (idempotence)
 const mockPaymentCorrections = new Map<string, PaymentCorrectionResult>(); // clé: correctionKey (idempotence)
+const mockInvoiceDetails = new Map<string, InvoiceDetail & { tenantId: string }>();
 let mockSeq = 0;
 const nextId = (p: string) => `${p}-mock-${(++mockSeq).toString().padStart(6, "0")}`;
 
 const mockCompta: ComptaClient = {
+  async invoiceDetail(tenantId, invoiceId) {
+    const invoice = mockInvoiceDetails.get(invoiceId);
+    if (!invoice || invoice.tenantId !== tenantId) throw new CoreClientError("compta", "invoiceDetail", 404, "INVOICE_NOT_FOUND");
+    return { ...invoice, paidXpf: sumSettledForInvoice(invoiceId) };
+  },
   async createInvoice(input) {
     const key = `${input.tenantId}|${input.sourceType}|${input.sourceId}`;
     const existing = mockInvoices.get(key);
@@ -313,6 +345,9 @@ const mockCompta: ComptaClient = {
       alreadyExisted: false,
     };
     mockInvoices.set(key, created);
+    mockInvoiceDetails.set(created.invoiceId, { tenantId: input.tenantId, id: created.invoiceId, sourceType: input.sourceType,
+      sourceId: input.sourceId, totalXpf: total, paidXpf: 0, tgcRatePpm: null,
+      lines: input.lines.map((l, i) => ({ ...l, id: `${created.invoiceId}:line:${i}`, tgcRatePpm: l.tgcRatePpm ?? null })) });
     return created;
   },
 
@@ -330,16 +365,28 @@ const mockCompta: ComptaClient = {
   },
 
   async creditNote(input) {
-    const existing = mockCreditNotes.get(input.invoiceId);
-    if (existing) return { ...existing, alreadyExisted: true };
+    const key = `${input.tenantId}|${input.invoiceId}|${input.creditKey ?? "total"}`;
+    const invoice = mockInvoiceDetails.get(input.invoiceId);
+    const amount = input.amountXpf ?? (input.lineIds ? input.lineIds.reduce((s, id) => {
+      const l = invoice?.lines.find(l => l.id === id);
+      if (!l) throw new CoreClientError("compta", "creditNote", 404, "LINE_NOT_FOUND");
+      return s + l.unitXpf * l.qty;
+    }, 0) : 0);
+    const existing = mockCreditNotes.get(key);
+    if (existing) {
+      if (input.creditKey !== undefined && -existing.totalXpf !== amount) {
+        throw new CoreClientError("compta", "creditNote", 409, "CREDIT_KEY_CONFLICT");
+      }
+      return { ...existing, alreadyExisted: true };
+    }
     const created: CreditNoteResult = {
       creditNoteId: nextId("cn"),
       number: `AVOIR-MOCK-${(++mockSeq).toString().padStart(4, "0")}`,
-      totalXpf: 0,
+      totalXpf: -amount,
       alreadyExisted: false,
       origin: { id: input.invoiceId, number: "MOCK" },
     };
-    mockCreditNotes.set(input.invoiceId, created);
+    mockCreditNotes.set(key, created);
     return created;
   },
 
