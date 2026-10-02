@@ -458,6 +458,13 @@ historique).
 
 ## Dernières actions
 
+- `2026-10-02` — **PR 59, prod 9be4973** — avoir partiel : `finalize` passe DONE même si la vente a
+  changé (`saleChanged:true`, plus de PENDING coincé ; `fullyRefundedAt` seulement si vente PAID même
+  facture ; SALE_NOT_FOUND 404) ; `doneAt` renvoyé ; `GET /api/sales/:id` donne `netXpf` par ligne
+  (remise répartie, `netLineTotals`) ; nouveau `GET /api/partial-refunds?tenantId&from&to`
+  (X-Core-Key, ≤ 92 j) → `{refunds:[{actionId,saleId,refundMethod,cashDrawer?,amountXpf,creditNoteId,
+  reason,lines,parTaux,saleChanged?,doneAt,sessionId}]}` (`lib/partial-refund-list.ts`). 417 tests.
+
 - `2026-10-01` — **PR 57, prod 9b442b3** — champ optionnel `cashDrawer:"EXTERNAL"` sur
   `POST /api/sales/:id/partial-refund` : CASH sans session ni mouvement de tiroir, tracé dans
   input/outcome, dans l'empreinte d'idempotence seulement s'il est présent ; sans le champ
