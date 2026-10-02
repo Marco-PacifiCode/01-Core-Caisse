@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { planPartialRefund, refundFingerprint, validRefundInput, type RefundInput, type RefundPlan, type RefundSale } from "./partial-refund.ts";
+import { netLineTotals, planPartialRefund, refundFingerprint, validRefundInput, type RefundInput, type RefundPlan, type RefundSale } from "./partial-refund.ts";
 import { partialRefundWithPorts } from "./partial-refund-db.ts";
 import { runVoidSale } from "./void-sale.ts";
 import { expectedCashXpf } from "./cash-movement.ts";
@@ -228,4 +228,57 @@ test("contrat RLS, gardes sous verrou, migration additive et détail S2S", () =>
   assert.match(route, /hasServiceKey\(req\)/);
   const detail = readFileSync(new URL("../app/api/sales/[id]/route.ts", import.meta.url), "utf8");
   assert.match(detail, /partialRefunds: sale.partialRefunds.map/); assert.match(detail, /fullyRefundedAt: sale.fullyRefundedAt/);
+});
+
+test("vente modifiée entre émission et finalize: DONE, saleChanged, sans fullyRefundedAt, nouvelle demande possible", async () => {
+  const f = fixture(); f.onCredit(() => { f.state.sale.status = "VOID"; });
+  const r = await f.run(input({ refundMethod: "CASH", lines: [{ lineId: LINE, qty: 3 }] })); assert.ok(r.ok);
+  assert.equal(r.saleChanged, true); assert.equal(typeof r.doneAt, "string"); assert.ok(!Number.isNaN(Date.parse(r.doneAt!)));
+  assert.equal(f.state.refunds[0].status, "DONE"); assert.equal(f.state.refunds[0].outcome.saleChanged, true);
+  assert.equal(f.state.movements.length, 1); assert.equal(f.state.sale.fullyRefundedAt, null);
+  f.onCredit(() => {}); f.state.sale.status = "PAID";
+  const next = await f.run(input({ actionId: B })); assert.ok(!next.ok); assert.notEqual(next.error, "REFUND_IN_PROGRESS");
+  const f2 = fixture(); f2.onCredit(() => { f2.state.sale.invoiceId = "autre"; });
+  const r2 = await f2.run(); assert.ok(r2.ok); assert.equal(r2.saleChanged, true);
+  f2.onCredit(() => {}); f2.state.sale.invoiceId = "invoice";
+  assert.ok((await f2.run(input({ actionId: B }))).ok);
+});
+test("outcome normal: doneAt ISO, pas de saleChanged", async () => {
+  const f = fixture(); const r = await f.run(); assert.ok(r.ok);
+  assert.equal(r.saleChanged, undefined); assert.equal(new Date(r.doneAt!).toISOString(), r.doneAt);
+});
+test("netXpf: Σ floor(net*(déjà+q)/qte) − déjà == plan.amountXpf", () => {
+  const C = "00000000-0000-4000-8000-000000000008", D = "00000000-0000-4000-8000-000000000009", E = "00000000-0000-4000-8000-00000000000a";
+  const check = (s: RefundSale, prior: { lineId: string; qty: number }[], sel: { lineId: string; qty: number }[]) => {
+    const net = netLineTotals(s, invoiceFor(s)); assert.ok(net);
+    const priorPlans = prior.length ? [planPartialRefund(s, invoiceFor(s), input({ lines: prior }), []) as RefundPlan] : [];
+    const plan = planPartialRefund(s, invoiceFor(s), input({ actionId: B, lines: sel }), priorPlans); assert.ok(!("ok" in plan), JSON.stringify(plan));
+    let expected = 0;
+    for (const r of sel) {
+      const l = s.lines.find(x => x.id === r.lineId)!; const n = net.get(l.id)!; const deja = prior.find(p => p.lineId === l.id)?.qty ?? 0;
+      expected += Math.floor(n * (deja + r.qty) / l.qty) - Math.floor(n * deja / l.qty);
+    }
+    assert.equal(plan.amountXpf, expected);
+  };
+  const one = sale(); one.lines.push({ id: SECOND, label: "Remise", qty: 1, unitXpf: -7n, lineXpf: -7n, tgcRatePpm: 50_000 }); one.totalXpf = 296n;
+  check(one, [], [{ lineId: LINE, qty: 1 }]);
+  check(one, [{ lineId: LINE, qty: 1 }], [{ lineId: LINE, qty: 2 }]);
+  const multi: RefundSale = { id: SALE, status: "PAID", invoiceId: "invoice", totalXpf: 0n, lines: [
+    { id: LINE, label: "A", qty: 3, unitXpf: 101n, lineXpf: 303n, tgcRatePpm: 50_000 },
+    { id: C, label: "B", qty: 2, unitXpf: 57n, lineXpf: 114n, tgcRatePpm: 50_000 },
+    { id: SECOND, label: "Remise 5", qty: 1, unitXpf: -13n, lineXpf: -13n, tgcRatePpm: 50_000 },
+    { id: D, label: "C", qty: 1, unitXpf: 250n, lineXpf: 250n, tgcRatePpm: 110_000 },
+    { id: E, label: "Remise 11", qty: 1, unitXpf: -9n, lineXpf: -9n, tgcRatePpm: 110_000 }] };
+  multi.totalXpf = multi.lines.reduce((s, l) => s + l.lineXpf, 0n);
+  // Remise sur 2 taux: le plan refuse (PARTIAL_QTY_MULTI_RATE, règle existante); netXpf reste cohérent par taux.
+  const refused = planPartialRefund(multi, invoiceFor(multi), input({ lines: [{ lineId: C, qty: 2 }] }), []);
+  assert.ok("ok" in refused); assert.equal(refused.error, "PARTIAL_QTY_MULTI_RATE");
+  const n2 = netLineTotals(multi, invoiceFor(multi))!; assert.equal(n2.get(LINE)! + n2.get(C)!, 404); assert.equal(n2.get(D), 241);
+  const twoDisc: RefundSale = { ...multi, lines: multi.lines.map(l => ({ ...l, tgcRatePpm: 50_000 })) };
+  check(twoDisc, [], [{ lineId: LINE, qty: 2 }, { lineId: C, qty: 1 }, { lineId: D, qty: 1 }]);
+  check(twoDisc, [{ lineId: LINE, qty: 2 }], [{ lineId: LINE, qty: 1 }, { lineId: C, qty: 2 }]);
+  const net = netLineTotals(multi, invoiceFor(multi))!;
+  assert.equal(net.get(LINE)! + net.get(C)! + net.get(D)!, Number(multi.totalXpf)); assert.equal(net.has(SECOND), false);
+  const detail = readFileSync(new URL("../app/api/sales/[id]/route.ts", import.meta.url), "utf8");
+  assert.match(detail, /netLineTotals\(sale\)/); assert.match(detail, /netXpf:/);
 });

@@ -22,7 +22,9 @@ export type RefundPlan = {
   lineIds?: string[]; fullyRefunded: boolean;
 };
 export type RefundFailure = { ok: false; error: string; status?: number };
-export type RefundSuccess = { ok: true; creditNoteId: string; actionId: string; refundMethod: RefundInput["refundMethod"]; cashDrawer?: "EXTERNAL"; plan: RefundPlan };
+export type RefundSuccess = { ok: true; creditNoteId: string; actionId: string; refundMethod: RefundInput["refundMethod"]; cashDrawer?: "EXTERNAL"; plan: RefundPlan;
+  // Additifs (absents des anciens outcomes): date de confirmation, vente modifiée après émission.
+  doneAt?: string; saleChanged?: true };
 export type RefundResult = RefundFailure | RefundSuccess;
 export const refuse = (error: string, status = 409): RefundFailure => ({ ok: false, error, status });
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -49,6 +51,32 @@ export function refundFingerprint(input: RefundInput): string {
 const safe = (n: bigint) => n >= 0n && n <= BigInt(Number.MAX_SAFE_INTEGER);
 const ht = (ttc: bigint, rate: number) => (ttc * 1_000_000n + (1_000_000n + BigInt(rate)) / 2n) / (1_000_000n + BigInt(rate));
 
+type NetLine = { id: string; lineXpf: bigint; tgcRatePpm: number | null };
+// Répartition des remises (lignes négatives) sur les lignes positives du même taux, ordre stable par id.
+function netTotals(lines: NetLine[], rateOf: (l: NetLine) => number): Map<string, bigint> | null {
+  const totals = new Map<string, bigint>();
+  for (const rate of new Set(lines.map(rateOf))) {
+    const group = lines.filter(l => rateOf(l) === rate);
+    const positives = group.filter(l => l.lineXpf > 0n).sort((a, b) => a.id.localeCompare(b.id));
+    const gross = positives.reduce((s, l) => s + l.lineXpf, 0n);
+    const discount = -group.filter(l => l.lineXpf < 0n).reduce((s, l) => s + l.lineXpf, 0n);
+    if (discount > gross) return null;
+    let cumulative = 0n, allocated = 0n;
+    for (const l of positives) {
+      cumulative += l.lineXpf;
+      const next = discount * cumulative / gross;
+      totals.set(l.id, l.lineXpf - (next - allocated));
+      allocated = next;
+    }
+  }
+  return totals;
+}
+/** TTC net de chaque ligne positive après répartition des remises (XPF entiers). null si un taux est négatif. */
+export function netLineTotals(sale: { lines: NetLine[] }, invoice?: { tgcRatePpm: number | null } | null): Map<string, number> | null {
+  const totals = netTotals(sale.lines, l => l.tgcRatePpm ?? invoice?.tgcRatePpm ?? 0);
+  return totals && new Map([...totals].map(([id, v]) => [id, Number(v)]));
+}
+
 export function planPartialRefund(sale: RefundSale, invoice: InvoiceDetail, input: RefundInput, prior: RefundPlan[]): RefundPlan | RefundFailure {
   if (sale.status !== "PAID") return refuse("SALE_NOT_PAID");
   if (sale.voidPreparedAt) return refuse("VOID_IN_PROGRESS");
@@ -63,21 +91,8 @@ export function planPartialRefund(sale: RefundSale, invoice: InvoiceDetail, inpu
   const saleKeys = sale.lines.map(signature).sort();
   const invoiceKeys = invoice.lines.map(signature).sort();
   if (JSON.stringify(saleKeys) !== JSON.stringify(invoiceKeys)) return refuse("INVOICE_LINES_MISMATCH");
-  const totals = new Map<string, bigint>();
-  for (const rate of new Set(sale.lines.map(rateOf))) {
-    const group = sale.lines.filter(l => rateOf(l) === rate);
-    const positives = group.filter(l => l.lineXpf > 0n).sort((a, b) => a.id.localeCompare(b.id));
-    const gross = positives.reduce((s, l) => s + l.lineXpf, 0n);
-    const discount = -group.filter(l => l.lineXpf < 0n).reduce((s, l) => s + l.lineXpf, 0n);
-    if (discount > gross) return refuse("NEGATIVE_RATE_GROUP");
-    let cumulative = 0n, allocated = 0n;
-    for (const l of positives) {
-      cumulative += l.lineXpf;
-      const next = discount * cumulative / gross;
-      totals.set(l.id, l.lineXpf - (next - allocated));
-      allocated = next;
-    }
-  }
+  const totals = netTotals(sale.lines, rateOf);
+  if (!totals) return refuse("NEGATIVE_RATE_GROUP");
   const used = new Map<string, { qty: number; ttc: bigint }>();
   for (const p of prior) for (const l of p.lines) {
     const old = used.get(l.lineId) ?? { qty: 0, ttc: 0n };
