@@ -68,7 +68,9 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if ("ok" in replay) return replay;
         if (replay.outcome) return replay.outcome;
         const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId } });
-        if (!sale || sale.status !== "PAID" || sale.invoiceId !== reservation.plan.invoiceId) return refuse("REFUND_RETRY_SALE_CHANGED");
+        if (!sale) return refuse("SALE_NOT_FOUND", 404);
+        // L'avoir est déjà émis côté Compta: c'est un fait, on termine en DONE même si la vente a changé.
+        const saleChanged = sale.status !== "PAID" || sale.invoiceId !== reservation.plan.invoiceId;
         if (input.refundMethod === "CASH" && input.cashDrawer !== "EXTERNAL") {
           const action = await tx.partialRefund.findUniqueOrThrow({ where: key });
           // Le rejeu après clôture peut utiliser la nouvelle session du même poste.
@@ -85,9 +87,10 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
           await tx.partialRefund.update({ where: { id: action.id }, data: { sessionId: session.id } });
         }
         const outcome: RefundSuccess = { ok: true, actionId: input.actionId, creditNoteId, refundMethod: input.refundMethod,
-          ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}), plan: reservation.plan };
+          ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}), plan: reservation.plan,
+          doneAt: new Date().toISOString(), ...(saleChanged ? { saleChanged: true as const } : {}) };
         await tx.partialRefund.update({ where: key, data: { status: "DONE", creditNoteId, outcome: outcome as unknown as Prisma.InputJsonValue } });
-        if (reservation.plan.fullyRefunded) await tx.sale.update({ where: { id: saleId }, data: { fullyRefundedAt: new Date() } });
+        if (reservation.plan.fullyRefunded && !saleChanged) await tx.sale.update({ where: { id: saleId }, data: { fullyRefundedAt: new Date() } });
         return outcome;
       });
     },

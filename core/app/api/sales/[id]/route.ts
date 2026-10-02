@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { withTenant } from "@/lib/tenant";
 import { xpf } from "@/lib/serialize";
+import { netLineTotals } from "@/lib/partial-refund";
 
 export const runtime = "nodejs";
 
@@ -29,6 +30,9 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   );
 
   if (!sale) return NextResponse.json({ error: "Vente introuvable" }, { status: 404 });
+
+  // TTC net après répartition des remises (même calcul que l'avoir partiel); taux nul par défaut sans facture.
+  const net = netLineTotals(sale);
 
   return NextResponse.json({
     id: sale.id,
@@ -59,6 +63,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       unitXpf: xpf(l.unitXpf),
       lineXpf: xpf(l.lineXpf),
       tgcRatePpm: l.tgcRatePpm,
+      ...(l.lineXpf > 0n && net?.has(l.id) ? { netXpf: net.get(l.id)! } : {}),
     })),
     payments: sale.payments.map((p) => ({
       id: p.id,
