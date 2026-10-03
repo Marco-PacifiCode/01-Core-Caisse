@@ -344,6 +344,11 @@ model GiftCard {
   cancelledBy     String?   @db.Uuid
   cancelledByName String?
 
+  // ── Vente en ligne ────────────────────────────────────────────────────────────────────────
+  message String? // mot au bénéficiaire
+  // Commande en ligne (GiftCardOrder) soldée par ce bon, SANS FK (même discipline que saleId).
+  orderId String? @unique @db.Uuid
+
   // Le code ne vaut QUE dans son marchand. Sans le tenantId, deux salons se voleraient leurs
   // codes — et l'unicité est garantie EN BASE, pas au clic.
   @@unique([tenantId, code])
@@ -353,6 +358,56 @@ model GiftCard {
   @@index([tenantId, redeemedAt])
   @@index([tenantId, issuedAt])
   @@index([tenantId, saleId])
+}
+
+// ── COMMANDE DE BON CADEAU EN LIGNE ──────────────────────────────────────────────────────────
+//
+// La vitrine dépose une commande « à encaisser » (PENDING). Le bon NE naît PAS ici : il naît dans
+// la transaction du checkout (GiftCard.orderId), qui passe la commande à PAID par un UPDATE
+// conditionné à `status = PENDING`. Colonnes scalaires SANS FK vers Sale / GiftCard.
+// Phase 2 (paiement carte) : paymentProvider / paymentRef, vides pour l'instant.
+enum GiftCardOrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
+model GiftCardOrder {
+  id        String              @id @default(uuid()) @db.Uuid
+  tenantId  String              @db.Uuid
+  reference String // « CMD-XXXXXX »
+  status    GiftCardOrderStatus @default(PENDING)
+  channel   String              @default("ONLINE")
+
+  amountXpf    BigInt
+  serviceId    String? @db.Uuid
+  serviceLabel String?
+
+  buyerName        String
+  buyerPhone       String?
+  buyerEmail       String?
+  beneficiaryName  String
+  beneficiaryPhone String?
+  beneficiaryEmail String?
+  message          String?
+
+  paymentMode     String  @default("ON_SITE")
+  paymentProvider String?
+  paymentRef      String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  paidAt    DateTime?
+  saleId     String? @db.Uuid
+  giftCardId String? @unique @db.Uuid
+
+  cancelledAt     DateTime?
+  cancelReason    String?
+  cancelledBy     String?
+  cancelledByName String?
+
+  @@unique([tenantId, reference])
+  @@index([tenantId, status, createdAt])
 }
 
 // ── FIDÉLITÉ ───────────────────────────────────────────────────────────────────────────────

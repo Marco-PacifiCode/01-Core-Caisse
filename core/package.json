@@ -6,7 +6,7 @@
     "dev": "next dev -p 3106",
     "build": "next build",
     "start": "next start -p 3106",
-    "test": "node --test --experimental-strip-types \"lib/**/*.test.ts\"",
+    "test": "node --test --experimental-strip-types \"lib/**/*.test.ts\" \"app/**/*.test.ts\"",
     "db:migrate": "prisma migrate dev --name init",
     "db:rls": "prisma db execute --file prisma/rls.sql --schema prisma/schema.prisma",
     "db:seed": "prisma db seed",

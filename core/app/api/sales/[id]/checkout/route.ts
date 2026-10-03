@@ -198,6 +198,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       GIFT_CARD_CODE_TAKEN: 409,
       // Bon inconsommable (inconnu, deja brule, annule) : refus AVANT tout encaissement.
       GIFT_CARD_NOT_REDEEMABLE: 409,
+      // Commande de bon en ligne déjà payée/annulée/introuvable : refus AVANT tout encaissement
+      // (pré-contrôle), ou transaction annulée si une course la perd — aucun bon créé.
+      GIFT_CARD_ORDER_NOT_PENDING: 409,
+      // Montant du bon ≠ montant de la commande en ligne : refus AVANT tout encaissement.
+      GIFT_CARD_ORDER_AMOUNT_MISMATCH: 409,
       // Vente à crédit (lot A) : CREDIT_NOT_NEEDED = déjà soldé, refus au même titre qu'UNDERPAID
       // (conflit d'état AVANT tout encaissement). CREDIT_NEEDS_DEPOSIT = requête bien formée mais
       // 1er versement manquant/nul — 422, pas 409 (ce n'est pas un conflit d'état, une correction
