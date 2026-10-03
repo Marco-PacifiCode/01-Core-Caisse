@@ -473,3 +473,56 @@ test("isRedeemedInSession : closedAt null (session ouverte) → pas de borne hau
 test("isRedeemedInSession : redeemedAt null → faux", () => {
   assert.equal(isRedeemedInSession(null, { openedAt, closedAt }), false);
 });
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Vente en ligne : message et commande soldée (orderId)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("validateGiftCard : message et orderId absents → null", () => {
+  const r = validateGiftCard(inputNominal());
+  assert.ok(r.ok);
+  if (r.ok) {
+    assert.equal(r.data.message, null);
+    assert.equal(r.data.orderId, null);
+  }
+});
+
+test("validateGiftCard : message et orderId valides → conservés", () => {
+  const r = validateGiftCard(inputNominal({ message: " Joyeux anniversaire ", orderId: UUID_VALIDE }));
+  assert.ok(r.ok);
+  if (r.ok) {
+    assert.equal(r.data.message, "Joyeux anniversaire");
+    assert.equal(r.data.orderId, UUID_VALIDE);
+  }
+});
+
+// Rétrocompat stricte (92aea55 ignorait `message`) : jamais de nouveau refus au checkout.
+test("validateGiftCard : message > 500 → tronqué à 500, pas de refus", () => {
+  const r = validateGiftCard(inputNominal({ message: "a".repeat(501) }));
+  assert.ok(r.ok);
+  if (r.ok) assert.equal(r.data.message, "a".repeat(500));
+});
+
+test("validateGiftCard : message non-string → ignoré (null), pas de refus", () => {
+  const r = validateGiftCard(inputNominal({ message: 42 }));
+  assert.ok(r.ok);
+  if (r.ok) assert.equal(r.data.message, null);
+});
+
+test("validateGiftCard : orderId non UUID → INVALID_ORDER_ID", () => {
+  const r = validateGiftCard(inputNominal({ orderId: "pas-un-uuid" }));
+  assert.deepEqual(r, { ok: false, error: "INVALID_ORDER_ID" });
+});
+
+test("validateGiftCards : deux bons pour la même commande → DUPLICATE_ORDER", () => {
+  const r = validateGiftCards([
+    inputNominal({ code: "BCAAAAAA", orderId: UUID_VALIDE }),
+    inputNominal({ code: "BCBBBBBB", orderId: UUID_VALIDE }),
+  ]);
+  assert.deepEqual(r, { ok: false, error: "DUPLICATE_ORDER", index: 1 });
+});
+
+test("validateGiftCards : deux bons sans commande → ok", () => {
+  const r = validateGiftCards([inputNominal({ code: "BCAAAAAA" }), inputNominal({ code: "BCBBBBBB" })]);
+  assert.ok(r.ok);
+});

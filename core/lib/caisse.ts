@@ -15,6 +15,7 @@
 // il est tracé sur la vente (comptaSyncedAt/stockSyncedAt/syncError) et repris par repairSale
 // (endpoint /api/sales/:id/repair + balayage /api/cron/repair-sales).
 
+import { randomUUID } from "node:crypto";
 import { assertTenantId, withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
 import { log } from "./log";
@@ -679,8 +680,12 @@ export type CheckoutError =
   // Bons cadeaux (PC-0064) : les DEUX refus tombent AVANT que le moindre franc soit acté.
   // C'est la seule place tenable — un bon refusé après l'encaissement laisserait une vente
   // payée sans le bon qu'elle a vendu, c'est-à-dire de l'argent pris pour rien.
-  | { ok: false; error: "GIFT_CARD_INVALID"; reason: GiftCardRefusal | "DUPLICATE_CODE"; index: number }
+  | { ok: false; error: "GIFT_CARD_INVALID"; reason: GiftCardRefusal | "DUPLICATE_CODE" | "DUPLICATE_ORDER"; index: number }
   | { ok: false; error: "GIFT_CARD_CODE_TAKEN"; code: string }
+  // Commande en ligne (GiftCardOrder) que le bon devait solder, mais qui n'est plus PENDING
+  // (déjà encaissée, annulée, inconnue) : la transaction est annulée, aucun bon n'est créé.
+  | { ok: false; error: "GIFT_CARD_ORDER_NOT_PENDING"; orderId: string }
+  | { ok: false; error: "GIFT_CARD_ORDER_AMOUNT_MISMATCH"; orderId: string }
   // Bon à CONSOMMER qui n'est pas consommable : inconnu, déjà brûlé, ou annulé. Le refus tombe
   // AVANT que le moindre paiement soit persisté ; et si un autre comptoir brûle le même bon dans
   // l'intervalle, l'`updateMany` de la transaction rend 0 et fait ÉCHOUER le passage à PAID —
@@ -961,6 +966,28 @@ export async function checkoutSale(
     }
   }
 
+  // ── Commandes en ligne : sont-elles encore à encaisser ? ────────────────────────────────
+  // Lue AVANT de persister le moindre paiement, même raison que les deux contrôles au-dessus ;
+  // l'UPDATE conditionnel de la transaction reste le dernier mot pour la course.
+  const giftCardsWithOrder = giftCardsToIssue.filter((g) => g.orderId);
+  if (giftCardsWithOrder.length > 0) {
+    const orders = await withTenant(tenantId, (tx) =>
+      tx.giftCardOrder.findMany({
+        where: { tenantId, id: { in: giftCardsWithOrder.map((g) => g.orderId as string) } },
+        select: { id: true, status: true, amountXpf: true },
+      }),
+    );
+    for (const g of giftCardsWithOrder) {
+      const row = orders.find((r) => r.id === g.orderId);
+      if (!row || row.status !== "PENDING") {
+        return { ok: false, error: "GIFT_CARD_ORDER_NOT_PENDING", orderId: g.orderId as string };
+      }
+      if (BigInt(row.amountXpf) !== BigInt(g.amountXpf)) {
+        return { ok: false, error: "GIFT_CARD_ORDER_AMOUNT_MISMATCH", orderId: g.orderId as string };
+      }
+    }
+  }
+
   // ── Fidélité à CONSOMMER : la récompense est-elle encore consommable, ET le montant posé
   //    par la surface est-il EXACTEMENT celui attendu ? ──────────────────────────────────────
   // Même raison, exactement, que les deux contrôles bons cadeaux ci-dessus : cette lecture est
@@ -1089,6 +1116,8 @@ export async function checkoutSale(
   // la même raison : une affectation faite DANS la closure de la transaction ne se lit pas comme
   // un `let` par l'analyse de flot.
   const loyaltyRace: { hit: boolean } = { hit: false };
+  // Sentinelle de COURSE, commande de bon en ligne — même schéma que `race` / `loyaltyRace`.
+  const orderRace: { id: string | null } = { id: null };
   // Bon cadeau émis PAR CETTE vente : montant EXCLU de l'assiette de points (décision Marco,
   // complément du 15/09 au lot C1) — cf. lib/loyalty.ts#pointsForSale, dernier paramètre. Calculé
   // sur les DONNÉES DE L'ENTRÉE (giftCardsToIssue), pas sur les lignes ni sur les bons relus en
@@ -1141,10 +1170,32 @@ export async function checkoutSale(
     if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
     const rows: GiftCardIssued[] = [];
     for (const g of giftCardsToIssue) {
-      const row = await tx.giftCard.create({
-        data: { tenantId, saleId, ...g },
-        select: { id: true, code: true, amountXpf: true, serviceLabel: true, expiresAt: true, beneficiaryName: true },
-      });
+      // Commande en ligne soldée par ce bon : l'UPDATE conditionnel `status: PENDING` (une ligne
+      // ou rien) passe AVANT la création du bon, avec un id de bon tiré d'avance. Deux
+      // encaissements simultanés de la même commande : le 2e attend le verrou de ligne de la
+      // commande, la voit PAID, 0 ligne ⇒ GIFT_CARD_ORDER_NOT_PENDING (409) et TOUTE la
+      // transaction est annulée (aucun bon) — au lieu d'un P2002 sur GiftCard.orderId (500).
+      // Sans `orderId`, la création du bon est strictement celle d'avant.
+      let row;
+      if (g.orderId) {
+        const newId = randomUUID();
+        const orderWhere = { id: g.orderId, tenantId, status: "PENDING" as const };
+        const orderData = { status: "PAID" as const, paidAt: datePaiement, saleId, giftCardId: newId };
+        const orderUpd = await tx.giftCardOrder.updateMany({ where: orderWhere, data: orderData });
+        if (orderUpd.count !== 1) {
+          orderRace.id = g.orderId;
+          throw new Error("GIFT_CARD_ORDER_NOT_PENDING");
+        }
+        row = await tx.giftCard.create({
+          data: { tenantId, saleId, ...g, id: newId },
+          select: { id: true, code: true, amountXpf: true, serviceLabel: true, expiresAt: true, beneficiaryName: true },
+        });
+      } else {
+        row = await tx.giftCard.create({
+          data: { tenantId, saleId, ...g },
+          select: { id: true, code: true, amountXpf: true, serviceLabel: true, expiresAt: true, beneficiaryName: true },
+        });
+      }
       rows.push({
         id: row.id,
         code: row.code,
@@ -1208,6 +1259,7 @@ export async function checkoutSale(
     // vide n'est jamais lue : le refus part à la ligne suivante, avant tout usage d'`issued`.
     if (race.id) return [] as GiftCardIssued[];
     if (loyaltyRace.hit) return [] as GiftCardIssued[];
+    if (orderRace.id) return [] as GiftCardIssued[];
     throw e;
   });
   if (race.id) {
@@ -1215,6 +1267,9 @@ export async function checkoutSale(
   }
   if (loyaltyRace.hit) {
     return { ok: false, error: "LOYALTY_NOT_REDEEMABLE", reason: "ALREADY_REDEEMED" };
+  }
+  if (orderRace.id) {
+    return { ok: false, error: "GIFT_CARD_ORDER_NOT_PENDING", orderId: orderRace.id };
   }
 
   // 3. SYNCHRO Compta + Stock — un échec ici ne remet PAS l'encaissement en cause (reprise différée).
@@ -1872,7 +1927,8 @@ export async function createGiftCardWithoutSale(
   if (!validated.ok) return { ok: false, error: validated.error };
   try {
     const row = await withTenant(tenantId, (tx) =>
-      tx.giftCard.create({ data: { tenantId, ...validated.data }, select: GIFT_CARD_SELECT }),
+      // orderId forcé à null : un bon hors vente ne solde jamais une commande en ligne.
+      tx.giftCard.create({ data: { tenantId, ...validated.data, orderId: null }, select: GIFT_CARD_SELECT }),
     );
     return { ok: true, card: toGiftCardView(row) };
   } catch (e) {

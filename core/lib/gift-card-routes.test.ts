@@ -319,6 +319,38 @@ test("🔴 la consommation est un UPDATE CONDITIONNEL, et 0 ligne annule tout l'
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
+// 9 bis. 🔴 COMMANDE EN LIGNE soldée DANS la transaction du checkout
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+test("🔴 commande PENDING → PAID (saleId, giftCardId) dans LA MÊME transaction que le bon", () => {
+  // Le bloc commun s'arrête à la fermeture du create : on isole ici jusqu'à `return rows;`.
+  const bloc = isolateBlock(corpsCheckoutSale(), "const issued = await withTenant", "return rows;");
+  const iCreate = bloc.indexOf("tx.giftCard.create");
+  const iOrder = bloc.indexOf("tx.giftCardOrder.updateMany");
+  // 2026-10-03 : la commande se solde AVANT la création du bon (id tiré par randomUUID) —
+  // deux encaissements simultanés : le 2e attend le verrou de ligne, voit PAID → 409, pas un P2002.
+  assert.ok(iOrder > -1 && iCreate > iOrder, "la commande se solde AVANT la création du bon, dans la transaction");
+  assert.match(bloc, /const newId = randomUUID\(\)/);
+  assert.match(bloc, /const orderWhere = \{ id: g\.orderId, tenantId, status: "PENDING" as const \}/);
+  assert.match(bloc, /status: "PAID" as const, paidAt: datePaiement, saleId, giftCardId: newId/);
+});
+
+test("🔴 commande déjà PAID/annulée → la transaction est annulée (aucun bon) et 409 GIFT_CARD_ORDER_NOT_PENDING", () => {
+  const bloc = isolateBlock(corpsCheckoutSale(), "const issued = await withTenant", "return rows;");
+  assert.match(bloc, /orderUpd\.count !== 1/);
+  assert.match(bloc, /throw new Error\("GIFT_CARD_ORDER_NOT_PENDING"\)/);
+  const corps = corpsCheckoutSale();
+  assert.match(corps, /if \(orderRace\.id\) return \[\] as GiftCardIssued\[\]/);
+  assert.match(corps, /error: "GIFT_CARD_ORDER_NOT_PENDING", orderId: orderRace\.id/);
+  assert.match(checkoutSrc(), /GIFT_CARD_ORDER_NOT_PENDING: 409/);
+});
+
+test("createGiftCardWithoutSale force orderId à null (un bon hors vente ne solde jamais une commande)", () => {
+  const corps = exportBody(caisseSrc(), "createGiftCardWithoutSale");
+  assert.match(corps, /\.\.\.validated\.data, orderId: null/);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
 // 10. 🔴 BON CONSOMMÉ LIÉ AU RDV HONORÉ (redeemedAppointmentId)
 // ══════════════════════════════════════════════════════════════════════════════════════════
 //

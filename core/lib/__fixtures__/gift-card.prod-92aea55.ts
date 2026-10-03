@@ -1,3 +1,5 @@
+// copie figée de la prod 92aea55 pour le test de rétrocompatibilité — ne pas modifier
+// (source : git show 92aea55:core/lib/gift-card.ts)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // lib/gift-card.ts — logique PURE des bons cadeaux (PC-0064).
 //
@@ -89,8 +91,6 @@ export type GiftCardRefusal =
   | "CODE_REQUIRED" // sans code, le bon est introuvable au comptoir
   | "CODE_TOO_LONG"
   | "BENEFICIARY_REQUIRED" // il faut savoir À QUI le bon est destiné, sinon on ne le retrouve pas
-  | "MESSAGE_TOO_LONG" // mot doux au bénéficiaire : 500 caractères au plus
-  | "INVALID_ORDER_ID" // commande en ligne à solder : UUID ou rien
   | "EXPIRY_INVALID"; // une date de validité illisible vaut mieux refusée que stockée de travers
 
 export type GiftCardRedeemRefusal =
@@ -201,10 +201,6 @@ export type GiftCardInput = {
   beneficiaryPhone?: unknown;
   beneficiaryEmail?: unknown;
   expiresAt?: unknown;
-  /** Mot au bénéficiaire (≤ 500). */
-  message?: unknown;
-  /** Commande en ligne (GiftCardOrder PENDING) que ce bon solde à l'encaissement. */
-  orderId?: unknown;
 };
 
 /** Ce que la couche base écrit, une fois l'entrée jugée bonne. Tout est déjà normalisé. */
@@ -220,11 +216,9 @@ export type GiftCardData = {
   beneficiaryPhone: string | null;
   beneficiaryEmail: string | null;
   expiresAt: Date | null;
-  message: string | null;
-  orderId: string | null;
 };
 
-export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Valide et normalise un bon à émettre.
@@ -261,23 +255,6 @@ export function validateGiftCard(input: GiftCardInput): { ok: true; data: GiftCa
     ? input.serviceId.trim()
     : null;
 
-  let message: string | null = null;
-  // Rétrocompat stricte (clients prod sur 92aea55, qui ignorait ce champ) : un `message`
-  // non-string est IGNORÉ et un texte trop long est TRONQUÉ à 500 — jamais un nouveau refus.
-  // Le refus MESSAGE_TOO_LONG vit à la commande publique (`gift-card-order.ts`).
-  if (typeof input.message === "string") {
-    const m = input.message.trim().slice(0, 500);
-    message = m.length > 0 ? m : null;
-  }
-
-  let orderId: string | null = null;
-  if (input.orderId !== undefined && input.orderId !== null && input.orderId !== "") {
-    if (typeof input.orderId !== "string" || !UUID_RE.test(input.orderId.trim())) {
-      return { ok: false, error: "INVALID_ORDER_ID" };
-    }
-    orderId = input.orderId.trim().toLowerCase();
-  }
-
   return {
     ok: true,
     data: {
@@ -292,8 +269,6 @@ export function validateGiftCard(input: GiftCardInput): { ok: true; data: GiftCa
       beneficiaryPhone,
       beneficiaryEmail,
       expiresAt: expiry.expiresAt,
-      message,
-      orderId,
     },
   };
 }
@@ -308,19 +283,14 @@ export function validateGiftCard(input: GiftCardInput): { ok: true; data: GiftCa
  */
 export function validateGiftCards(
   inputs: readonly GiftCardInput[],
-): { ok: true; data: GiftCardData[] } | { ok: false; error: GiftCardRefusal | "DUPLICATE_CODE" | "DUPLICATE_ORDER"; index: number } {
+): { ok: true; data: GiftCardData[] } | { ok: false; error: GiftCardRefusal | "DUPLICATE_CODE"; index: number } {
   const out: GiftCardData[] = [];
   const seen = new Set<string>();
-  const seenOrders = new Set<string>();
   for (let i = 0; i < inputs.length; i++) {
     const r = validateGiftCard(inputs[i]);
     if (!r.ok) return { ok: false, error: r.error, index: i };
     if (seen.has(r.data.code)) return { ok: false, error: "DUPLICATE_CODE", index: i };
     seen.add(r.data.code);
-    if (r.data.orderId !== null) {
-      if (seenOrders.has(r.data.orderId)) return { ok: false, error: "DUPLICATE_ORDER", index: i };
-      seenOrders.add(r.data.orderId);
-    }
     out.push(r.data);
   }
   return { ok: true, data: out };
@@ -332,7 +302,7 @@ export function validateGiftCards(
  * Alphabet sans caractère ambigu : ni O/0, ni I/1, ni S/5. Voir `normalizeCode` — ce code est
  * recopié à la main, et une confusion de glyphe se paie par un bon introuvable au comptoir.
  */
-export const CODE_ALPHABET = "ABCDEFGHJKLMNPQRTUVWXYZ2346789";
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRTUVWXYZ2346789";
 
 /**
  * Code lisible d'un bon (« BC4K7QP2 » — l'écran l'affiche avec un tiret, la base le stocke sans).

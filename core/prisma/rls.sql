@@ -25,7 +25,7 @@ DO $$
 DECLARE
   t text;
   tables text[] := ARRAY[
-    'CashSession','Sale','SaleLine','SalePayment','CashMovement','GiftCard',
+    'CashSession','Sale','SaleLine','SalePayment','CashMovement','GiftCard','GiftCardOrder',
     'LoyaltyProgram','LoyaltyAccount','LoyaltyEntry','VoidAction'
   ];
 BEGIN
