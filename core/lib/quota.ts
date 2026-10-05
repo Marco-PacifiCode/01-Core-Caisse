@@ -76,8 +76,10 @@ export function droitDepuisReponse(payload: unknown, tenantId: string, cle: stri
   if (plafond !== null && plafond !== undefined && (!Number.isSafeInteger(plafond) || (plafond as number) < 0)) {
     throw new Error("Plafond Core-Auth invalide");
   }
+  // Une ligne à moitié lisible n'est pas appliquée : mieux vaut pas de verrou qu'un plafond douteux.
+  if (!Number.isSafeInteger(niveau) || (niveau as number) < 1) throw new Error("Niveau Core-Auth invalide");
   return {
-    niveau: Number.isSafeInteger(niveau) ? (niveau as number) : null,
+    niveau: niveau as number,
     plafond: typeof plafond === "number" ? plafond : null,
     quoi: typeof quoi === "string" && quoi ? quoi : null,
   };
@@ -110,7 +112,11 @@ export async function lireDroit(
     cache.set(k, { expire: Date.now() + DUREE_CACHE_MS, droit });
     return droit;
   } catch (e) {
-    opts.journal?.(e);
+    try {
+      opts.journal?.(e);
+    } catch {
+      // journaliser ne doit jamais transformer une ouverture en panne
+    }
     cache.set(k, { expire: Date.now() + DUREE_CACHE_PANNE_MS, droit: null });
     return null;
   }

@@ -63,6 +63,8 @@ test("droitDepuisReponse lit la forme réelle de Core-Auth (niveau entier)", () 
   assert.deepEqual(droitDepuisReponse(reponse(null), TENANT, "CAISSE"), { niveau: 1, plafond: null, quoi: "postes de caisse" });
   assert.equal(droitDepuisReponse({ tenantId: TENANT, droits: [] }, TENANT, "CAISSE"), null);
   assert.throws(() => droitDepuisReponse({ tenantId: "autre", droits: [] }, TENANT, "CAISSE"));
+  // Ligne à moitié lisible : jamais appliquée (sinon un plafond 0 mal formé fermerait la caisse).
+  assert.throws(() => droitDepuisReponse({ tenantId: TENANT, droits: [{ cle: "CAISSE", niveau: "invalide", plafond: 0, quoi: null }] }, TENANT, "CAISSE"));
 });
 
 test("lireDroit rend le plafond envoyé par Core-Auth", async () => {
@@ -85,4 +87,10 @@ test("ouverture : Core-Auth en panne, en erreur, réponse invalide ou clé absen
   viderCacheQuota();
   delete process.env.CORE_AUTH_API_KEY;
   assert.equal(await lireDroit(TENANT, "CAISSE"), null);
+
+  // Un journal qui lève ne doit pas faire lever la lecture.
+  viderCacheQuota();
+  process.env.CORE_AUTH_API_KEY = "cle-de-test";
+  globalThis.fetch = (async () => { throw Object.create(null); }) as typeof fetch;
+  assert.equal(await lireDroit(TENANT, "CAISSE", { journal: () => { throw new Error("journal cassé"); } }), null);
 });

@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
   // Le poste est noté au registre APRÈS l'import réussi, sans contrôle : une session faite
   // hors ligne n'est jamais refusée pour une raison de quota. Ne lève jamais.
   const posteImporte = body.posteId?.trim();
-  if (posteImporte) await noterPosteHorsLigne(tenantId, posteImporte);
+  if (posteImporte && !result.alreadyExisted) await noterPosteHorsLigne(tenantId, posteImporte);
 
   return NextResponse.json({
     ok: true,

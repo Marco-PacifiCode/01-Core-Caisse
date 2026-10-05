@@ -18,12 +18,25 @@ import { decisionInscription, lireDroit, refusPostes, type DroitQuota, type Quot
 
 const CLE = "CAISSE";
 
-function droitCaisse(tenantId: string): Promise<DroitQuota | null> {
-  return lireDroit(tenantId, CLE, { journal: (e) => log.error("quota.lireDroit", e, { tenantId, cle: CLE }) });
+/** Journaliser ne doit jamais transformer une ouverture en panne (rejet exotique, sérialisation…). */
+function journal(evenement: string, erreur: unknown, contexte: Record<string, unknown>): void {
+  try {
+    log.error(evenement, erreur, contexte);
+  } catch {
+    // rien : le journal est un confort, pas une condition
+  }
 }
 
-/** Sérialise les inscriptions d'un même tenant jusqu'à la fin de la transaction. */
+function droitCaisse(tenantId: string): Promise<DroitQuota | null> {
+  return lireDroit(tenantId, CLE, { journal: (e) => journal("quota.lireDroit", e, { tenantId, cle: CLE }) });
+}
+
+/**
+ * Sérialise les inscriptions d'un même tenant jusqu'à la fin de la transaction. Attente bornée :
+ * au-delà de 3 s la base lève, l'appelant attrape, et l'ouverture se fait sans contrôle.
+ */
 async function verrouRegistre(tx: Prisma.TransactionClient, tenantId: string): Promise<void> {
+  await tx.$executeRaw`SELECT set_config('lock_timeout', '3s', true)`;
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"quota-postes:" + tenantId}, 0))`;
 }
 
@@ -36,22 +49,27 @@ async function aDejaTravaille(tx: Prisma.TransactionClient, tenantId: string, po
 /**
  * Appelé par `openSession` quand un `posteId` est fourni. Rend `ok: true` dans tous les cas
  * sauf UN : un poste nouveau (ou rallumé) alors que le plafond est atteint. Ne lève jamais.
+ * `nouveau` = ce poste vient d'être inscrit par cet appel, sans passé (cf. `annulerInscription`).
+ *
+ * Ordre voulu : le REGISTRE d'abord. Un poste connu et actif — le cas de tous les jours — coûte
+ * une lecture en base et ne dépend jamais de Core-Auth, même en panne ou muet. Les droits ne
+ * sont demandés que pour un poste que le registre ne connaît pas actif.
  */
 export async function inscrirePosteEnLigne(
   tenantId: string,
   posteId: string,
-): Promise<{ ok: true } | { ok: false; quota: QuotaAtteint }> {
+): Promise<{ ok: true; nouveau: boolean } | { ok: false; quota: QuotaAtteint }> {
   try {
-    const droit = await droitCaisse(tenantId); // avant la transaction : pas d'appel réseau sous verrou
+    const cle = { tenantId_posteId: { tenantId, posteId } };
+    const connu = await withTenant(tenantId, (tx) => tx.poste.findUnique({ where: cle, select: { actif: true } }));
+    if (connu?.actif) return { ok: true, nouveau: false };
+
+    const droit = await droitCaisse(tenantId); // hors transaction : pas d'appel réseau sous verrou
     const plafond = droit?.plafond ?? null;
     return await withTenant(tenantId, async (tx) => {
-      const cle = { tenantId_posteId: { tenantId, posteId } };
-      // Chemin de tous les jours : poste connu et actif → une lecture, aucun verrou.
-      const connu = await tx.poste.findUnique({ where: cle, select: { actif: true } });
-      if (connu?.actif) return { ok: true as const };
-
       await verrouRegistre(tx, tenantId);
       const poste = await tx.poste.findUnique({ where: cle, select: { actif: true } });
+      if (poste?.actif) return { ok: true as const, nouveau: false };
       const aHistorique = poste ? false : await aDejaTravaille(tx, tenantId, posteId);
       const actifs = await tx.poste.count({ where: { tenantId, actif: true } });
       const decision = decisionInscription({ poste, aHistorique, plafond, actifs });
@@ -65,32 +83,45 @@ export async function inscrirePosteEnLigne(
           update: { actif: true, horsQuota: decision.horsQuota },
         });
       }
-      return { ok: true as const };
+      return { ok: true as const, nouveau: !poste && !aHistorique };
     });
   } catch (e) {
-    log.error("quota.inscrirePoste", e, { tenantId, posteId });
-    return { ok: true };
+    journal("quota.inscrirePoste", e, { tenantId, posteId });
+    return { ok: true, nouveau: false };
   }
 }
 
 /**
- * Après l'import RÉUSSI d'une session faite hors ligne : on note le poste s'il est inconnu,
- * sans aucun contrôle (marqué hors quota s'il dépasse). Ne lève jamais, ne refuse jamais.
+ * L'ouverture de session a échoué juste après l'inscription d'un poste sans passé : on retire
+ * la ligne, pour qu'un poste qui n'a jamais ouvert n'occupe pas une place. Ne lève jamais.
+ */
+export async function annulerInscription(tenantId: string, posteId: string): Promise<void> {
+  try {
+    await withTenant(tenantId, async (tx) => {
+      if (await aDejaTravaille(tx, tenantId, posteId)) return;
+      await tx.poste.deleteMany({ where: { tenantId, posteId } });
+    });
+  } catch (e) {
+    journal("quota.annulerInscription", e, { tenantId, posteId });
+  }
+}
+
+/**
+ * Après l'import d'une session faite hors ligne et réellement CRÉÉE : on note le poste s'il est
+ * inconnu. Aucun contrôle, aucun appel à Core-Auth (l'import ne doit attendre personne) : le
+ * dépassement se lit sur le compteur (`utilise` > `plafond`). Ne lève jamais, ne refuse jamais.
  */
 export async function noterPosteHorsLigne(tenantId: string, posteId: string): Promise<void> {
   try {
-    const droit = await droitCaisse(tenantId);
-    const plafond = droit?.plafond ?? null;
-    await withTenant(tenantId, async (tx) => {
-      const cle = { tenantId_posteId: { tenantId, posteId } };
-      if (await tx.poste.findUnique({ where: cle, select: { id: true } })) return;
-      await verrouRegistre(tx, tenantId);
-      const actifs = await tx.poste.count({ where: { tenantId, actif: true } });
-      const horsQuota = plafond !== null && actifs >= plafond;
-      await tx.poste.upsert({ where: cle, create: { tenantId, posteId, horsQuota }, update: {} });
-    });
+    await withTenant(tenantId, (tx) =>
+      tx.poste.upsert({
+        where: { tenantId_posteId: { tenantId, posteId } },
+        create: { tenantId, posteId },
+        update: {},
+      }),
+    );
   } catch (e) {
-    log.error("quota.noterPosteHorsLigne", e, { tenantId, posteId });
+    journal("quota.noterPosteHorsLigne", e, { tenantId, posteId });
   }
 }
 
