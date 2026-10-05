@@ -74,6 +74,7 @@ import {
   type LoyaltyProgramRow,
 } from "./loyalty-db";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
+import { inscrirePosteEnLigne } from "./postes";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
@@ -96,6 +97,13 @@ export async function openSession(
   },
 ) {
   const posteId = input.posteId ?? null;
+  // Quota de postes (2026-10-05) : SEUL endroit du moteur où un quota peut dire non, et
+  // seulement à un poste NOUVEAU alors que le plafond est atteint. Sans `posteId` (marchand
+  // mono-caisse), rien n'est contrôlé. Tout échec du registre ouvre. Cf. lib/postes.ts.
+  if (posteId) {
+    const inscription = await inscrirePosteEnLigne(tenantId, posteId);
+    if (!inscription.ok) return { ok: false as const, ...inscription.quota };
+  }
   return withTenant(tenantId, async (tx) => {
     // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
     // règle reste identique à avant : une seule pour le marchand.

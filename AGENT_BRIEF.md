@@ -4,6 +4,20 @@
 
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
+## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ⛔ NON DÉPLOYÉ, migration NON JOUÉE, verrou NON BRANCHÉ
+
+- **Règle (Marco, 05/10)** : la brique Caisse se compte en **nombre de postes**. Le verrou ne bloque **que l'enregistrement d'un NOUVEAU poste** au-delà du plafond. **Jamais une vente**, jamais `POST /api/sales`, jamais `POST /api/sessions/import`, jamais une clôture, jamais un poste déjà enregistré.
+- **Où est le verrou** : `openSession` (`core/lib/caisse.ts`), quand un `posteId` est fourni → `inscrirePosteEnLigne` (`core/lib/postes.ts`). Refus : `409 { ok: false, error: "quota_atteint", code, cle, plafond, utilise, quoi, message }` par le chemin d'erreur existant de `POST /api/sessions` (la route n'a pas changé). Sans `posteId` (mono-caisse) : rien n'est contrôlé.
+- **`createSale` et `importerCloture` ne sont PAS modifiés** et ne lisent pas le registre. Une première version (GPT) y inscrivait le poste avant la vente, hors de tout `try` : table absente ou base en erreur = vente refusée. Écartée. **À NE PAS RÉINTRODUIRE.** L'import note le poste APRÈS coup, dans la route, sans contrôle (`noterPosteHorsLigne`, ne lève jamais).
+- **Poste antérieur au registre** : inconnu du registre mais ayant déjà une session ou une vente à son nom → inscrit SANS contrôle, `horsQuota = true` s'il dépasse (`decisionInscription`, `core/lib/quota.ts`). Un poste qui vendait hier ouvre aujourd'hui.
+- **OUVERTURE, à ne jamais inverser** : droit absent, plafond null, `CORE_AUTH_API_KEY` non provisionnée, Core-Auth en panne, table `Poste` absente, erreur de base → aucun verrou, l'ouverture se déroule comme avant.
+- **Les droits vivent dans Core-Auth** (`GET /api/s2s/tenants/{id}/droits`, clé `CAISSE`, `niveau` ENTIER) — délai 2 s, cache 60 s (15 s en panne).
+- **Schéma** : table `Poste` (tenantId, posteId, libelle, actif, horsQuota). Migration ADDITIVE `20261005130000_postes` (RLS forcée comme les voisines), **sans reprise** : sous FORCE RLS le propriétaire lirait zéro session. Reprise facultative pour un rôle BYPASSRLS : `core/prisma/manual/2026-10-05_postes_reprise.sql`. `rls.sql` liste `Poste`.
+- **Routes** : `GET /api/postes?tenantId=` (consommation + registre), `PATCH /api/postes` (renommer, désactiver = libère une place, rallumer = repasse par le plafond ; refus si session ouverte).
+- **Tests** : `core/lib/quota.test.ts` (9, règles pures + lecture des droits). ⚠️ **Non vérifié à l'exécution** : tout le chemin base de données (`postes.ts` : verrou consultatif, upsert sous RLS) — pas de base de test en session. À éprouver sur un tenant de test avant de brancher.
+- 👉 **Pour brancher (accord Marco requis)** : jouer la migration ici (rôle `core_caisse_owner`) ; provisionner `CORE_AUTH_API_KEY` ; jouer la migration Core-Auth `20261005120000_droit_tenant` ; déployer Core-Auth puis Core-Caisse. Déployé sans la migration, le code reste ouvert (une erreur journalisée par ouverture de session avec poste).
+- ⚠️ **Limite connue** : les applications appelantes choisissent leur `posteId` librement (aucun appelant trouvé dans les dépôts voisins au 05/10) — un navigateur vidé peut produire un nouvel identifiant, donc un nouveau poste. À cadrer côté application de caisse avant de vendre un plafond à 1 poste.
+
 ## 🔁 2026-10-01 — ANNULATION IDEMPOTENTE (`actionId`) — ✅ EN PRODUCTION (PR #52, be14a3c, accord QCM Marco « Oui, lot Core-Caisse »)
 
 - `POST /api/sales/:id/void` : `{ tenantId, reason?, actionId? }` (UUID, ou en-tête `Idempotency-Key`). Même clé rejouée → un seul avoir ; vente déjà VOID → succès `alreadyVoid:true` + `creditNoteId`, quelle que soit la clé ; clé déjà liée à une AUTRE vente → 409 définitif.

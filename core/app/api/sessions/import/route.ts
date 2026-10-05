@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { importerCloture } from "@/lib/caisse";
+import { noterPosteHorsLigne } from "@/lib/postes";
 
 /**
  * POST /api/sessions/import
@@ -65,6 +66,11 @@ export async function POST(req: NextRequest) {
   });
 
   if (!result.ok) return NextResponse.json(result, { status: 400 });
+
+  // Le poste est noté au registre APRÈS l'import réussi, sans contrôle : une session faite
+  // hors ligne n'est jamais refusée pour une raison de quota. Ne lève jamais.
+  const posteImporte = body.posteId?.trim();
+  if (posteImporte) await noterPosteHorsLigne(tenantId, posteImporte);
 
   return NextResponse.json({
     ok: true,

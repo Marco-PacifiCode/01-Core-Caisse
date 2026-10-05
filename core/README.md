@@ -112,6 +112,10 @@ Généré via l'endpoint **reçu** de Core-Compta : `GET /api/invoices/:id/recei
 | POST | `/api/sessions` | Ouvrir une session (`openedBy`, `openingFloatXpf?`). |
 | GET | `/api/sessions?tenantId=…` | Lister les sessions. |
 | POST | `/api/sessions/:id/close` | Clôture Z (`closedBy`, `closingCountedXpf`). |
+| GET | `/api/postes?tenantId=…` | Quota de postes : `{ cle: "CAISSE", quoi, niveau, plafond, utilise, postes: [{ posteId, libelle, actif, horsQuota, creeLe }] }`. `plafond` null = pas de plafond. |
+| PATCH | `/api/postes` | Renommer / désactiver / rallumer un poste (`tenantId`, `posteId`, `libelle?`, `actif?`). 404 `POSTE_INCONNU`, 409 `SESSION_OUVERTE`, 409 `quota_atteint`. |
+
+**Quota de postes (2026-10-05).** Le droit vit dans Core-Auth (clé `CAISSE`, lu par `GET /api/s2s/tenants/{id}/droits` avec `CORE_AUTH_API_KEY` en `X-Core-Key`). Le verrou ne joue qu'à `POST /api/sessions` avec un `posteId` : un poste NOUVEAU (ou désactivé puis rallumé) alors que le plafond est atteint reçoit `409 { ok: false, error: "quota_atteint", code, cle, plafond, utilise, quoi, message }`. Un poste déjà enregistré, ou inconnu du registre mais ayant déjà une session ou une vente à son nom, ouvre toujours. `POST /api/sales` et `POST /api/sessions/import` ne sont JAMAIS refusés pour quota. Sans droit, sans plafond, sans `CORE_AUTH_API_KEY`, Core-Auth en panne, ou table `Poste` absente : aucun verrou.
 | POST | `/api/sales` | Créer un ticket (`lines:[{kind,label,productId?,qty,unitXpf}]`, `sourceType?/sourceId?`). |
 | GET | `/api/sales?tenantId=…` | Historique des tickets. |
 | POST | `/api/sales/:id/checkout` | Encaisser (`payments:[{method,amountXpf,tenderedXpf?}]`) → PAID + synchro + `receiptUrl`/`syncPending`. |
