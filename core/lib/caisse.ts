@@ -74,6 +74,7 @@ import {
   type LoyaltyProgramRow,
 } from "./loyalty-db";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
+import { annulerInscription, inscrirePosteEnLigne } from "./postes";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
@@ -83,18 +84,39 @@ export { CAISSE_SOURCE_TYPE } from "./sync";
 
 // ─── Sessions de caisse ──────────────────────────────────────────────────────
 
-export async function openSession(
-  tenantId: string,
-  input: {
-    openedBy: string;
-    openedByName?: string;
-    openingFloatXpf: bigint;
-    note?: string;
-    /** Poste (caisse physique) qui ouvre. Omis = marchand mono-caisse :
-     *  comportement d'origine, une seule session ouverte pour tout le tenant. */
-    posteId?: string | null;
-  },
-) {
+type OpenSessionInput = {
+  openedBy: string;
+  openedByName?: string;
+  openingFloatXpf: bigint;
+  note?: string;
+  /** Poste (caisse physique) qui ouvre. Omis = marchand mono-caisse :
+   *  comportement d'origine, une seule session ouverte pour tout le tenant. */
+  posteId?: string | null;
+};
+
+/**
+ * Ouvre une session. Quota de postes (2026-10-05) : SEUL endroit du moteur où un quota peut
+ * dire non, et seulement à un poste NOUVEAU (ou désactivé puis rallumé) alors que le plafond
+ * est atteint. Sans `posteId` (marchand mono-caisse), rien n'est contrôlé et le registre n'est
+ * pas lu. Tout échec du registre ouvre. L'ouverture elle-même (`ouvrirSession`) est le code
+ * d'origine, inchangé. Cf. lib/postes.ts.
+ */
+export async function openSession(tenantId: string, input: OpenSessionInput) {
+  const posteId = input.posteId ?? null;
+  if (!posteId) return ouvrirSession(tenantId, input);
+  const inscription = await inscrirePosteEnLigne(tenantId, posteId);
+  if (!inscription.ok) return { ok: false as const, ...inscription.quota };
+  try {
+    return await ouvrirSession(tenantId, input);
+  } catch (e) {
+    // L'ouverture a échoué pour une autre raison : un poste inscrit à l'instant ne doit pas
+    // garder une place qu'il n'a jamais utilisée.
+    if (inscription.nouveau) await annulerInscription(tenantId, posteId);
+    throw e;
+  }
+}
+
+async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
   const posteId = input.posteId ?? null;
   return withTenant(tenantId, async (tx) => {
     // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
