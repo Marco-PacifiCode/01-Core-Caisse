@@ -34,7 +34,7 @@ export default async function Home() {
           <>
             <h1 className="title">Aucun marchand pour ce domaine</h1>
             <p className="subtitle">
-              Le domaine <b>{host || "(inconnu)"}</b> n&apos;est rattaché à aucun tenant. En dev,
+              Le domaine <b>{host || "(inconnu)"}</b>{" "}n&apos;est rattaché à aucun tenant. En dev,
               assurez-vous que core_auth tourne sur <code>{coreAuthUrl}</code> et que le domaine est
               configuré dans core_auth.
             </p>
