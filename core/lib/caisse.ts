@@ -882,10 +882,12 @@ export async function checkoutSale(
   // 1. Charger le ticket + lignes + paiements déjà enregistrés
   const sale = await getSale(tenantId, saleId);
   if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
-  // Mêmes moyens et mêmes montants (par moyen), quel que soit l'ordre des lignes.
+  // Mêmes montants NETS par moyen, quel que soit l'ordre des lignes : une correction de moyen
+  // persiste une contre-écriture négative (CASH −1 000, CARD +1 000) ; un moyen soldé à 0 ne compte pas.
   type PayPart = { method: string; amountXpf: bigint | number };
   const samePayments = (a: readonly PayPart[], b: readonly PayPart[]) => {
-    const parts = (x: readonly PayPart[]) => canonical(paymentParts(x.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) }))));
+    const parts = (x: readonly PayPart[]) => canonical(Object.fromEntries(Object.entries(
+      paymentParts(x.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })), true)).filter(([, n]) => n !== 0n)));
     return parts(a) === parts(b);
   };
   // Caisse partagée : une vente déjà payée par d'AUTRES moyens est un refus, jamais un succès.

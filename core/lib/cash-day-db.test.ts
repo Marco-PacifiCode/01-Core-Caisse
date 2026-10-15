@@ -49,7 +49,7 @@ function fixture() {
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
-        op === "lte" ? row[k] <= n! : op === "gt" ? row[k] > n! : op === "in" ? (n as unknown[]).includes(row[k]) : false);
+        op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "in" ? (n as unknown[]).includes(row[k]) : false);
       return row[k] === v;
     });
   }
@@ -209,6 +209,19 @@ test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000,
     assert.equal(f.rows("sale")[0].payments.length, 3);
     assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "SALE_PAID").length, 1);
     assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PAYMENT_CORRECTION").length, 1);
+    // Rejeu du checkout après correction : le moyen NET (carte) est un rejeu, l'ancien (espèces) un 409.
+    const checkout = caisseFunction("checkoutSale", {
+      getSale: () => f.tx.sale.findFirst({ where: { id: sale.id } }), withTenant: f.withTenant, comptaClient: () => ({}),
+      lockSharedSale: f.ledger.lockSharedSale, lockSaleRow: async () => true,
+      prepareSharedCheckout: f.ledger.prepareSharedCheckout, recordSharedSale: f.ledger.recordSharedSale,
+      consumePickupOrder: f.ledger.consumePickupOrder, ackFinancial: f.sync.ackFinancial,
+      CAISSE_SOURCE_TYPE: "caisse", syncLoadedSale: async () => ({ synced: true, invoiceId: null, stockDecremented: 0 }),
+    });
+    const card = await checkout(tenant, sale.id, [{ method: "CARD", amountXpf: 1000n }]);
+    assert.equal(card.ok, true); assert.equal(card.alreadyPaid, true);
+    await assert.rejects(checkout(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }]),
+      (e: Row) => e.status === 409 && e.message === "SALE_ALREADY_PAID");
+    assert.equal(f.rows("sale")[0].payments.length, 3);
   }
 });
 

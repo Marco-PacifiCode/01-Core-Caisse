@@ -163,8 +163,10 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
     if (!alias) await tx.cashDaySession.create({ data: { tenantId: b.tenantId, cashDayId: id, sessionId, cycle: Number(b.cycle) } });
   }
   // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins.
+  // Borne basse : un avoir est enregistré après avoir été rendu (createdAt ≥ occurredAt), marge d'un jour.
+  const since = new Date(Date.parse(`${day.businessDay}T00:00:00Z`) - 35 * 3600000);
   const refunds = (await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
-    OR: [{ cashDayId: null }, { cashDayId: id }] } })).filter(refund => {
+    createdAt: { gte: since }, OR: [{ cashDayId: null }, { cashDayId: id }] } })).filter(refund => {
     const input = object(refund.input);
     return input.refundMethod === "CASH" && businessDay(input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
   });
