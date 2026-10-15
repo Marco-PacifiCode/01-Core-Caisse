@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
-import { date, lockCashTenant, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, lockCashTenant, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
@@ -18,6 +18,7 @@ function dayOf(b: ActionInput) {
   return day;
 }
 export async function openCashDay(tx: CashTx, b: ActionInput) {
+  b = normalizeActionInput(b);
   await lockCashTenant(tx, b.tenantId);
   await assertNoLegacyOperationInProgress(tx, b.tenantId);
   const business = dayOf(b), tenantId = b.tenantId, author = sourceAuthor(b);
@@ -50,6 +51,7 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
     fondNonRetenu: openingFloatXpf !== locked.canonicalSession.openingFloatXpf };
 }
 export async function dayState(tx: CashTx, tenantId: string, id: string) {
+  tenantId = uuid(tenantId); id = uuid(id);
   const day = await lockDay(tx, tenantId, id);
   return { id: day.id, cashDayId: day.id, businessDay: day.businessDay, scope: day.scope, cycle: day.cycle,
     sessionId: day.currentSessionId, canonicalSessionId: day.canonicalSessionId, status: day.currentSession.status,
@@ -58,6 +60,7 @@ export async function dayState(tx: CashTx, tenantId: string, id: string) {
     closedByName: day.currentSession.closedByName, closedAt: day.currentSession.closedAt };
 }
 export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput) {
+  cashDayId = uuid(cashDayId); b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
   requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
   const countedXpf = xpfInteger(b.countedXpf), occurredAt = date(b.occurredAt);
@@ -132,6 +135,7 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     alreadyClosed: !!first, recount: !authoritative, report };
 }
 export async function reopenCashDay(tx: CashTx, id: string, b: ActionInput) {
+  id = uuid(id); b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, id), author = sourceAuthor(b);
   // Le relais S2S vérifie le cookie Administration signé ; le Core exige son attestation.
   requireCash(b.administration === true && !!author.actorId, "MODE_CAISSE", 403);
@@ -147,6 +151,7 @@ export async function reopenCashDay(tx: CashTx, id: string, b: ActionInput) {
   return dayState(tx, b.tenantId, id);
 }
 export async function ledgerPage(tx: CashTx, tenantId: string, id: string, q: URLSearchParams) {
+  tenantId = uuid(tenantId); id = uuid(id);
   const day = await lockDay(tx, tenantId, id);
   const revision = q.has("atRevision") ? xpfInteger(q.get("atRevision")) : day.revision;
   const after = q.has("afterSequence") ? xpfInteger(q.get("afterSequence")) : q.has("cursor") ? xpfInteger(q.get("cursor")) : 0n;
@@ -164,6 +169,7 @@ export async function ledgerPage(tx: CashTx, tenantId: string, id: string, q: UR
       fondsNonRetenus: openings.filter((o: { sourceKey: string; openingFloatXpf: bigint }) => visibleOpeningKeys.has(o.sourceKey) && o.openingFloatXpf !== day.canonicalSession.openingFloatXpf) } };
 }
 export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
+  id = uuid(id); b = normalizeActionInput(b);
   await lockCashTenant(tx, b.tenantId);
   await assertNoLegacyOperationInProgress(tx, b.tenantId);
   const day = await lockDay(tx, b.tenantId, id);

@@ -81,8 +81,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { tenantId, payments } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
-  if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
-
   const parsed: PaymentInput[] = [];
   for (const p of payments ?? []) {
     if (!p.method || !VALID_METHODS.includes(p.method as PayMethod)) {
@@ -190,6 +188,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       : undefined;
   let result: Awaited<ReturnType<typeof checkoutSale>>;
   try {
+    if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await checkoutSale(tenantId, saleId, parsed, options);
   } catch (e) {
     // Caisse partagée : vente déjà payée par d'autres moyens → 409 explicite, pas une 500.

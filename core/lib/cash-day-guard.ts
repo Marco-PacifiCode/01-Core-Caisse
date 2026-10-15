@@ -4,7 +4,8 @@ import { CashContractError } from "./cash-day-projection";
 
 export const CASHDAY_ROUTE_REQUIRED = { ok: false, error: "CASHDAY_ROUTE_REQUIRED" } as const;
 export async function assertLegacyWriteAllowed(tx: CashTx, tenantId: string): Promise<void> {
-  await lockCashTenant(tx, uuid(tenantId));
+  tenantId = uuid(tenantId);
+  await lockCashTenant(tx, tenantId);
   if (await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) {
     throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
   }
@@ -12,6 +13,7 @@ export async function assertLegacyWriteAllowed(tx: CashTx, tenantId: string): Pr
 
 /** Appelé après lockCashTenant et avant lockDay, pour qu'une bascule ne coupe aucune réservation. */
 export async function assertNoLegacyOperationInProgress(tx: CashTx, tenantId: string): Promise<void> {
+  tenantId = uuid(tenantId);
   const [refund, voidAction, correction, saleVoid, checkout] = await Promise.all([
     tx.partialRefund.findFirst({ where: { tenantId, status: "PENDING", cashDayId: null }, select: { id: true } }),
     tx.voidAction.findMany({ where: { tenantId, status: "PENDING" }, select: { id: true, saleId: true } }).then(async actions => {
@@ -28,6 +30,9 @@ type LegacyWrite = { openSession: true } | { sessionId?: string | null } | { sal
 
 /** Toute écriture historique doit passer par l'API CashDay dès qu'un jour existe. */
 export async function cashDayGuard(tenantId: string, target: LegacyWrite): Promise<boolean> {
+  tenantId = uuid(tenantId);
+  if ("sessionId" in target && target.sessionId) target = { ...target, sessionId: uuid(target.sessionId) };
+  if ("saleId" in target) target = { ...target, saleId: uuid(target.saleId), ...(target.refundCashDayId ? { refundCashDayId: uuid(target.refundCashDayId) } : {}) };
   return withTenant(tenantId, async tx => {
     const days = await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } });
     if (!days) return false;

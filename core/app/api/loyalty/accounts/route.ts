@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { listLoyaltyAccounts } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -36,6 +37,11 @@ export async function GET(req: NextRequest) {
     if (!UUID_RE.test(id)) return NextResponse.json({ error: `clientFicheId invalide : ${id}` }, { status: 400 });
   }
 
-  const accounts = await listLoyaltyAccounts(tenantId, ids);
-  return NextResponse.json({ ok: true, accounts });
+  try {
+    const accounts = await listLoyaltyAccounts(tenantId, ids);
+    return NextResponse.json({ ok: true, accounts });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 }

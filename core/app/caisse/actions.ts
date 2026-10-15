@@ -51,9 +51,9 @@ export type ZReportResult = {
 
 export async function closeSessionAction(sessionId: string, closingCountedXpf: number): Promise<ZReportResult> {
   const { user, tenant } = await requireStaff("/caisse");
-  if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
   let res;
   try {
+    if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
     res = await closeSession(tenant.id, {
       sessionId,
       closedBy: user.id,
@@ -122,8 +122,6 @@ export async function checkoutAction(
 ): Promise<CheckoutActionResult> {
   const { user, tenant } = await requireStaff("/caisse");
 
-  if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
-
   if (!lines || lines.length === 0) return { ok: false, error: "Le ticket est vide." };
   if (!payments || payments.length === 0) return { ok: false, error: "Aucun paiement saisi." };
 
@@ -137,6 +135,7 @@ export async function checkoutAction(
 
   let created;
   try {
+    if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
     created = await createSale(tenant.id, {
       cashierId: user.id,
       sessionId: sessionId ?? null,

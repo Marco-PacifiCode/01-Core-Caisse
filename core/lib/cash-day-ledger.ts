@@ -1,12 +1,13 @@
 import type { Prisma } from "@prisma/client";
 import { businessDay, canonical, CashContractError, factDelta, jsonValue, requireCash, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
-import { lockCashTenant, type CashTx } from "./caisse-sync";
+import { lockCashTenant, uuid, type CashTx } from "./caisse-sync";
 
 // Tenant → Day → Sale : verrouiller le tenant avant toute recherche de CashDay.
 // Toute transaction prenant les deux verrous lit d'abord cashDayId
 // sans verrou, verrouille le Day, puis la Sale, et relit son rattachement. Un changement
 // impose un 409 et l'annulation, jamais l'acquisition d'un nouveau Day après la Sale.
 export async function lockDay(tx: CashTx, tenantId: string, cashDayId: string) {
+  tenantId = uuid(tenantId); cashDayId = uuid(cashDayId);
   await lockCashTenant(tx, tenantId);
   const rows = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "CashDay" WHERE "tenantId"=${tenantId}::uuid AND "id"=${cashDayId}::uuid FOR UPDATE`;
   if (!rows.length) throw new CashContractError("NOT_FOUND", 404);
@@ -15,6 +16,9 @@ export async function lockDay(tx: CashTx, tenantId: string, cashDayId: string) {
 export async function appendDayFact(tx: CashTx, tenantId: string, cashDayId: string, input: {
   kind: string; sourceRef: string; deviceId: string; occurredAt: Date; snapshot: unknown; saleId?: string; refundActionId?: string;
 }) {
+  tenantId = uuid(tenantId); cashDayId = uuid(cashDayId);
+  if (input.saleId) input = { ...input, saleId: uuid(input.saleId) };
+  if (input.refundActionId) input = { ...input, refundActionId: uuid(input.refundActionId) };
   await lockDay(tx, tenantId, cashDayId);
   const snapshot = jsonValue(input.snapshot) as Prisma.InputJsonValue;
   const cashDeltaXpf = factDelta(input.kind, snapshot);
@@ -28,12 +32,14 @@ export async function appendDayFact(tx: CashTx, tenantId: string, cashDayId: str
     deviceId: input.deviceId, occurredAt: input.occurredAt, cashDeltaXpf, snapshot, saleId: input.saleId, refundActionId: input.refundActionId } });
 }
 export async function lockSharedSale(tx: CashTx, tenantId: string, saleId: string) {
+  tenantId = uuid(tenantId); saleId = uuid(saleId);
   // Pas de lecture d'une nouvelle table quand la vente n'a pas opté pour CashDay.
   const sale = await tx.sale.findFirst({ where: { tenantId, id: saleId } });
   if (sale?.cashDayId) await lockDay(tx, tenantId, sale.cashDayId);
   return sale;
 }
 export async function prepareSharedCheckout(tx: CashTx, tenantId: string, saleId: string) {
+  tenantId = uuid(tenantId); saleId = uuid(saleId);
   await lockSharedSale(tx, tenantId, saleId);
   const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
   if (current.status === "PAID") return false;
@@ -41,11 +47,13 @@ export async function prepareSharedCheckout(tx: CashTx, tenantId: string, saleId
   return true;
 }
 export async function recordSharedGift(tx: CashTx, tenantId: string, cashDayId: string, giftId: string, deviceId: string, occurredAt: Date) {
+  tenantId = uuid(tenantId); cashDayId = uuid(cashDayId); giftId = uuid(giftId);
   const card = await tx.giftCard.findFirstOrThrow({ where: { tenantId, id: giftId } });
   await appendDayFact(tx, tenantId, cashDayId, { kind: "GIFT_CARD_REDEEMED", sourceRef: card.id, deviceId, occurredAt,
     snapshot: { amountXpf: String(card.amountXpf) } });
 }
 export async function recordSharedSale(tx: CashTx, tenantId: string, saleId: string) {
+  tenantId = uuid(tenantId); saleId = uuid(saleId);
   const sale = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { lines: true, payments: true } });
   if (!sale.cashDayId) return;
   const day = await lockDay(tx, tenantId, sale.cashDayId);
@@ -77,6 +85,7 @@ export async function recordSharedSale(tx: CashTx, tenantId: string, saleId: str
     snapshot: { saleRef: sale.id, creditNoteId: sale.creditNoteId } });
 }
 export async function consumePickupOrder(tx: CashTx, tenantId: string, saleId: string) {
+  tenantId = uuid(tenantId); saleId = uuid(saleId);
   const sale = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
   if (!sale.cashDayId || !sale.pickupOrderId) return;
   const order = await tx.pickupOrder.findFirst({ where: { tenantId, id: sale.pickupOrderId } });
@@ -90,5 +99,6 @@ export async function consumePickupOrder(tx: CashTx, tenantId: string, saleId: s
   if (changed.count !== 1) throw new CashContractError("ORDER_ALREADY_PAID", 409);
 }
 export async function readFacts(tx: CashTx, tenantId: string, cashDayId: string, revision: bigint): Promise<DayFact[]> {
+  tenantId = uuid(tenantId); cashDayId = uuid(cashDayId);
   return tx.cashDayEvent.findMany({ where: { tenantId, cashDayId, sequence: { lte: revision } }, orderBy: { sequence: "asc" } });
 }

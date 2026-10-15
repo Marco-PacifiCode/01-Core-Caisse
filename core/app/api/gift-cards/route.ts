@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { createGiftCardWithoutSale, listGiftCards } from "@/lib/caisse";
 import { normalizeCode } from "@/lib/gift-card";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -34,8 +35,13 @@ export async function GET(req: NextRequest) {
   const rawTake = Number(url.searchParams.get("take") ?? "");
   const take = Number.isFinite(rawTake) && rawTake > 0 ? Math.min(rawTake, 500) : undefined;
 
-  const giftCards = await listGiftCards(tenantId, { code: code || undefined, take });
-  return NextResponse.json({ ok: true, giftCards });
+  try {
+    const giftCards = await listGiftCards(tenantId, { code: code || undefined, take });
+    return NextResponse.json({ ok: true, giftCards });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 }
 
 /**
@@ -78,7 +84,13 @@ export async function POST(req: NextRequest) {
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
-  const result = await createGiftCardWithoutSale(tenantId, body);
+  let result;
+  try {
+    result = await createGiftCardWithoutSale(tenantId, body);
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: result.error === "CODE_TAKEN" ? 409 : 400 });
   }

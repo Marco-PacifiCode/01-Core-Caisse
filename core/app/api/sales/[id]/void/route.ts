@@ -32,8 +32,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { tenantId, reason } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
-  if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
-
   const headerActionId = req.headers.get("Idempotency-Key") ?? undefined;
   if (body.actionId !== undefined && (typeof body.actionId !== "string" || body.actionId.length === 0)) {
     return NextResponse.json({ error: "actionId invalide" }, { status: 400 });
@@ -51,6 +49,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   let result;
   try {
+    if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await annulerVente(tenantId, saleId, { ...(reason ? { reason } : {}), ...(actionId ? { actionId } : {}) });
   } catch (error) {
     if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });

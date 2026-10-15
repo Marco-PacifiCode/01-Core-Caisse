@@ -2,6 +2,7 @@ import type { Prisma } from "@prisma/client";
 import type { ComptaClient } from "./clients";
 import { partialRefundMovementRef } from "./cash-movement.ts";
 import { planPartialRefund, refundFingerprint, refuse, runPartialRefund, type RefundInput, type RefundPlan, type RefundResult, type RefundSuccess, type RefundReservation } from "./partial-refund.ts";
+import { normalizeActionId, uuid } from "./caisse-sync.ts";
 
 type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
@@ -14,6 +15,10 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
   compta: ComptaClient;
   recordDrawer?(tx: Tx, action: { id: string }, plan: RefundPlan): Promise<void>;
 }): Promise<RefundResult> {
+  tenantId = uuid(tenantId); saleId = uuid(saleId);
+  input = { ...input, actionId: normalizeActionId(input.actionId),
+    ...(input.cashDayId ? { cashDayId: uuid(input.cashDayId) } : {}),
+    lines: input.lines.map(line => ({ ...line, lineId: uuid(line.lineId) })) };
   const key = { tenantId_actionId: { tenantId, actionId: input.actionId } };
   const readExisting = async (tx: Tx): Promise<RefundReservation | ReturnType<typeof refuse> | null> => {
     const r = await tx.partialRefund.findUnique({ where: key });

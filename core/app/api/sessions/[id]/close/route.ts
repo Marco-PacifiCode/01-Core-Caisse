@@ -29,10 +29,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "tenantId, closedBy et closingCountedXpf sont requis" }, { status: 400 });
   }
 
-  if (await cashDayGuard(tenantId, { sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
-
   let result;
   try {
+    if (await cashDayGuard(tenantId, { sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await closeSession(tenantId, {
       sessionId,
       closedBy,

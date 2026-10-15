@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { adjustLoyaltyAccount } from "@/lib/caisse";
 import { log } from "@/lib/log";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -57,6 +58,7 @@ export async function POST(req: NextRequest) {
     if (!result.ok) return NextResponse.json(result, { status: 400 });
     return NextResponse.json(result);
   } catch (e) {
+    if (e instanceof CashContractError) return NextResponse.json({ error: e.message }, { status: e.status });
     // Socle observabilité (cf. app/api/cron/repair-sales/route.ts) : une correction ADMIN
     // manipule de l'argent (points, visites, remises) — toute exception inattendue est tracée
     // ET renvoyée en JSON propre, jamais une pile brute vers l'appelant.

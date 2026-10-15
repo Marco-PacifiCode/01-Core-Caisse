@@ -52,9 +52,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "amountXpf requis" }, { status: 400 });
   }
 
-  if (await cashDayGuard(tenantId, { saleId, paymentCorrection: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
   let result;
   try {
+    if (await cashDayGuard(tenantId, { saleId, paymentCorrection: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await corrigerMoyenPaiement(tenantId, { saleId, fromMethod, toMethod, amountXpf });
   } catch (error) {
     if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });

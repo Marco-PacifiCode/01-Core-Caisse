@@ -49,8 +49,8 @@ test("l'unicité de session ouverte est filtrée PAR POSTE", () => {
 
 test("openSession rattrape la course sur l'index unique au lieu de remonter une erreur brute", () => {
   const bloc = caisse.slice(caisse.indexOf("export async function openSession"));
-  assert.match(bloc.slice(0, 2500), /P2002/);
-  assert.match(bloc.slice(0, 2500), /SESSION_ALREADY_OPEN/);
+  assert.match(bloc.slice(0, 3500), /P2002/);
+  assert.match(bloc.slice(0, 3500), /SESSION_ALREADY_OPEN/);
 });
 
 test("currentSession cherche la session DU poste, pas n'importe laquelle", () => {

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { redeemGiftCard } from "@/lib/caisse";
 import { normalizeRedeemedFor } from "@/lib/gift-card";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -71,12 +72,18 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     redeemedAppointmentId = body.redeemedAppointmentId;
   }
 
-  const result = await redeemGiftCard(tenantId, id, {
-    redeemedBy: typeof body.redeemedBy === "string" ? body.redeemedBy : null,
-    redeemedByName: typeof body.redeemedByName === "string" ? body.redeemedByName : null,
-    redeemedForXpf: forXpf.redeemedForXpf,
-    redeemedAppointmentId,
-  });
+  let result;
+  try {
+    result = await redeemGiftCard(tenantId, id, {
+      redeemedBy: typeof body.redeemedBy === "string" ? body.redeemedBy : null,
+      redeemedByName: typeof body.redeemedByName === "string" ? body.redeemedByName : null,
+      redeemedForXpf: forXpf.redeemedForXpf,
+      redeemedAppointmentId,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: result.error === "NOT_FOUND" ? 404 : 409 });

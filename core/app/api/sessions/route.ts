@@ -30,10 +30,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
 
-  if (await cashDayGuard(tenantId, { openSession: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
-
   let result;
   try {
+    if (await cashDayGuard(tenantId, { openSession: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await openSession(tenantId, {
       openedBy,
       openedByName: body.openedByName?.trim() || undefined,

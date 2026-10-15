@@ -53,9 +53,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
 
-  if (await cashDayGuard(tenantId, {})) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
   let result;
   try {
+    if (await cashDayGuard(tenantId, {})) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await importerCloture(tenantId, {
       sourceType: body.sourceType ?? null,
       sourceId: body.sourceId ?? null,

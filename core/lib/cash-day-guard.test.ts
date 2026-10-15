@@ -6,6 +6,7 @@ import ts from "typescript";
 import * as refundPolicy from "./partial-refund.ts";
 import * as projection from "./cash-day-projection.ts";
 import * as credit from "./credit.ts";
+import * as sync from "./caisse-sync.ts";
 import { createHash } from "node:crypto";
 
 type Row = Record<string, any>;
@@ -132,7 +133,7 @@ test("import Z HTTP : CashContractError après la garde renvoie 409", async () =
 });
 
 test("verrous consultatifs : UUID majuscules et minuscules produisent la même clé normalisée", async () => {
-  const sync = load("caisse-sync.ts", { "node:crypto": { createHash }, "./tenant": {}, "./cash-day-projection": projection });
+  const sync = load("caisse-sync.ts", { "node:crypto": { createHash }, "./tenant": {}, "./tenant.ts": {}, "./cash-day-projection": projection, "./cash-day-projection.ts": projection });
   const seen: unknown[] = [];
   const tx = { $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) { seen.push(values[0]); return Promise.resolve([]); } };
   const lower = "abcdefab-cdef-abcd-efab-cdefabcdefab";
@@ -147,7 +148,8 @@ test("verrous consultatifs : UUID majuscules et minuscules produisent la même c
 });
 
 test("verrou d'action : tenant et UUID d'action normalisés et invalides refusés en 400", async () => {
-  const locks = load("sale-lock.ts", { "./cash-day-projection": projection });
+  const syncInVm = load("caisse-sync.ts", { "./tenant": { withTenant: async () => {} }, "./tenant.ts": { withTenant: async () => {} }, "./cash-day-projection": projection, "./cash-day-projection.ts": projection, "node:crypto": { createHash } });
+  const locks = load("sale-lock.ts", { "./cash-day-projection": projection, "./caisse-sync": syncInVm });
   const seen: unknown[] = [];
   const tx = {
     $executeRaw: async () => [],

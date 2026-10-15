@@ -1,13 +1,17 @@
 import type { PayMethod } from "@prisma/client";
 import { annulerVente, checkoutSale, rembourserPartiellement, type CheckoutOptions } from "./caisse";
 import { withTenant } from "./tenant";
-import { ackFinancial, date, financialReservation, text, uuid, type ActionInput } from "./caisse-sync";
+import { ackFinancial, date, financialReservation, normalizeActionId, normalizeActionInput, text, uuid, type ActionInput } from "./caisse-sync";
 import { lockDay } from "./cash-day-ledger";
 import { businessDay, canonical, CashContractError, jsonValue, object, paymentParts, requireCash, safeXpf, xpfInteger } from "./cash-day-projection";
 import type { Prisma } from "@prisma/client";
 import { validRefundInput, type RefundInput } from "./partial-refund";
 
 export async function dayFinancial(cashDayId: string, saleId: string, operation: string, b: ActionInput) {
+  cashDayId = uuid(cashDayId);
+  saleId = uuid(saleId);
+  b = normalizeActionInput(b);
+  b.tenantId = uuid(b.tenantId); b.actionId = normalizeActionId(b.actionId);
   requireCash(["checkout", "void", "partial-refund"].includes(operation));
   uuid(b.actionId);
   const replay = await financialReservation(`cash-days:${cashDayId}:sales:${saleId}:${operation}`, b);

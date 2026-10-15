@@ -19,8 +19,8 @@ import * as voidPolicy from "./void-sale.ts";
 import * as importsPolicy from "./import-cloture.ts";
 
 const require = createRequire(import.meta.url);
-const tenant = "10000000-0000-0000-0000-000000000001", tenantB = "10000000-0000-0000-0000-000000000002";
-const actor = "10000000-0000-0000-0000-000000000003", now = new Date("2026-10-15T01:00:00.000Z");
+const tenant = "ab000000-0000-0000-0000-000000000001", tenantB = "cd000000-0000-0000-0000-000000000002";
+const actor = "ef000000-0000-0000-0000-000000000003", now = new Date("2026-10-15T01:00:00.000Z");
 const fixedDate = class extends Date { constructor(value?: string | number) { super(value ?? now.getTime()); } static now() { return now.getTime(); } };
 function load(file: string, imports: Record<string, unknown>) {
   const source = readFileSync(new URL(file, import.meta.url), "utf8");
@@ -30,8 +30,9 @@ function load(file: string, imports: Record<string, unknown>) {
   run((name: string) => name in imports ? imports[name] : require(name), module, module.exports);
   return module.exports;
 }
-const syncForTests = load("caisse-sync.ts", { "./tenant": { withTenant: async (_tenant: string, fn: (tx: any) => unknown) => fn({}) }, "./cash-day-projection": projection, "node:crypto": require("node:crypto") });
+const syncForTests = load("caisse-sync.ts", { "./tenant": { withTenant: async (_tenant: string, fn: (tx: any) => unknown) => fn({}) }, "./tenant.ts": { withTenant: async (_tenant: string, fn: (tx: any) => unknown) => fn({}) }, "./cash-day-projection": projection, "./cash-day-projection.ts": projection, "node:crypto": require("node:crypto") });
 const tenantLock = syncForTests.lockCashTenant;
+let activeSync: Row;
 function caisseFunction(name: string, globals: Row) {
   const source = readFileSync(new URL("caisse.ts", import.meta.url), "utf8");
   const start = source.indexOf(`export async function ${name}(`);
@@ -41,6 +42,7 @@ function caisseFunction(name: string, globals: Row) {
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...corrections,
     assertLegacyWriteAllowed: globals.assertLegacyWriteAllowed, lockCashTenant: globals.lockCashTenant ?? tenantLock,
+    uuid: activeSync.uuid, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
     createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
 }
 type Row = Record<string, any>;
@@ -96,7 +98,7 @@ function fixture(enforceDayBeforeSale = false) {
         return structuredClone(take ? rows.slice(0, take) : rows);
       },
       async create({ data }: Row) {
-        const id = `20000000-0000-0000-0000-${String(++serial).padStart(12, "0")}`;
+        const id = `a0000000-0000-0000-0000-${String(++serial).padStart(12, "0")}`;
         const row: Row = { id, revision: name === "cashDay" ? 0n : 0, cycle: 0, createdAt: now, updatedAt: now, receivedAt: now,
           claimedByDevice: null, claimActionId: null, actorId: null, legacySnapshot: null, cashDayId: null, paidAt: null, creditNoteId: null, voidPreparedAt: null,
           sessionId: null, posteId: null, deviceId: null, deviceName: null, ticketNumber: null, sellerId: null, sellerName: null, saleId: null, ...structuredClone(data) };
@@ -144,10 +146,11 @@ function fixture(enforceDayBeforeSale = false) {
     heldDays = new Set(); trace = [];
     try { return await fn(tx); } catch (e) { state = before; throw e; } finally { lockTraces.push(trace); release(); }
   }
-  const sync = load("caisse-sync.ts", { "./tenant": { withTenant }, "./cash-day-projection": projection, "node:crypto": require("node:crypto") });
+  const sync = load("caisse-sync.ts", { "./tenant": { withTenant }, "./tenant.ts": { withTenant }, "./cash-day-projection": projection, "./cash-day-projection.ts": projection, "node:crypto": require("node:crypto") });
+  activeSync = sync;
   const legacyGuard = load("cash-day-guard.ts", { "./tenant": { withTenant }, "./caisse-sync": sync, "./cash-day-projection": projection });
   const ledger = load("cash-day-ledger.ts", { "./cash-day-projection": projection, "./caisse-sync": sync });
-  const locks = load("sale-lock.ts", { "./cash-day-projection": projection });
+  const locks = load("sale-lock.ts", { "./cash-day-projection": projection, "./caisse-sync": sync });
   const native = {
     async openSessionTx(tx: Row, tenantId: string, b: Row) {
       const old = await tx.cashSession.findFirst({ where: { tenantId, posteId: null, status: "OPEN" } });
@@ -166,7 +169,7 @@ function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
 
 function financialPorts(f: ReturnType<typeof fixture>, overrides: Row = {}) {
-  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard });
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard, "./caisse-sync": f.sync });
   const globals = {
     ...refundPolicy, ...voidPolicy, ...f.ledger, ...f.locks, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed, ackFinancial: f.sync.ackFinancial,
     assertTenantId: (v: string) => v, withTenant: f.withTenant,
@@ -225,12 +228,14 @@ test("huitième relecture : clôture refusée pendant Compta, rejeu de l'avoir 1
   } });
   const finance = load("cash-day-finance.ts", { "./caisse": native, "./tenant": { withTenant: f.withTenant },
     "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger, "./cash-day-projection": projection, "./partial-refund": refundPolicy });
-  const b = input({ actionId: actor, entityKey: sale.id, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH" });
-  assert.equal((await finance.dayFinancial(day.id, sale.id, "partial-refund", b)).ok, false);
+  const b = input({ actionId: actor.toUpperCase(), tenantId: tenant.toUpperCase(), entityKey: sale.id.toUpperCase(), reason: "Retour synthétique", lines: [{ lineId: tenantB.toUpperCase(), qty: 1 }], refundMethod: "CASH" });
+  await assert.rejects(finance.dayFinancial(day.id, "invalid-sale-id", "partial-refund", b), (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+  assert.equal(f.rows("caisseSyncAction").length, 0); assert.equal(f.rows("partialRefund").length, 0);
+  assert.equal((await finance.dayFinancial(day.id.toUpperCase(), sale.id.toUpperCase(), "partial-refund", b)).ok, false);
   assert.equal(f.rows("partialRefund")[0].status, "PENDING");
   assert.equal(f.rows("caisseSyncAction")[0].state, "PENDING");
   assert.equal(await expected(f, day.id), 25000n);
-  const replay = await finance.dayFinancial(day.id, sale.id, "partial-refund", b);
+  const replay = await finance.dayFinancial(day.id, sale.id, "partial-refund", { ...b, tenantId: tenant, actionId: actor, entityKey: sale.id, lines: [{ lineId: tenantB, qty: 1 }] });
   assert.equal(replay.ok, true); assert.equal(f.rows("partialRefund")[0].status, "DONE");
   assert.equal(f.rows("caisseSyncAction")[0].state, "ACK");
   assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 1);
@@ -494,7 +499,7 @@ for (const operation of ["checkout", "void"] as const) {
     const operationNative = financialPorts(f);
     const result = operation === "checkout"
       ? await operationNative.checkoutSale(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }], { cashDayId: day.id })
-      : await operationNative.annulerVente(tenant, sale.id, { sharedActionId: actor, actionId: actor });
+      : await operationNative.annulerVente(tenant.toUpperCase(), sale.id.toUpperCase(), { sharedActionId: actor.toUpperCase(), actionId: actor.toUpperCase() });
     assert.equal(result.ok, true);
     const transactions = f.lockTraces.slice(start).filter(t => t.includes(`Sale:${sale.id}`));
     assert.equal(transactions.length, 2, "les deux transactions prennent le verrou Sale");
@@ -560,7 +565,7 @@ test("sixième relecture (b) : avoir CASH 1000 sur vente ancienne sans CashDay r
   const response = await route.POST({ json: async () => b }, { params: Promise.resolve({ id: sale.id }) });
   assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
   // Vérifie aussi le refus propre à l'adaptateur si la session choisie appartient à CashDay.
-  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard });
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard, "./caisse-sync": f.sync });
   await assert.rejects(refundDb.partialRefundWithPorts(tenant, sale.id, b, {
     transact: (fn: (tx: Row) => Promise<unknown>) => f.withTenant(tenant, fn),
     lockTenant: (tx: Row) => f.guard.assertLegacyWriteAllowed(tx, tenant),
@@ -723,7 +728,7 @@ test("avoir historique : collision checkout PENDING refusée en HTTP 409 avant C
   const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: day.currentSessionId } });
   await f.sync.financialReservation(`cash-days:${day.id}:sales:${sale.id}:checkout`, input({ actionId: actor }));
   let externalCalls = 0;
-  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard });
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy, "./cash-day-guard": f.guard, "./caisse-sync": f.sync });
   const native = caisseFunction("rembourserPartiellement", { assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
     ...refundPolicy, assertTenantId: (v: string) => v, withTenant: f.withTenant,
     lockDay: f.ledger.lockDay, lockSharedSale: f.ledger.lockSharedSale, ackFinancial: f.sync.ackFinancial,
@@ -880,13 +885,18 @@ test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000,
       sourceType: "synthetic", sourceId: "corrected", status: "PAID", paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now,
       totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
     if (!beforeImport) await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+    let comptaCalls = 0;
     const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
-      lockSaleRow: async () => true, comptaClient: () => ({ paymentCorrection: async () => ({ ok: true }) }),
+      lockSaleRow: async () => true, comptaClient: () => ({ paymentCorrection: async () => { comptaCalls++; return { ok: true }; } }),
       verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection, correctionKeyPour: corrections.correctionKeyPour, runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
     });
     const b = { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 };
-    const results = await Promise.all([correct(tenant, b), correct(tenant, b)]);
+    assert.notEqual(sale.id, sale.id.toUpperCase());
+    const results = await Promise.all([correct(tenant.toUpperCase(), { ...b, saleId: sale.id.toUpperCase() }), correct(tenant, b)]);
     assert.ok(results.every(r => r.ok)); assert.ok(results.some(r => r.alreadyCorrected));
+    const comptaBeforeInvalid = comptaCalls;
+    await assert.rejects(correct(tenant, { ...b, saleId: "invalid-sale-id" }), (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+    assert.equal(comptaCalls, comptaBeforeInvalid, "UUID invalide refusé avant Compta");
     if (beforeImport) {
       await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
       id = f.rows("cashDay")[0].id;
@@ -896,6 +906,7 @@ test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000,
     const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
     assert.equal(f.rows("cashSession")[0].status, "OPEN");
     assert.equal(page.projection.totauxCourants.expectedXpf, 25000n);
+    assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PAYMENT_CORRECTION").length, 1);
     assert.equal(page.projection.totauxCourants.byMethod.CASH, 0n);
     assert.equal(page.projection.totauxCourants.byMethod.CARD, 1000n);
     assert.equal(page.projection.totauxCourants.totalSalesXpf, 1000n);
@@ -1079,3 +1090,122 @@ test("ledger : arrivée tardive CLOSED, alias, aucune facture/vente supplémenta
   assert.equal(first.data.length, 200); assert.equal(first.hasMore, true); assert.equal(second.hasMore, false);
   assert.equal(first.data.length + second.data.length, f.rows("cashDayEvent").length); assert.equal(first.projection.ecartZ, -3205n);
 });
+
+test("quota plein : openCashDay crée une session sans posteId", async () => {
+  const f = fixture(); let quotaCalls = 0; let receivedPosteId: unknown = "sentinel";
+  const quota = { plafond: 1, utilise: 1 };
+  const inscrirePosteEnLigne = async () => { quotaCalls++; return { ok: false, quota: { error: "POSTE_QUOTA_ATTEINT", ...quota } }; };
+  const realOpenSessionTx = caisseFunction("openSessionTx", { Prisma: { PrismaClientKnownRequestError: class extends Error {} } });
+  f.native.openSessionTx = async (tx: Row, tenantId: string, b: Row) => { receivedPosteId = b.posteId ?? null; return realOpenSessionTx(tx, tenantId, b); };
+  f.native.inscrirePosteEnLigne = inscrirePosteEnLigne;
+  f.native.openSession = async () => { const registered = await inscrirePosteEnLigne(); return registered.ok ? { ok: true } : { ok: false, ...registered.quota }; };
+  const result = await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  assert.equal(result.id, f.rows("cashDay")[0].id);
+  assert.equal(receivedPosteId, null);
+  assert.equal(f.rows("cashSession")[0].posteId, null);
+  assert.equal(quotaCalls, 0);
+  assert.deepEqual(quota, { plafond: 1, utilise: 1 });
+  const manager = readFileSync(new URL("cash-days.ts", import.meta.url), "utf8");
+  const opening = manager.slice(manager.indexOf("export async function openCashDay"), manager.indexOf("export async function dayState"));
+  assert.match(opening, /openSessionTx\(tx/); assert.doesNotMatch(opening, /openSession\(|inscrirePosteEnLigne/);
+});
+
+test("correction partagée : vente UUID majuscule puis rejeu minuscule conserve un seul appel Compta", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, status: "PAID", paidAt: now,
+    invoiceId: "synthetic-invoice", comptaSyncedAt: now, totalXpf: 1000n, lines: [thousandLine()],
+    payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
+  await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+  let comptaCalls = 0;
+  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed, lockSaleRow: async () => true,
+    comptaClient: () => ({ paymentCorrection: async () => { comptaCalls++; return { ok: true }; } }),
+    verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection,
+    correctionKeyPour: corrections.correctionKeyPour,
+    runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
+  });
+  assert.notEqual(sale.id, sale.id.toUpperCase());
+  const first = await correct(tenant.toUpperCase(), { saleId: sale.id.toUpperCase(), fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 });
+  assert.equal(first.ok, true);
+  const replay = await correct(tenant, { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 });
+  assert.equal(replay.ok, true); assert.equal(replay.alreadyCorrected, true); assert.equal(comptaCalls, 1);
+  await assert.rejects(correct(tenant, { saleId: "invalid-sale-id", fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 }),
+    (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+  assert.equal(comptaCalls, 1);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PAYMENT_CORRECTION").length, 1);
+  assert.equal(await expected(f, day.id), 25000n);
+});
+
+test("createSale et createGiftCardWithoutSale normalisent leurs UUID d'entrée avant accès aux ports", async () => {
+  fixture(); // fournit à caisseFunction les fonctions uuid/normalizeActionInput réellement chargées.
+  const ids = {
+    tenant: "ab000000-0000-0000-0000-000000000011", session: "ab000000-0000-0000-0000-000000000012",
+    cashier: "ab000000-0000-0000-0000-000000000013", poste: "ab000000-0000-0000-0000-000000000014",
+    product: "ab000000-0000-0000-0000-000000000015", service: "ab000000-0000-0000-0000-000000000016",
+    order: "ab000000-0000-0000-0000-000000000017",
+  };
+  let salesCreated = 0, cardsCreated = 0, giftInput: Row | undefined, saleData: Row | undefined;
+  const tx = {
+    sale: { create: async ({ data }: Row) => { salesCreated++; saleData = data; return { id: "new-sale", totalXpf: data.totalXpf }; } },
+    giftCard: { create: async ({ data }: Row) => { cardsCreated++; assert.equal(data.serviceId, ids.service); return data; } },
+  };
+  const globals = { withTenant: async (_tenantId: string, fn: (tx: Row) => Promise<unknown>) => fn(tx),
+    assertLegacyWriteAllowed: async () => {}, validateGiftCard: (input: Row) => { giftInput = input; return { ok: true, data: { ...input } }; },
+    GIFT_CARD_SELECT: {}, toGiftCardView: (row: Row) => row, Prisma: { PrismaClientKnownRequestError: class extends Error {} } };
+  const createSale = caisseFunction("createSale", globals);
+  const upper = (id: string) => id.toUpperCase();
+  assert.notEqual(ids.session, upper(ids.session));
+  const sale = await createSale(upper(ids.tenant), { sessionId: upper(ids.session), cashierId: upper(ids.cashier), posteId: upper(ids.poste),
+    lines: [{ kind: "PRODUCT", productId: upper(ids.product), label: "Article synthétique", qty: 1, unitXpf: 1000n }] });
+  assert.equal(sale.ok, true); assert.equal(salesCreated, 1);
+  assert.equal(saleData!.sessionId, ids.session); assert.equal(saleData!.cashierId, ids.cashier); assert.equal(saleData!.posteId, ids.poste);
+  assert.equal(saleData!.lines.create[0].productId, ids.product);
+  await assert.rejects(createSale(ids.tenant, { sessionId: "invalid-session", lines: [{ kind: "OTHER", label: "X", qty: 1, unitXpf: 1n }] }),
+    (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+  assert.equal(salesCreated, 1, "session invalide refusée avant le port base");
+
+  const createGift = caisseFunction("createGiftCardWithoutSale", globals);
+  const created = await createGift(upper(ids.tenant), { code: "SYNTHETIC", amountXpf: 1000, serviceId: upper(ids.service), orderId: upper(ids.order) });
+  assert.equal(created.ok, true); assert.equal(cardsCreated, 1);
+  assert.equal(giftInput!.serviceId, ids.service); assert.equal(giftInput!.orderId, ids.order);
+  await assert.rejects(createGift(ids.tenant, { code: "INVALID", amountXpf: 1000, serviceId: "invalid-service" }),
+    (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+  assert.equal(cardsCreated, 1, "serviceId invalide refusé avant le port base");
+});
+
+for (const operation of ["partial-refund", "void"] as const) {
+  test(`UUID ${operation} CashDay : majuscules puis rejeu minuscule, Z 25000, invalide avant Compta`, async () => {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const day = f.rows("cashDay")[0];
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: day.canonicalSessionId,
+      sourceType: "synthetic", sourceId: `uuid-${operation}`, status: "PAID", paidAt: now, invoiceId: "synthetic-invoice",
+      totalXpf: 1000n, lines: [thousandLine()], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+    await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+    assert.equal(await expected(f, day.id), 26000n);
+    let comptaCalls = 0;
+    const native = financialPorts(f, { afterCredit: () => { comptaCalls++; } });
+    const finance = load("cash-day-finance.ts", { "./caisse": native, "./tenant": { withTenant: f.withTenant },
+      "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger, "./cash-day-projection": projection, "./partial-refund": refundPolicy });
+    const base = input({ actionId: actor, tenantId: tenant, entityKey: sale.id, reason: "Retour synthétique", cashDayId: day.id,
+      lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH" });
+    for (const [badDay, badSale, badBody] of [
+      ["invalid-day", sale.id, base], [day.id, "invalid-sale", base],
+      [day.id, sale.id, { ...base, actionId: "invalid-action" }],
+      ...(operation === "partial-refund" ? [[day.id, sale.id, { ...base, lines: [{ lineId: "invalid-line", qty: 1 }] }] as const] : []),
+    ] as const) {
+      await assert.rejects(finance.dayFinancial(badDay, badSale, operation, badBody), (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
+    }
+    assert.equal(comptaCalls, 0, "UUID invalides refusés avant Compta");
+    const upper = { ...base, tenantId: tenant.toUpperCase(), actionId: actor.toUpperCase(), entityKey: sale.id.toUpperCase(),
+      cashDayId: day.id.toUpperCase(), lines: [{ lineId: tenantB.toUpperCase(), qty: 1 }] };
+    assert.notEqual(sale.id, sale.id.toUpperCase()); assert.notEqual(day.id, day.id.toUpperCase());
+    assert.notEqual(actor, actor.toUpperCase()); assert.notEqual(tenantB, tenantB.toUpperCase());
+    const first = await finance.dayFinancial(day.id.toUpperCase(), sale.id.toUpperCase(), operation, upper);
+    assert.equal(first.ok, true, JSON.stringify(first)); assert.equal(comptaCalls, 1);
+    assert.equal(await expected(f, day.id), 25000n);
+    const replay = await finance.dayFinancial(day.id, sale.id, operation, base);
+    assert.equal(replay.alreadyApplied, true); assert.equal(comptaCalls, 1);
+    assert.equal(await expected(f, day.id), 25000n);
+  });
+}
