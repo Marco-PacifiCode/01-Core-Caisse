@@ -3,6 +3,7 @@ import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
 import { date, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
+import { lockSaleRow } from "./sale-lock";
 
 export function sourceAuthor(b: ActionInput) {
   const receivedById = uuid(b.receivedById);
@@ -203,6 +204,9 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
       continue;
     }
     requireCash(!sale.cashDayId || sale.cashDayId === id, "DAY_MISMATCH", 409);
+    requireCash(await lockSaleRow(tx, sale.id, b.tenantId), "NOT_FOUND", 404);
+    const currentSale = await tx.sale.findFirst({ where: { tenantId: b.tenantId, id: sale.id } });
+    requireCash(currentSale && (!currentSale.cashDayId || currentSale.cashDayId === id), "DAY_MISMATCH", 409);
     await tx.sale.update({ where: { id: sale.id }, data: { cashDayId: id, sessionId: day.canonicalSessionId } });
     await recordSharedSale(tx, b.tenantId, sale.id);
     saleIds.push(sale.id);

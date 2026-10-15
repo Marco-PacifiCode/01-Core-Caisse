@@ -23,6 +23,11 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
   const openSession = async (tx: Tx, posteId: string | null) => tx.cashSession.findFirst({
     where: { tenantId, posteId, status: "OPEN" }, orderBy: { openedAt: "desc" },
   });
+  const isCashDaySession = async (tx: Tx, sessionId: string) => {
+    const alias = await tx.cashDaySession?.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId } } });
+    const canonical = await tx.cashDay?.findFirst({ where: { tenantId, canonicalSessionId: sessionId }, select: { id: true } });
+    return !!(alias || canonical);
+  };
   return runPartialRefund({ tenantId, saleId,
     creditNote: value => deps.compta.creditNote(value),
     async prepare() {
@@ -54,6 +59,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         const coreDrawer = input.refundMethod === "CASH" && input.cashDrawer !== "EXTERNAL";
         const session = coreDrawer ? await openSession(tx, current.posteId) : null;
         if (coreDrawer && !session) return refuse("NO_OPEN_SESSION");
+        if (session && coreDrawer && !input.cashDayId && await isCashDaySession(tx, session.id)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         if (coreDrawer && await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } })) return refuse("REFUND_REF_CONFLICT");
         await tx.partialRefund.create({ data: { tenantId, saleId, actionId: input.actionId, sessionId: session?.id,
           ...(input.cashDayId ? { cashDayId: input.cashDayId, drawerBusinessDay: input.drawerBusinessDay, deviceId: input.deviceId } : {}),
@@ -82,6 +88,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
           // a gagné la course, rien n'est écrit et l'action reste rejouable.
           const locked = await tx.cashSession.updateMany({ where: { id: session.id, tenantId, status: "OPEN" }, data: { status: "OPEN" } });
           if (locked.count !== 1) return refuse("SESSION_CLOSED");
+          if (!input.cashDayId && await isCashDaySession(tx, session.id)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
           const movement = await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } });
           if (movement) return refuse("REFUND_REF_CONFLICT");
           if (!movement) await tx.cashMovement.create({ data: { tenantId, sessionId: session.id, kind: "REFUND", ref: partialRefundMovementRef(input.actionId),

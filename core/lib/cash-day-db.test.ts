@@ -127,7 +127,7 @@ function fixture() {
     },
     closeSessionTx: caisseFunction("closeSessionTx", { ...movements, ...gifts, ...reports }),
   };
-  const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection });
+  const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection, "./sale-lock": { lockSaleRow: async () => true } });
   const shared = load("cash-shared-data.ts", { "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
   const sales = load("cash-day-sales.ts", { "./cash-day-ledger": ledger, "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
   return { tx, sync, ledger, days, shared, sales, native, withTenant, rows: (name: string) => structuredClone(state[name]), queries };

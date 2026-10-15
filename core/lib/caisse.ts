@@ -605,6 +605,7 @@ export type PaymentInput = {
  */
 export type CheckoutOptions = {
   sharedActionId?: string;
+  cashDayId?: string;
   /**
    * Date RÉELLE de l'encaissement, quand elle diffère de son enregistrement.
    * Pendant du `occurredAt` de `createSale` : une caisse hors ligne remonte des
@@ -1115,8 +1116,12 @@ export async function checkoutSale(
     await withTenant(tenantId, async (tx) => {
       if (sale.cashDayId) {
         await lockSharedSale(tx, tenantId, saleId);
-        await lockSaleRow(tx, saleId, tenantId);
-        const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
+      }
+      if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
+      const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
+      if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+      if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+      if (current.cashDayId) {
         // Course perdue contre un autre moyen de paiement : refus explicite (409), pas de faux succès.
         if (current.payments.length && !samePayments(current.payments, toPersist)) {
           throw new CashContractError("SALE_ALREADY_PAID", 409,
@@ -1186,7 +1191,11 @@ export async function checkoutSale(
   // base : c'est le lien non ambigu documenté dans loyalty.ts (`GiftCard.saleId`, pas une ligne).
   const giftCardSalesXpf = giftCardsToIssue.reduce((t, g) => t + g.amountXpf, 0n);
   const issued = await withTenant(tenantId, async (tx) => {
-    if (sale.cashDayId && !await prepareSharedCheckout(tx, tenantId, saleId)) return [] as GiftCardIssued[];
+    if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
+    const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
+    if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    if (current.cashDayId && !await prepareSharedCheckout(tx, tenantId, saleId)) return [] as GiftCardIssued[];
     // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
     // Une date future est ignorée plutôt que refusée : le ticket est déjà
     // encaissé au comptoir, on ne bloque pas sa remontée pour une horloge mal
@@ -1206,10 +1215,10 @@ export async function checkoutSale(
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
     await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
-    if (sale.cashDayId) {
+    if (current.cashDayId) {
       await consumePickupOrder(tx, tenantId, saleId);
       await recordSharedSale(tx, tenantId, saleId);
-      if (options?.sharedActionId) await ackFinancial(tx, tenantId, options.sharedActionId, { id: saleId, saleId, cashDayId: sale.cashDayId, status: "PAID" });
+      if (options?.sharedActionId) await ackFinancial(tx, tenantId, options.sharedActionId, { id: saleId, saleId, cashDayId: current.cashDayId, status: "PAID" });
     }
     // 🔴 LES BONS SE CONSOMMENT ICI, dans la MÊME transaction que le passage à PAID — pour la
     //    raison exactement symétrique de leur création : zéro fenêtre entre « le bon est brûlé »
@@ -1234,7 +1243,7 @@ export async function checkoutSale(
         race.id = g.id;
         throw new Error("GIFT_CARD_RACE");
       }
-      if (sale.cashDayId) await recordSharedGift(tx, tenantId, sale.cashDayId, g.id, sale.deviceId ?? "legacy", datePaiement);
+      if (current.cashDayId) await recordSharedGift(tx, tenantId, current.cashDayId, g.id, sale.deviceId ?? "legacy", datePaiement);
     }
     if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
     const rows: GiftCardIssued[] = [];

@@ -72,12 +72,12 @@ for (const [path, body] of cases) {
 test("garde : vente liée directement, jour fermé, et exception d'avoir strictement du même CashDay", async () => {
   for (const mode of ["canonical", "alias", "sale-only"] as const) {
     const { guard } = fixture(mode, false);
-    assert.equal(await guard.cashDayGuard(tenant, { saleId }), true);
+    assert.equal(await guard.cashDayGuard(tenant, { saleId }), mode !== "sale-only");
     assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: dayId }), false);
     assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: actionId }), true);
     if (mode !== "sale-only") {
       assert.equal(await guard.cashDayGuard(tenant, { sessionId }), true);
-      assert.equal(await guard.cashDayGuard(tenant, { openSession: true }), false);
+      assert.equal(await guard.cashDayGuard(tenant, { openSession: true }), true);
     }
   }
 });

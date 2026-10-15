@@ -1,26 +1,22 @@
 import { withTenant } from "./tenant";
 
 export const CASHDAY_ROUTE_REQUIRED = { ok: false, error: "CASHDAY_ROUTE_REQUIRED" } as const;
-type LegacyWrite = { openSession: true } | { sessionId: string | null | undefined } | { saleId: string; refundCashDayId?: string };
+type LegacyWrite = { openSession: true } | { sessionId?: string | null } | { saleId: string; refundCashDayId?: string };
 
-/** Garde des entrées historiques uniquement ; les primitives CashDay restent accessibles. */
+/** Toute écriture historique doit passer par l'API CashDay dès qu'un jour existe. */
 export async function cashDayGuard(tenantId: string, target: LegacyWrite): Promise<boolean> {
   return withTenant(tenantId, async tx => {
-    if ("openSession" in target) return !!await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN" } } });
-    let sessionId: string | null | undefined;
-    let cashDayId: string | null | undefined;
+    const days = await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } });
+    if (!days) return false;
     if ("saleId" in target) {
+      if (target.refundCashDayId && await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId }, select: { id: true } })) return false;
       const sale = await tx.sale.findFirst({ where: { tenantId, id: target.saleId }, select: { sessionId: true, cashDayId: true } });
-      sessionId = sale?.sessionId;
-      cashDayId = sale?.cashDayId;
-    } else sessionId = target.sessionId;
-    if (sessionId) {
-      const canonical = await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: sessionId } });
-      const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId } } });
-      const owners = [cashDayId, canonical?.id, alias?.cashDayId].filter((id): id is string => !!id);
-      if ("saleId" in target && target.refundCashDayId && owners.length && owners.every(id => id === target.refundCashDayId)) return false;
-      return owners.length > 0;
+      if (target.refundCashDayId && sale?.sessionId) {
+        const canonical = await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: sale.sessionId }, select: { id: true } });
+        const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId: sale.sessionId } } });
+        if ([sale.cashDayId, canonical?.id, alias?.cashDayId].includes(target.refundCashDayId)) return false;
+      } else if (target.refundCashDayId && sale?.cashDayId === target.refundCashDayId) return false;
     }
-    return !!cashDayId && !("saleId" in target && target.refundCashDayId === cashDayId);
+    return true;
   });
 }
