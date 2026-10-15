@@ -30,9 +30,12 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
     return { input: r.input as unknown as RefundInput, plan: r.plan as unknown as RefundPlan,
       ...(r.status === "DONE" ? { outcome: r.outcome as unknown as RefundSuccess } : {}) };
   };
-  const openSession = async (tx: Tx, posteId: string | null) => tx.cashSession.findFirst({
-    where: { tenantId, posteId, status: "OPEN" }, orderBy: { openedAt: "desc" },
-  });
+  const openSession = async (tx: Tx, posteId: string | null) => {
+    const read = (key: string | null) => tx.cashSession.findFirst({
+      where: { tenantId, posteId: key, status: "OPEN" }, orderBy: { openedAt: "desc" },
+    });
+    return posteId === null ? read(null) : findHistoricalKey(posteId, read);
+  };
   const isCashDaySession = async (tx: Tx, sessionId: string) => {
     const alias = await tx.cashDaySession?.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId } } });
     const canonical = await tx.cashDay?.findFirst({ where: { tenantId, canonicalSessionId: sessionId }, select: { id: true } });

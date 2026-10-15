@@ -132,14 +132,18 @@ async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
 
 /** Variante interne L4 : la transaction et son verrou sont détenus par le gestionnaire de journée. */
 export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: string, input: OpenSessionInput) {
+  const receivedPosteId = receivedActionInput(input).posteId ?? null;
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
   const posteId = input.posteId ?? null;
+  const readOpen = () => {
+    const read = (key: string | null) => tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN", posteId: key }, select: { id: true },
+    });
+    return receivedPosteId === null ? read(null) : findHistoricalKey(receivedPosteId, read);
+  };
     // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
     // règle reste identique à avant : une seule pour le marchand.
-    const existing = await tx.cashSession.findFirst({
-      where: { tenantId, status: "OPEN", posteId },
-      select: { id: true },
-    });
+    const existing = await readOpen();
     if (existing) return { ok: false as const, error: "SESSION_ALREADY_OPEN" as const, sessionId: existing.id };
 
     try {
@@ -161,10 +165,7 @@ export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: stri
       // base qui tranche. On retombe sur la session gagnante au lieu de
       // remonter une erreur technique au comptoir.
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        const gagnante = await tx.cashSession.findFirst({
-          where: { tenantId, status: "OPEN", posteId },
-          select: { id: true },
-        });
+        const gagnante = await readOpen();
         if (gagnante) {
           return { ok: false as const, error: "SESSION_ALREADY_OPEN" as const, sessionId: gagnante.id };
         }
@@ -175,18 +176,20 @@ export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: stri
 
 /** Session OPEN courante du tenant (ou null). */
 export async function currentSession(tenantId: string, posteId?: string | null) {
-  tenantId = uuid(tenantId); if (posteId) posteId = uuid(posteId);
+  const receivedPosteId = posteId ?? null;
+  tenantId = uuid(tenantId);
   // Sans poste précisé, on cherche la session SANS poste (`posteId: null`) et
   // non « n'importe laquelle » : sur un marchand multi-postes, rendre la
   // session d'un autre comptoir ferait rattacher des ventes au mauvais tiroir.
   // Pour les marchands mono-caisse, dont les sessions ont `posteId = NULL`, le
   // résultat est exactement celui d'avant.
-  return withTenant(tenantId, (tx) =>
-    tx.cashSession.findFirst({
-      where: { tenantId, status: "OPEN", posteId: posteId ?? null },
+  return withTenant(tenantId, (tx) => {
+    const read = (key: string | null) => tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN", posteId: key },
       orderBy: { openedAt: "desc" },
-    }),
-  );
+    });
+    return receivedPosteId === null ? read(null) : findHistoricalKey(receivedPosteId, read);
+  });
 }
 
 export type ZReport = {

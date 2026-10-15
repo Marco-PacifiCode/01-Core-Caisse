@@ -44,7 +44,9 @@ test("le poste est NULLABLE sur CashSession et Sale (les marchands existants n'e
 // ── Unicité de session ───────────────────────────────────────────────────────
 
 test("l'unicité de session ouverte est filtrée PAR POSTE", () => {
-  assert.match(caisse, /status:\s*"OPEN",\s*posteId\s*\}/);
+  const bloc = caisse.slice(caisse.indexOf("export async function openSessionTx"), caisse.indexOf("export async function currentSession"));
+  assert.match(bloc, /where:\s*\{ tenantId, status: "OPEN", posteId: key \}/);
+  assert.match(bloc, /receivedPosteId === null \? read\(null\) : findHistoricalKey\(receivedPosteId, read\)/);
 });
 
 test("openSession rattrape la course sur l'index unique au lieu de remonter une erreur brute", () => {
@@ -55,7 +57,9 @@ test("openSession rattrape la course sur l'index unique au lieu de remonter une 
 
 test("currentSession cherche la session DU poste, pas n'importe laquelle", () => {
   const bloc = caisse.slice(caisse.indexOf("export async function currentSession"));
-  assert.match(bloc.slice(0, 900), /posteId:\s*posteId\s*\?\?\s*null/);
+  assert.match(bloc.slice(0, 1200), /const receivedPosteId = posteId \?\? null/);
+  assert.match(bloc.slice(0, 1200), /where:\s*\{ tenantId, status: "OPEN", posteId: key \}/);
+  assert.match(bloc.slice(0, 1200), /receivedPosteId === null \? read\(null\) : findHistoricalKey\(receivedPosteId, read\)/);
 });
 
 // ── Horodatage ───────────────────────────────────────────────────────────────

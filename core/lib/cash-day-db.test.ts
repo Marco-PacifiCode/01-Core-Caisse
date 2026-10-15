@@ -1321,6 +1321,71 @@ test('journal : UUID normalises des la creation et snapshots rejoues sans doublo
 
 function sameResponse(actual: unknown, saved: unknown) { assert.equal(projection.canonical(actual), projection.canonical(saved)); }
 
+test('session OPEN : poste UUID historique majuscule retrouvé, ouvertures concurrentes sans doublon', async () => {
+  const f = fixture();
+  const old = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: actor.toUpperCase(), openingFloatXpf: 25000n } });
+  await f.tx.cashSession.create({ data: { tenantId: tenantB, posteId: actor, openingFloatXpf: 99n } });
+  const current = caisseFunction('currentSession', { withTenant: f.withTenant });
+  const open = caisseFunction('openSessionTx', {});
+  for (const posteId of [actor, actor.toUpperCase(), 'eF000000-0000-0000-0000-000000000003']) {
+    assert.equal((await current(tenant, posteId)).id, old.id);
+  }
+  const results = await Promise.all([actor, actor.toUpperCase()].map(posteId =>
+    f.withTenant(tenant, (tx: Row) => open(tx, tenant, f.sync.normalizeActionInput({ posteId, openedBy: actor, openingFloatXpf: 0n })))));
+  for (const result of results) {
+    assert.equal(result.ok, false); assert.equal(result.error, 'SESSION_ALREADY_OPEN'); assert.equal(result.sessionId, old.id);
+  }
+  assert.equal(f.rows('cashSession').length, 2);
+  assert.equal(f.rows('cashSession')[0].posteId, actor.toUpperCase());
+  assert.equal(f.rows('cashDay').length, 0);
+});
+
+test('avoir CASH : poste normalisé retrouve la session historique majuscule en préparation et finalisation', async () => {
+  const f = fixture();
+  const session = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: actor.toUpperCase(), openingFloatXpf: 25000n } });
+  await f.tx.cashSession.create({ data: { tenantId: tenantB, posteId: actor, openingFloatXpf: 99n } });
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, posteId: actor, sessionId: session.id, status: 'PAID',
+    invoiceId: 'synthetic-invoice', totalXpf: 1000n, lines: [thousandLine()] } });
+  let credits = 0;
+  const native = financialPorts(f, { afterCredit: () => { credits++; } });
+  const request = { actionId: actor, reason: 'Retour synthétique', lines: [{ lineId: tenantB, qty: 1 }], refundMethod: 'CASH' };
+  assert.equal((await native.rembourserPartiellement(tenant, sale.id, request)).ok, true);
+  assert.equal((await native.rembourserPartiellement(tenant, sale.id, request)).ok, true);
+  assert.equal(credits, 1); assert.equal(f.rows('partialRefund').length, 1);
+  assert.equal(f.rows('partialRefund')[0].status, 'DONE');
+  assert.equal(f.rows('cashMovement').length, 1); assert.equal(f.rows('cashMovement')[0].sessionId, session.id);
+  assert.equal(f.rows('cashSession')[0].posteId, actor.toUpperCase());
+  assert.equal(f.rows('cashDay').length, 0);
+});
+
+test('session OPEN : P2002 relit le poste historique sous trois formes', async () => {
+  const f = fixture();
+  class ConcurrentOpen extends Error { code = 'P2002'; }
+  const open = caisseFunction('openSessionTx', { Prisma: { PrismaClientKnownRequestError: ConcurrentOpen } });
+  const create = f.tx.cashSession.create.bind(f.tx.cashSession);
+  let winner: Row;
+  f.tx.cashSession.create = async ({ data }: Row) => {
+    winner = await create({ data: { ...data, posteId: actor.toUpperCase() } });
+    throw new ConcurrentOpen();
+  };
+  const result = await open(f.tx, tenant, { posteId: actor, openedBy: actor, openingFloatXpf: 0n });
+  assert.equal(result.ok, false); assert.equal(result.sessionId, winner!.id);
+  assert.equal(f.rows('cashSession').length, 1);
+});
+
+test('session OPEN : poste libre sensible à la casse, poste null conservé, nouvelle écriture UUID normalisée', async () => {
+  const f = fixture();
+  const current = caisseFunction('currentSession', { withTenant: f.withTenant });
+  const open = caisseFunction('openSessionTx', {});
+  for (const posteId of ['ABC', 'abc', actor.toUpperCase(), null]) {
+    const result = await open(f.tx, tenant, { posteId, openedBy: actor, openingFloatXpf: 0n });
+    assert.equal(result.ok, true);
+    assert.equal((await current(tenant, posteId)).id, result.session.id);
+  }
+  assert.deepEqual(f.rows('cashSession').map(s => s.posteId), ['ABC', 'abc', actor, null]);
+  assert.equal((await current(tenant)).posteId, null);
+});
+
 // Sources historiques TEXT : mêmes ports que la production, comparaisons sensibles
 // à la casse (contrairement aux colonnes PostgreSQL UUID).
 for (const storedSource of [actor.toUpperCase(), 'eF000000-0000-0000-0000-000000000003']) {

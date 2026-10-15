@@ -180,11 +180,24 @@ function readCaisse(): string {
   return readFileSync(path.join(libDir, "caisse.ts"), "utf8");
 }
 
-test("importerCloture cherche la session EXISTANTE par (tenantId, sourceType, sourceId) avant d'écrire", () => {
+test("importerCloture cherche la session EXISTANTE par (tenantId, sourceType, sourceId) avant d'écrire", async () => {
   const src = readCaisse();
   const bloc = src.slice(src.indexOf("export async function importerCloture"));
-  assert.match(bloc.slice(0, 1500), /sourceType:\s*prepared\.sourceType,\s*sourceId:\s*prepared\.sourceId/);
-  assert.match(bloc.slice(0, 1500), /alreadyExisted:\s*true/);
+  const beforeCreate = bloc.slice(0, bloc.indexOf("tx.cashSession.create"));
+  assert.match(beforeCreate, /receivedActionInput\(input\)/);
+  assert.match(beforeCreate, /findHistoricalSource\(source,\s*\(sourceType, sourceId\)\s*=>\s*tx.cashSession.findFirst/);
+  assert.match(beforeCreate, /where:\s*\{ tenantId, sourceType, sourceId \}/);
+  assert.match(beforeCreate, /const existing = await readSource\(tx\)/);
+  assert.match(beforeCreate, /alreadyExisted:\s*true/);
+  // Le helper réellement appelé doit retrouver toutes les formes historiques d'un UUID.
+  const { findHistoricalSource } = await import("./caisse-sync.ts");
+  const lower = "ab000000-0000-0000-0000-000000000001";
+  const mixed = "aB000000-0000-0000-0000-000000000001";
+  for (const stored of [mixed, lower, lower.toUpperCase()]) {
+    const result = await findHistoricalSource({ sourceType: "synthetic", sourceId: mixed }, async (sourceType, sourceId) =>
+      sourceType === "synthetic" && sourceId === stored ? { sessionId: "existing", alreadyExisted: true } : null);
+    assert.deepEqual(result, { sessionId: "existing", alreadyExisted: true });
+  }
 });
 
 test("importerCloture ne modifie PAS la session si elle existe déjà (pas d'update, juste une relecture)", () => {
