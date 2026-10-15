@@ -37,10 +37,11 @@ export function claimState(syncError: string | null | undefined, now: Date): "no
 }
 export function syncBlocksVoid(sale: Pick<SyncSaleSnapshot, "status" | "syncError" | "comptaSyncedAt" | "stockSyncedAt"> & {
   lines: { kind: string; productId: string | null }[];
-}): boolean {
+}, now: Date): boolean {
   return sale.status === "PAID" &&
-    !!(sale.syncError?.startsWith(SYNC_EN_COURS_MARKER) || sale.syncError?.startsWith(SYNC_A_REPRENDRE_MARKER)) &&
-    (!sale.comptaSyncedAt || (!sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId)));
+    (claimState(sale.syncError, now) === "live" ||
+      (!!(sale.syncError?.startsWith(SYNC_EN_COURS_MARKER) || sale.syncError?.startsWith(SYNC_A_REPRENDRE_MARKER)) &&
+        (!sale.comptaSyncedAt || (!sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId)))));
 }
 export function checkoutStatusAfterSync(outcome: SyncOutcome | null | undefined): "PAID" | "VOID" {
   return outcome?.stopped === "VOID" || outcome?.settledOnVoidingSale || outcome?.stockOnVoidingSale ? "VOID" : "PAID";
@@ -128,8 +129,10 @@ const NEUTRALISATION_REASON = "Vente annulée pendant la synchro : facture neutr
 /** Transactions courtes sous verrou, sans appel réseau. */
 export type SyncGuard = {
   reread(): Promise<SyncSaleSnapshot | null>;
-  claimSync(claim: string): Promise<
-    { claimed: true; fresh: SyncSaleSnapshot } | { claimed: false; busy: boolean; fresh: SyncSaleSnapshot | null }
+  claimSync(claim: string, phase: "compta" | "stock"): Promise<
+    { claimed: true; fresh: SyncSaleSnapshot } |
+    { claimed: false; busy: false; done: true; fresh: SyncSaleSnapshot } |
+    { claimed: false; busy: boolean; done?: false; fresh: SyncSaleSnapshot | null }
   >;
   completeSync(claim: string, phase: "compta" | "stock"): Promise<void>;
   failSync(claim: string, phase: "compta" | "stock", detail: string): Promise<void>;
@@ -138,6 +141,7 @@ export type SyncGuard = {
   >;
   attachOrphanInvoice(invoiceId: string, invoiceNumber: string | null): Promise<boolean>;
   attachNeutralization(invoiceId: string, creditNoteId: string): Promise<void>;
+  failNeutralization(invoiceId: string, detail: string): Promise<void>;
 };
 
 export type SyncOutcome = {
@@ -271,9 +275,9 @@ async function runGuardedSaleSync(
       if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent");
       if (cur.payments.length) {
         const claim = syncClaimFor(cur.payments.length, new Date(), timeoutMs, crypto.randomUUID());
-        const result = await guard.claimSync(claim);
-        if (!result.claimed) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
-        active = { claim, phase: "compta" };
+        const result = await guard.claimSync(claim, "compta");
+        if (!result.claimed && !result.done) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
+        if (result.claimed) active = { claim, phase: "compta" };
         cur = result.fresh;
       } else cur = await guard.reread();
       invoiceId = cur?.invoiceId ?? null;
@@ -282,16 +286,18 @@ async function runGuardedSaleSync(
       if (stopped) return await stop(stopped);
       if (!cur) return await stop("NOT_FOUND");
       if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent après relecture");
-      for (const p of cur.payments) {
-        await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
-          amountXpf: Number(p.amountXpf), method: p.method,
-          paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+      if (!cur.comptaSyncedAt) {
+        for (const p of cur.payments) {
+          await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
+            amountXpf: Number(p.amountXpf), method: p.method,
+            paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+        }
+        const afterSettle = await guard.reread();
+        if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
+        if (active) await guard.completeSync(active.claim, "compta");
+        else await persist.markComptaSynced();
+        active = null;
       }
-      const afterSettle = await guard.reread();
-      if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
-      if (active) await guard.completeSync(active.claim, "compta");
-      else await persist.markComptaSynced();
-      active = null;
     }
     cur = await reread();
     stopped = stoppedFor(cur);
@@ -301,9 +307,9 @@ async function runGuardedSaleSync(
       let productLines = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId);
       if (productLines.length) {
         const claim = syncClaimFor(productLines.length, new Date(), timeoutMs, crypto.randomUUID());
-        const result = await guard.claimSync(claim);
-        if (!result.claimed) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
-        active = { claim, phase: "stock" };
+        const result = await guard.claimSync(claim, "stock");
+        if (!result.claimed && !result.done) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
+        if (result.claimed) active = { claim, phase: "stock" };
         cur = result.fresh;
         productLines = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId);
       } else cur = await guard.reread();
@@ -312,16 +318,18 @@ async function runGuardedSaleSync(
       stopped = stoppedFor(cur);
       if (stopped) return await stop(stopped);
       if (!cur) return await stop("NOT_FOUND");
-      for (const l of productLines) {
-        await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
-          sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
-        stockDecremented++;
-      }
-      const afterStock = await guard.reread();
-      if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
-      if (active) await guard.completeSync(active.claim, "stock");
-      else await persist.markStockSynced();
-      active = null;
+      if (!cur.stockSyncedAt) {
+        for (const l of productLines) {
+          await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
+            sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
+          stockDecremented++;
+        }
+        const afterStock = await guard.reread();
+        if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
+        if (active) await guard.completeSync(active.claim, "stock");
+        else await persist.markStockSynced();
+        active = null;
+      } else stockDecremented = productLines.length;
     }
     await persist.clearError();
     return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented, ...races };

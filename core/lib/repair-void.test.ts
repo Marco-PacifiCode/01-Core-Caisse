@@ -18,11 +18,14 @@ function fixture() {
   const credits: string[] = [];
   const guard: SyncGuard = {
     async reread() { return db.sale ? structuredClone(db.sale) : null; },
-    async claimSync(claim) {
+    async claimSync(claim, phase) {
       hooks.claim?.();
       const s = db.sale;
       const fresh = s ? structuredClone(s) : null;
       if (!s || s.status !== "PAID" || s.voidPreparedAt) return { claimed: false, busy: false, fresh };
+      if (phase === "compta" ? s.comptaSyncedAt : s.stockSyncedAt) {
+        return { claimed: false, busy: false, done: true, fresh: structuredClone(s) };
+      }
       if (claimState(s.syncError, new Date()) === "live" && s.syncError !== claim) return { claimed: false, busy: true, fresh };
       s.syncError = claim;
       return { claimed: true, fresh: structuredClone(s) };
@@ -53,6 +56,14 @@ function fixture() {
       if (!s || s.status !== "VOID" || s.invoiceId) return false;
       Object.assign(s, { invoiceId, invoiceNumber, syncError: NEUTRALISATION_MARKER });
       return true;
+    },
+    async failNeutralization(invoiceId, detail) {
+      const s = db.sale;
+      if (!s) return;
+      db.syncAttempts++;
+      if (s.status === "VOID" && s.invoiceId === invoiceId && !s.creditNoteId) {
+        s.syncError = NEUTRALISATION_MARKER + " " + detail;
+      }
     },
     async attachNeutralization(invoiceId, creditNoteId) {
       if (db.sale?.status === "VOID" && db.sale.invoiceId === invoiceId) {
@@ -344,7 +355,7 @@ test("q) un échec core pendant settle remplace la revendication", async () => {
   const out = await f.run();
   assert.equal(out.synced, false);
   assert.equal(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER), false);
-  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
   assert.equal(claimState(f.db.sale!.syncError, new Date()), "stale");
   assert.equal(f.db.syncAttempts, 1);
   assert.match(f.db.sale!.syncError!, /compta:settle/);
@@ -395,7 +406,7 @@ test("u) A vivant exclut B ; echec puis reprise de B", async () => {
   const a = f.run();
   await started;
   const claimA = f.db.sale!.syncError;
-  const b = await f.guard.claimSync(syncClaimFor(1, new Date(), 8000, "B"));
+  const b = await f.guard.claimSync(syncClaimFor(1, new Date(), 8000, "B"), "compta");
   assert.equal(b.claimed, false);
   assert.ok(!b.claimed && b.busy);
   assert.equal((await f.run()).stopped, "LOCKED");
@@ -405,11 +416,11 @@ test("u) A vivant exclut B ; echec puis reprise de B", async () => {
   release();
   assert.equal((await a).synced, false);
   assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
-  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
   f.compta.settle = async () => ({ ok: true, invoiceId: "invoice-test", paid: 1000, remaining: 0 });
   assert.equal((await f.run()).synced, true);
   assert.equal(f.db.sale!.syncError, null);
-  assert.equal(syncBlocksVoid(f.db.sale!), false);
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date()), false);
 });
 
 test("v) stock partiel puis timeout : blocage jusqua reprise confirmee", async () => {
@@ -424,12 +435,12 @@ test("v) stock partiel puis timeout : blocage jusqua reprise confirmee", async (
   assert.equal(out.stockDecremented, 1);
   assert.equal(f.db.sale!.stockSyncedAt, null);
   assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
-  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
   f.hooks.recordSale = undefined;
   assert.equal((await f.run()).synced, true);
   assert.ok(f.db.sale!.stockSyncedAt);
   assert.equal(f.db.sale!.syncError, null);
-  assert.equal(syncBlocksVoid(f.db.sale!), false);
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date()), false);
 });
 
 test("w) A echu termine apres reprise par B : le marqueur de B survit", async () => {
@@ -438,7 +449,7 @@ test("w) A echu termine apres reprise par B : le marqueur de B survit", async ()
     const a = syncClaimFor(1, new Date(0), 1000, "A");
     f.db.sale!.syncError = a;
     const b = syncClaimFor(1, new Date(), 8000, "B");
-    assert.equal((await f.guard.claimSync(b)).claimed, true);
+    assert.equal((await f.guard.claimSync(b, phase)).claimed, true);
     await f.guard.completeSync(a, phase);
     assert.equal(f.db.sale!.syncError, b);
     await f.guard.failSync(a, phase, "ancien echec");
@@ -455,7 +466,7 @@ test("x) plantage : une revendication echue bloque toujours l'annulation", () =>
   for (const marker of [syncClaimFor(1, new Date(0), 1000, "mort"), SYNC_EN_COURS_MARKER + " illisible"]) {
     f.db.sale!.syncError = marker;
     assert.equal(claimState(marker, new Date()), "stale");
-    assert.equal(syncBlocksVoid(f.db.sale!), true);
+    assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
   }
 });
 
@@ -463,14 +474,14 @@ test("y) marqueur residuel entierement synchronise : annulation non bloquee", ()
   const f = fixture();
   for (const marker of [SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER]) {
     Object.assign(f.db.sale!, { syncError: marker, comptaSyncedAt: new Date(), stockSyncedAt: new Date() });
-    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    assert.equal(syncBlocksVoid(f.db.sale!, new Date()), false);
     f.db.sale!.stockSyncedAt = null;
-    assert.equal(syncBlocksVoid(f.db.sale!), true);
+    assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
     f.db.sale!.status = "VOID";
-    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    assert.equal(syncBlocksVoid(f.db.sale!, new Date()), false);
     f.db.sale!.status = "PAID";
     f.db.sale!.lines = [];
-    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    assert.equal(syncBlocksVoid(f.db.sale!, new Date()), false);
     f.db.sale!.lines = structuredClone(f.photo.lines);
   }
 });
@@ -509,7 +520,91 @@ test("erreur inattendue : marqueur a reprendre et erreur originale preservee", a
         assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
         assert.equal(f.db.syncAttempts, 1);
       }
-      assert.equal(syncBlocksVoid(f.db.sale!), true);
+      assert.equal(syncBlocksVoid(f.db.sale!, new Date()), true);
     }
   }
+});
+
+test("ab) A termine entre la lecture de B et sa revendication : étape sautée sans appel", async () => {
+  for (const phase of ["compta", "stock"] as const) {
+    const f = fixture();
+    f.db.sale!.invoiceId = "invoice-test";
+    if (phase === "stock") f.db.sale!.comptaSyncedAt = new Date();
+    const claimSync = f.guard.claimSync;
+    let checked = false;
+    f.guard.claimSync = async (claim, requestedPhase) => {
+      if (requestedPhase !== phase) return claimSync(claim, requestedPhase);
+      checked = true;
+      const key = phase === "compta" ? "comptaSyncedAt" : "stockSyncedAt";
+      assert.equal(f.db.sale![key], null, "B a lu une étape incomplète");
+      await f.guard.completeSync("A", phase);
+      const before = structuredClone(f.db.sale);
+      const result = await claimSync(claim, requestedPhase);
+      assert.equal(result.claimed, false);
+      assert.ok(!result.claimed && result.done);
+      assert.equal(result.busy, false);
+      assert.deepEqual(result.fresh, before);
+      assert.deepEqual(f.db.sale, before, "aucune écriture lors du refus done");
+      return result;
+    };
+    const out = await f.run();
+    assert.equal(checked, true);
+    assert.equal(out.synced, true);
+    assert.equal(out.stopped, undefined);
+    assert.equal(f.calls.createInvoice, 0);
+    assert.equal(f.calls.settle, 0);
+    assert.equal(f.calls.recordSale, phase === "compta" ? 1 : 0);
+    assert.equal(out.stockDecremented, 1);
+    assert.ok(f.db.sale!.comptaSyncedAt);
+    assert.ok(f.db.sale!.stockSyncedAt);
+  }
+});
+
+test("ac) A échu termine pendant le bail de B : annulation bloquée jusqu'à la fin de B", async () => {
+  const f = fixture();
+  const now = new Date();
+  const a = syncClaimFor(1, new Date(0), 1000, "A");
+  const b = syncClaimFor(1, now, 8000, "B");
+  Object.assign(f.db.sale!, { invoiceId: "invoice-test", stockSyncedAt: now, syncError: a });
+  assert.equal((await f.guard.claimSync(b, "compta")).claimed, true);
+  await f.guard.completeSync(a, "compta");
+  assert.ok(f.db.sale!.comptaSyncedAt);
+  assert.equal(f.db.sale!.syncError, b);
+  assert.equal(claimState(f.db.sale!.syncError, now), "live");
+  assert.equal(syncBlocksVoid(f.db.sale!, now), true);
+  await f.guard.completeSync(b, "compta");
+  assert.equal(f.db.sale!.syncError, null);
+  assert.equal(syncBlocksVoid(f.db.sale!, now), false);
+});
+
+test("ad) vente synchronisée : un marqueur échu autorise l'annulation, un bail vivant la bloque", () => {
+  const f = fixture();
+  const now = new Date("2026-10-15T00:00:00.000Z");
+  const live = syncClaimFor(1, now, 1000, "B");
+  Object.assign(f.db.sale!, { comptaSyncedAt: now, stockSyncedAt: now, syncError: live });
+  assert.equal(syncBlocksVoid(f.db.sale!, new Date(now.getTime() + 6000)), false);
+  assert.equal(syncBlocksVoid(f.db.sale!, now), true);
+  f.db.sale!.status = "VOID";
+  assert.equal(syncBlocksVoid(f.db.sale!, now), false);
+});
+
+test("ae) échec de neutralisation tardif : l'avoir réussi ne reprend aucun marqueur", async () => {
+  const f = fixture();
+  Object.assign(f.db.sale!, { status: "VOID", invoiceId: "invoice-test", syncError: NEUTRALISATION_MARKER });
+  await f.guard.attachNeutralization("invoice-test", "credit-test");
+  await f.guard.failNeutralization("invoice-test", "échec de la reprise concurrente");
+  assert.equal(f.db.sale!.syncError, null);
+  assert.equal(f.db.sale!.creditNoteId, "credit-test");
+  assert.equal(f.db.syncAttempts, 1);
+  f.db.sale!.creditNoteId = null;
+  await f.guard.failNeutralization("invoice-other", "autre facture");
+  assert.equal(f.db.sale!.syncError, null);
+  assert.equal(f.db.syncAttempts, 2);
+  await f.guard.failNeutralization("invoice-test", "panne");
+  assert.equal(f.db.sale!.syncError, `${NEUTRALISATION_MARKER} panne`);
+  assert.equal(f.db.syncAttempts, 3);
+  f.db.sale!.status = "PAID";
+  await f.guard.failNeutralization("invoice-test", "vente non annulée");
+  assert.equal(f.db.sale!.syncError, `${NEUTRALISATION_MARKER} panne`);
+  assert.equal(f.db.syncAttempts, 4);
 });
