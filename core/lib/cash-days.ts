@@ -53,11 +53,82 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
 export async function dayState(tx: CashTx, tenantId: string, id: string) {
   tenantId = uuid(tenantId); id = uuid(id);
   const day = await lockDay(tx, tenantId, id);
+  return cashDayView(day);
+}
+function cashDayView(day: Prisma.CashDayGetPayload<{ include: { canonicalSession: true; currentSession: true } }>) {
   return { id: day.id, cashDayId: day.id, businessDay: day.businessDay, scope: day.scope, cycle: day.cycle,
     sessionId: day.currentSessionId, canonicalSessionId: day.canonicalSessionId, status: day.currentSession.status,
     revision: day.revision, fond: day.canonicalSession.openingFloatXpf, openedBy: day.currentSession.openedBy,
     openedByName: day.currentSession.openedByName, openedAt: day.currentSession.openedAt, closedBy: day.currentSession.closedBy,
     closedByName: day.currentSession.closedByName, closedAt: day.currentSession.closedAt };
+}
+
+function dayPage(q: URLSearchParams, fallback: number, max: number) {
+  const raw = q.get("limit");
+  requireCash(raw === null || /^[0-9]+$/.test(raw));
+  const limit = raw === null ? fallback : Number(raw);
+  requireCash(Number.isSafeInteger(limit) && limit >= 1 && limit <= max);
+  return { limit, cursor: q.has("cursor") ? validDay(q.get("cursor")) : null };
+}
+
+export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchParams) {
+  tenantId = uuid(tenantId);
+  const { limit, cursor } = dayPage(q, 31, 100);
+  // Index (tenantId, scope, businessDay), sans passer par dayState/lockDay.
+  const rows = await tx.cashDay.findMany({
+    where: { tenantId, scope: "rotisserie-caisse", ...(cursor ? { businessDay: { lt: cursor } } : {}) },
+    orderBy: { businessDay: "desc" }, take: limit + 1,
+    include: { canonicalSession: true, currentSession: true,
+      events: { where: { tenantId, kind: "CLOSURE" }, orderBy: { sequence: "desc" }, take: 1 } },
+  });
+  return { days: rows.slice(0, limit).map(day => ({ ...cashDayView(day), closure: day.events[0]?.snapshot ?? null })),
+    nextCursor: rows.length > limit ? rows[limit - 1].businessDay : null };
+}
+
+export async function listLegacyCashDays(tx: CashTx, tenantId: string, q: URLSearchParams) {
+  tenantId = uuid(tenantId);
+  const { limit, cursor } = dayPage(q, 7, 31);
+  const sessionWhere: Prisma.CashSessionWhereInput = { tenantId,
+    canonicalDays: { none: { tenantId } }, currentDays: { none: { tenantId } }, dayAliases: { none: { tenantId } } };
+  const saleWhere = { tenantId, cashDayId: null };
+  // Bornes UTC du même jour métier UTC+11 que businessDay(), utilisables par les index temporels.
+  const startOf = (day: string) => new Date(Date.parse(`${day}T00:00:00Z`) - 11 * 3600000);
+  let since = cursor ? new Date(startOf(cursor).getTime() + 86400000) : null;
+  const days = [];
+  while (days.length <= limit) {
+    const session = await tx.cashSession.findFirst({ where: { ...sessionWhere, ...(since ? { openedAt: { gte: since } } : {}) },
+      orderBy: [{ openedAt: "asc" }, { id: "asc" }], select: { openedAt: true } });
+    const sale = await tx.sale.findFirst({ where: { ...saleWhere, ...(since ? { createdAt: { gte: since } } : {}) },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }], select: { createdAt: true } });
+    if (!session && !sale) break;
+    const firstAt = !sale || session && session.openedAt <= sale.createdAt ? session!.openedAt : sale.createdAt;
+    const business = businessDay(firstAt);
+    if (days.length === limit) return { days, nextCursor: days[days.length - 1].businessDay };
+    const gte = startOf(business), lt = new Date(gte.getTime() + 86400000);
+    const sessions = await tx.cashSession.findMany({ where: { ...sessionWhere, openedAt: { gte, lt } },
+      orderBy: [{ openedAt: "asc" }, { id: "asc" }], take: 201,
+      select: { id: true, status: true, sourceType: true, sourceId: true, openedAt: true, closedAt: true,
+        openingFloatXpf: true, closingCountedXpf: true, expectedXpf: true, varianceXpf: true } });
+    const origins = await tx.sale.findMany({ where: { ...saleWhere, createdAt: { gte, lt },
+      sourceType: { not: null, notIn: [""] }, sourceId: { not: null, notIn: [""] } },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: 201,
+      select: { id: true, sourceType: true, sourceId: true, status: true, totalXpf: true, createdAt: true } });
+    const salesWithoutSource = await tx.sale.count({ where: { ...saleWhere, createdAt: { gte, lt },
+      OR: [{ sourceType: null }, { sourceId: null }, { sourceType: "" }, { sourceId: "" }] } });
+    const day = await tx.cashDay.findUnique({ where: { tenantId_scope_businessDay: { tenantId, scope: "rotisserie-caisse", businessDay: business } }, select: { id: true } });
+    // Plafond commun sessions + origines, avec un ordre stable entre les deux listes.
+    const entries = [
+      ...sessions.map(s => ({ kind: "session", id: s.id, at: s.openedAt })),
+      ...origins.map(s => ({ kind: "origin", id: s.id, at: s.createdAt })),
+    ].sort((a, b) => a.at.getTime() - b.at.getTime() || a.id.localeCompare(b.id) || a.kind.localeCompare(b.kind));
+    const visible = new Set(entries.slice(0, 200).map(e => `${e.kind}:${e.id}`));
+    days.push({ businessDay: business, cashDayId: day?.id ?? null,
+      sessions: sessions.filter(s => visible.has(`session:${s.id}`)),
+      origins: origins.filter(s => visible.has(`origin:${s.id}`)).map(({ id, ...s }) => ({ saleId: id, ...s })),
+      salesWithoutSource, more: entries.length > 200 });
+    since = lt;
+  }
+  return { days, nextCursor: null };
 }
 export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput) {
   cashDayId = uuid(cashDayId); b = normalizeActionInput(b);

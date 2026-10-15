@@ -28,7 +28,7 @@ function load(file: string, imports: Record<string, unknown>) {
   const source = readFileSync(new URL(file, import.meta.url), "utf8");
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const module = { exports: {} as any };
-  const run = vm.runInNewContext(`(function(require,module,exports){${js}\n})`, { Date: fixedDate, Map, Set, BigInt, JSON, Error, Number, String, Object, Array });
+  const run = vm.runInNewContext(`(function(require,module,exports){${js}\n})`, { Date: fixedDate, Map, Set, BigInt, JSON, Error, Number, String, Object, Array, URL, URLSearchParams });
   run((name: string) => name in imports ? imports[name] : require(name), module, module.exports);
   return module.exports;
 }
@@ -65,11 +65,16 @@ function fixture(enforceDayBeforeSale = false) {
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
       if (k === "currentSession") return match(state.cashSession.find(s => s.id === row.currentSessionId) ?? {}, v);
+      if (k === "canonicalDays" || k === "currentDays" || k === "dayAliases") {
+        const related = k === "dayAliases" ? state.cashDaySession.filter(d => d.sessionId === row.id)
+          : state.cashDay.filter(d => d[k === "canonicalDays" ? "canonicalSessionId" : "currentSessionId"] === row.id);
+        return !related.some(d => match(d, v.none));
+      }
       if (k === "payments") return !!state.sale.find(s => s.id === row.id)?.payments?.length;
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
-        op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : false);
+        op === "lte" ? row[k] <= n! : op === "lt" ? row[k] < n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : op === "notIn" ? !(n as unknown[]).includes(row[k]) : false);
       return row[k] === v;
     });
   }
@@ -84,22 +89,27 @@ function fixture(enforceDayBeforeSale = false) {
     if (name === "cashDay" && include) {
       out.canonicalSession = structuredClone(state.cashSession.find(s => s.id === row.canonicalSessionId));
       out.currentSession = structuredClone(state.cashSession.find(s => s.id === row.currentSessionId));
+      if (include.events) out.events = structuredClone(state.cashDayEvent.filter(e => e.cashDayId === row.id && match(e, include.events.where))
+        .sort((a, b) => a.sequence > b.sequence ? -1 : a.sequence < b.sequence ? 1 : 0).slice(0, include.events.take));
     }
     if (name === "sale" && include?.session) out.session = structuredClone(state.cashSession.find(s => s.id === row.sessionId) ?? null);
     return out;
   }
   for (const name of names) {
     tx[name] = {
-      async findFirst({ where, include }: Row = {}) { const row = state[name].find(r => match(r, where)); return row ? view(name, row, include) : null; },
+      async findFirst(args: Row = {}) { return (await this.findMany({ ...args, take: 1 }))[0] ?? null; },
       async count({ where }: Row = {}) { return state[name].filter(r => match(r, where)).length; },
       async findUnique(args: Row) { return this.findFirst(args); },
       async findUniqueOrThrow(args: Row) { const row = await this.findFirst(args); assert.ok(row); return row; },
       async findFirstOrThrow(args: Row) { return this.findUniqueOrThrow(args); },
-      async findMany({ where, orderBy, take }: Row = {}) {
+      async findMany({ where, orderBy, take, include, select }: Row = {}) {
         let rows = state[name].filter(r => match(r, where));
         const sort = Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : [];
         rows.sort((a, b) => { for (const item of sort) for (const [k, direction] of Object.entries(item)) if (a[k] !== b[k]) return (a[k] < b[k] ? -1 : 1) * (direction === "desc" ? -1 : 1); return 0; });
-        return structuredClone(take ? rows.slice(0, take) : rows);
+        return (take ? rows.slice(0, take) : rows).map(row => {
+          const out = view(name, row, include);
+          return select ? Object.fromEntries(Object.keys(select).map(k => [k, out[k]])) : out;
+        });
       },
       async create({ data }: Row) {
         const id = `a0000000-0000-0000-0000-${String(++serial).padStart(12, "0")}`;
@@ -243,7 +253,7 @@ function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
   const http = load("cash-shared-http.ts", { "next/server": server, "./service-auth": { hasServiceKey: () => true },
     "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection });
   return load(`../app/api/${path}`, {
-    "@/lib/cash-shared-http": http, "@/lib/caisse-sync": f.sync, "@/lib/cash-day-sales": f.sales,
+    "@/lib/cash-shared-http": http, "@/lib/caisse-sync": f.sync, "@/lib/cash-day-sales": f.sales, "@/lib/cash-days": f.days,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
@@ -258,6 +268,136 @@ async function expected(f: ReturnType<typeof fixture>, id: string) {
 }
 const routeRequired = (e: Row) => e.status === 409 && e.message === "CASHDAY_ROUTE_REQUIRED";
 const thousandLine = () => ({ id: tenantB, kind: "OTHER", label: "Article synthétique", qty: 1, unitXpf: 1000n, lineXpf: 1000n, tgcRatePpm: 0 });
+
+test("GET cash-days : ordre décroissant, curseur exclusif, dernier instantané et lecture sans verrou", async () => {
+  const f = fixture();
+  const created = [];
+  for (const business of ["2026-10-13", "2026-10-14", "2026-10-15"]) {
+    const session = await f.tx.cashSession.create({ data: { tenantId: tenant, openedAt: new Date(`${business}T01:00:00Z`),
+      openingFloatXpf: 25000n, openedBy: actor, openedByName: "Synthétique", closedAt: null } });
+    created.push(await f.tx.cashDay.create({ data: { tenantId: tenant, businessDay: business,
+      canonicalSessionId: session.id, currentSessionId: session.id } }));
+  }
+  const frozen = { cycle: 1, countedXpf: "27000", report: { expectedXpf: 26000, varianceXpf: 1000 } };
+  for (const [sequence, snapshot] of [[2n, { report: { expectedXpf: 1 } }], [4n, frozen]] as const)
+    await f.tx.cashDayEvent.create({ data: { tenantId: tenant, cashDayId: created[1].id, kind: "CLOSURE", sequence, snapshot } });
+  await f.tx.cashDayEvent.create({ data: { tenantId: tenant, cashDayId: created[1].id, kind: "REOPEN", sequence: 5n, snapshot: {} } });
+  await f.tx.cashDay.create({ data: { tenantId: tenantB, businessDay: "2026-10-16" } });
+  await f.tx.cashDay.create({ data: { tenantId: tenant, scope: "other", businessDay: "2026-10-16" } });
+  const route = api(f, "cash-days/route.ts", {});
+  const get = (suffix = "", id = tenant.toUpperCase()) => route.GET({ url: `http://test/api/cash-days?tenantId=${id}${suffix}` });
+  const before = f.rows("cashDayEvent"), queryCount = f.queries.length;
+  const first = await get("&limit=2");
+  assert.equal(first.status, 200);
+  assert.deepEqual(Array.from(first.body.days, (d: Row) => d.businessDay), ["2026-10-15", "2026-10-14"]);
+  assert.equal(first.body.days[0].closure, null);
+  assert.deepEqual(first.body.days[1].closure, frozen);
+  assert.equal(first.body.days[0].fond, "25000");
+  assert.equal(first.body.nextCursor, "2026-10-14");
+  const second = await get(`&limit=2&cursor=${first.body.nextCursor}`);
+  assert.deepEqual(Array.from(second.body.days, (d: Row) => d.businessDay), ["2026-10-13"]);
+  assert.equal(second.body.nextCursor, null);
+  assert.equal((await get()).body.days.length, 3);
+  assert.equal((await get("&cursor=2026-10-13")).body.days.length, 0);
+  const absent = await get("", actor);
+  assert.equal(absent.body.days.length, 0);
+  assert.equal(f.queries.length, queryCount, "aucune requête de verrouillage");
+  assert.deepEqual(f.rows("cashDayEvent"), before);
+  const legacyResponse = await get("&businessDay=2026-10-15&limit=invalid&cursor=invalid");
+  assert.equal(legacyResponse.status, 200);
+  const expectedDay = await f.days.dayState(f.tx, tenant, created[2].id);
+  assert.deepEqual(legacyResponse.body, projection.jsonValue({ day: expectedDay, defaultFloatXpf: 25000n }));
+  assert.equal("closure" in legacyResponse.body.day, false);
+  assert.equal((await get("&businessDay=2026-10-12")).body.day, null);
+});
+
+test("GET cash-days et legacy : limit/cursor invalides renvoient 400 INVALID_PAYLOAD", async () => {
+  const f = fixture();
+  for (const path of ["cash-days/route.ts", "cash-days/legacy/route.ts"]) {
+    const route = api(f, path, {}), max = path.includes("legacy") ? 31 : 100;
+    for (const suffix of ["limit=0", "limit=-1", "limit=1.5", "limit=", "limit=x", "limit=1e1", `limit=${max + 1}`,
+      "cursor=", "cursor=2026-2-01", "cursor=2026-02-30", "cursor=2026-13-01", "cursor=oops", "cursor=2026-10-15T00:00:00Z"]) {
+      const response = await route.GET({ url: `http://test/api?tenantId=${tenant}&${suffix}` });
+      assert.equal(response.status, 400, `${path} ${suffix}`);
+      assert.equal(response.body.error, "INVALID_PAYLOAD");
+    }
+    for (const limit of [1, max]) assert.equal((await route.GET({ url: `http://test/api?tenantId=${tenant}&limit=${limit}` })).status, 200);
+    assert.equal((await route.GET({ url: "http://test/api?tenantId=invalid" })).status, 400);
+  }
+});
+
+test("GET legacy : jours croissants UTC+11, exclusions canonique/courante/alias/vente rattachée et isolation", async () => {
+  const f = fixture();
+  const allSessions = [];
+  for (const openedAt of ["2026-10-12T13:00:00Z", "2026-10-14T12:59:59Z", "2026-10-14T13:00:00Z"]) {
+    allSessions.push(await f.tx.cashSession.create({ data: { tenantId: tenant, openedAt: new Date(openedAt),
+      openingFloatXpf: 9007199254740993n, closingCountedXpf: null, expectedXpf: null, varianceXpf: null } }));
+  }
+  const linked = [];
+  for (let i = 0; i < 3; i++) linked.push(await f.tx.cashSession.create({ data: { tenantId: tenant, openedAt: now } }));
+  const day = await f.tx.cashDay.create({ data: { tenantId: tenant, businessDay: "2026-10-15",
+    canonicalSessionId: linked[0].id, currentSessionId: linked[1].id } });
+  await f.tx.cashDaySession.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: linked[2].id } });
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "sale-origin",
+    totalXpf: 1200n, createdAt: now, paidAt: new Date("2026-10-16T01:00:00Z") } });
+  await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sourceType: "synthetic", sourceId: "linked", totalXpf: 9n } });
+  for (const missing of [{ sourceType: null, sourceId: null }, { sourceType: "synthetic", sourceId: null }, { sourceType: "", sourceId: "empty" }])
+    await f.tx.sale.create({ data: { tenantId: tenant, createdAt: now, ...missing } });
+  await f.tx.cashSession.create({ data: { tenantId: tenantB, openedAt: new Date("2020-01-01") } });
+  await f.tx.sale.create({ data: { tenantId: tenantB, sourceType: "synthetic", sourceId: "other" } });
+  const route = api(f, "cash-days/legacy/route.ts", {});
+  const get = (suffix = "", id = tenant.toUpperCase()) => route.GET({ url: `http://test/api/cash-days/legacy?tenantId=${id}${suffix}` });
+  const queryCount = f.queries.length;
+  const response = await get("&limit=2");
+  assert.equal(response.status, 200);
+  assert.deepEqual(Array.from(response.body.days, (d: Row) => d.businessDay), ["2026-10-13", "2026-10-14"]);
+  assert.equal(response.body.days[0].sessions[0].openingFloatXpf, "9007199254740993");
+  assert.equal(response.body.days[0].cashDayId, null);
+  assert.equal(response.body.nextCursor, "2026-10-14");
+  const last = await get(`&limit=2&cursor=${response.body.nextCursor}`);
+  assert.equal(last.body.days.length, 1); assert.equal(last.body.nextCursor, null);
+  const entry = last.body.days[0];
+  assert.equal(entry.businessDay, "2026-10-15"); assert.equal(entry.cashDayId, day.id);
+  assert.deepEqual(Array.from(entry.sessions, (s: Row) => s.id), [allSessions[2].id]);
+  assert.deepEqual(Array.from(entry.origins, (s: Row) => s.saleId), [sale.id]);
+  assert.equal(entry.origins[0].totalXpf, "1200"); assert.equal(entry.salesWithoutSource, 3); assert.equal(entry.more, false);
+  assert.equal((await get()).body.days.length, 3);
+  assert.equal((await get("&cursor=2026-10-15")).body.days.length, 0);
+  assert.equal((await get("", actor)).body.days.length, 0);
+  assert.equal(f.queries.length, queryCount);
+});
+
+test("GET legacy : plafond commun 200, more et comptage sans source non tronqué", async () => {
+  const f = fixture();
+  for (let i = 0; i < 110; i++) {
+    await f.tx.cashSession.create({ data: { tenantId: tenant, openedAt: now } });
+    await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: `sale-${i}`, createdAt: now, totalXpf: 1n } });
+  }
+  for (let i = 0; i < 205; i++) await f.tx.sale.create({ data: { tenantId: tenant, sourceType: null, sourceId: null } });
+  const route = api(f, "cash-days/legacy/route.ts", {});
+  const get = () => route.GET({ url: `http://test/api?tenantId=${tenant}` });
+  const first = (await get()).body.days[0];
+  assert.equal(first.sessions.length, 100); assert.equal(first.origins.length, 100);
+  assert.equal(first.more, true); assert.equal(first.salesWithoutSource, 205);
+  assert.deepEqual((await get()).body.days[0], first);
+});
+
+test("GET legacy : attachLegacy fait disparaître la session et la vente rattachées", async () => {
+  const f = fixture();
+  await f.days.openCashDay(f.tx, input());
+  const day = f.rows("cashDay")[0];
+  const session = await f.tx.cashSession.create({ data: { tenantId: tenant, openedAt: now, openingFloatXpf: 0n } });
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "to-attach", totalXpf: 1000n,
+    status: "PAID", paidAt: now, createdAt: now, lines: [thousandLine()], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  const route = api(f, "cash-days/legacy/route.ts", {});
+  const get = () => route.GET({ url: `http://test/api?tenantId=${tenant}` });
+  const before = await get();
+  assert.equal(before.body.days[0].sessions[0].id, session.id);
+  assert.equal(before.body.days[0].origins[0].saleId, sale.id);
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ cycle: 0,
+    sessionIds: [session.id], origins: [{ sourceType: "synthetic", sourceId: "to-attach" }] })));
+  assert.equal((await get()).body.days.length, 0);
+});
 
 test("huitième relecture : clôture refusée pendant Compta, rejeu de l'avoir 1000 DONE puis Z 24000", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
