@@ -34,14 +34,15 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
     const read = (key: string | null) => tx.cashSession.findFirst({
       where: { tenantId, posteId: key, status: "OPEN" }, orderBy: { openedAt: "desc" },
     });
-    return posteId === null ? read(null) : findHistoricalKey(posteId, read);
+    return read(posteId);
   };
   const isCashDaySession = async (tx: Tx, sessionId: string) => {
     const alias = await tx.cashDaySession?.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId } } });
     const canonical = await tx.cashDay?.findFirst({ where: { tenantId, canonicalSessionId: sessionId }, select: { id: true } });
     return !!(alias || canonical);
   };
-  return runPartialRefund({ tenantId, saleId,
+  let storedSaleId = saleId;
+  return runPartialRefund({ tenantId, get saleId() { return storedSaleId; },
     creditNote: value => deps.compta.creditNote(value),
     async prepare() {
       // Rejouer une réservation ne relit pas Compta et conserve exactement son plan.
@@ -68,6 +69,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (replay) return replay;
         const current = await tx.sale.findFirst({ where: { id: saleId, tenantId }, include: { lines: true } });
         if (!current) return refuse("SALE_NOT_FOUND", 404);
+        storedSaleId = current.id;
         if (!input.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         if (!input.cashDayId && (current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         const refunds = await tx.partialRefund.findMany({ where: { tenantId, saleId } });

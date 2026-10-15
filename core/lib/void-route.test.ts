@@ -368,7 +368,7 @@ test("production wiring uses short preparation and finalization transactions", (
  const prepareBody = body.slice(body.indexOf("async prepare()"), body.indexOf("compta: comptaClient()"));
  assert.ok(prepareBody.indexOf("lockSaleRow") < prepareBody.indexOf("tx.sale.findFirst"));
  assert.match(body, /tx\.sale\.update/);
- assert.match(body, /voidAction\.create\(\{ data: \{ tenantId: safeTenantId, saleId, actionId, status: "PENDING", outcome: \{ creditKey: voidCreditKey \} \} \}\)/);
+ assert.match(body, /voidAction\.create\(\{ data: \{ tenantId: safeTenantId, saleId: sale\.id, actionId, status: "PENDING", outcome: \{ creditKey: voidCreditKey \} \} \}\)/);
  assert.match(body, /status: "DONE"/);
  assert.doesNotMatch(body, /ACTION_IN_PROGRESS|ACTION_ALREADY_USED/);
  // La photo initiale sert uniquement à détecter un rattachement CashDay concurrent.

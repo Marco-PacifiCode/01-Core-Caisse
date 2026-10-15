@@ -125,6 +125,12 @@ function fixture(enforceDayBeforeSale = false) {
       async update({ where, data }: Row) { const changed = await this.updateMany({ where, data }); assert.equal(changed.count, 1); return this.findFirst({ where }); },
     };
   }
+  Object.assign(tx.salePayment, {
+    findFirst: async ({ where }: Row) => state.sale.find(s => s.id === where.saleId)?.payments.find((p: Row) => p.settleRef === where.settleRef) ?? null,
+    count: async ({ where }: Row) => state.sale.find(s => s.id === where.saleId)?.payments.filter((p: Row) => where.settleRef === undefined || p.settleRef === where.settleRef).length ?? 0,
+    findMany: async ({ where }: Row) => structuredClone(state.sale.find(s => s.id === where.saleId)?.payments ?? []),
+    create: async ({ data }: Row) => { const sale = state.sale.find(s => s.id === data.saleId); if (!sale) throw new Error(`sale not found: ${data.saleId}`); sale.payments.push(structuredClone(data)); return data; },
+  });
   tx.$queryRaw = async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const sql = strings.join("?"); queries.push(sql);
     if (sql.includes('FROM "CashDay"')) {
@@ -192,6 +198,44 @@ function financialPorts(f: ReturnType<typeof fixture>, overrides: Row = {}) {
   };
   return Object.fromEntries(["checkoutSale", "annulerVente", "rembourserPartiellement"].map(name => [name, caisseFunction(name, globals)]));
 }
+
+test('annulerVente : référence fidélité historique uppercase retrouvée, références dérivées depuis Sale.id stocké', async () => {
+  for (const receivedUppercase of [false, true]) {
+    const f = fixture();
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: 'PAID', paidAt: now, invoiceId: 'synthetic-invoice', totalXpf: 1000n,
+      lines: [thousandLine()] } });
+    const accountId = 'ab000000-0000-0000-0000-000000000088';
+    const entryAt = new Date('2026-10-14T01:00:00.000Z');
+    await f.tx.loyaltyEntry.create({ data: { tenantId: tenant, accountId, kind: 'POINTS', points: 27, sourceType: 'sale', sourceId: sale.id,
+      saleId: sale.id, ref: `points:sale:${sale.id.toUpperCase()}`, occurredAt: entryAt } });
+    await f.tx.loyaltyEntry.create({ data: { tenantId: tenant, accountId, kind: 'REWARD', points: -20, sourceType: 'sale', sourceId: sale.id,
+      ref: 'reward:historic:1', occurredAt: entryAt, redeemedAt: now, redeemedSaleId: sale.id } });
+    const reward = f.rows('loyaltyEntry').find(e => e.kind === 'REWARD')!;
+    await f.tx.loyaltyEntry.create({ data: { tenantId: tenant, accountId, kind: 'REDEEM', rewardEntryId: reward.id, sourceType: 'sale',
+      sourceId: sale.id, saleId: sale.id, ref: `redeem:sale:${sale.id.toUpperCase()}`, occurredAt: entryAt } });
+    const realLoyaltyDb = load('loyalty-db.ts', { './loyalty.ts': loyalty, './caisse-sync.ts': f.sync,
+      './log.ts': { log: { info() {}, warn() {}, error() {} } } });
+    let creditKey = '', comptaCalls = 0;
+    const native = financialPorts(f, {
+      reverseSaleLoyalty: realLoyaltyDb.reverseSale,
+      comptaClient: () => ({ invoiceDetail: async () => ({ id: 'synthetic-invoice', sourceType: 'caisse', sourceId: sale.id,
+        totalXpf: 1000, paidXpf: 1000, tgcRatePpm: 0, lines: [{ ...thousandLine(), id: 'invoice-line', unitXpf: 1000 }] }),
+        creditNote: async (value: Row) => { comptaCalls++; creditKey = value.creditKey; return { creditNoteId: 'synthetic-credit', totalXpf: -1000 }; } }),
+    });
+    const receivedSaleId = receivedUppercase ? sale.id.toUpperCase() : sale.id;
+    const first = await native.annulerVente(tenant, receivedSaleId, { actionId: actor });
+    const second = await native.annulerVente(tenant, receivedSaleId, { actionId: actor });
+    const reversals = f.rows('loyaltyEntry').filter(e => e.kind === 'REVERSAL');
+    assert.equal(first.alreadyVoid, false); assert.equal(second.ok, true);
+    assert.equal(creditKey, `caisse:${sale.id}:void:${actor}`); assert.equal(comptaCalls, 1);
+    assert.equal(reversals.filter(e => e.ref === `unpoints:sale:${sale.id}`).length, 1);
+    assert.equal(reversals.find(e => e.ref === `unpoints:sale:${sale.id}`)!.points, -27);
+    assert.equal(reversals.filter(e => e.ref === `unredeem:sale:${sale.id}`).length, 1);
+    assert.equal(f.rows('loyaltyEntry').find(e => e.id === reward.id)!.redeemedAt, null);
+    assert.equal(f.rows('loyaltyEntry').find(e => e.id === reward.id)!.redeemedSaleId, null);
+  }
+});
+
 function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
   const server = { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } };
   const http = load("cash-shared-http.ts", { "next/server": server, "./service-auth": { hasServiceKey: () => true },
@@ -335,7 +379,9 @@ test("huitième relecture : correction vente sans cashDayId, HTTP et transaction
     const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", totalXpf: 1000n,
       paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now, payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
     let external = 0;
-    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
+    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+      normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
+      assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
       comptaClient: () => ({ paymentCorrection: async () => { external++; return { ok: true }; } }),
       verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection, correctionKeyPour: corrections.correctionKeyPour, runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
     });
@@ -358,7 +404,10 @@ test("neuvième relecture : première ouverture refusée pendant correction, pui
   const sale = await f.tx.sale.create({ data: { tenantId: tenant, sessionId: historicalSession.id, status: "PAID", totalXpf: 1000n,
     paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now, sourceType: "synthetic", sourceId: "corrected",
     lines: [thousandLine()], payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
-  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
+  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
+    normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
     comptaClient: () => ({ paymentCorrection: async () => { await assert.rejects(f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())), (e: Row) => e.status === 409 && e.message === "LEGACY_IN_PROGRESS"); return { ok: true }; } }),
     runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
   });
@@ -383,6 +432,7 @@ test("première ouverture : correction PENDING est LEGACY_IN_PROGRESS jusqu'au r
   let first = true;
   const correctionKeys: string[] = [];
   const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
     assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
     comptaClient: () => ({ paymentCorrection: async (args: Row) => { correctionKeys.push(args.correctionKey); if (first) { first = false; throw new Error("synthetic timeout"); } return { ok: true }; } }),
     runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
@@ -892,7 +942,9 @@ test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000,
       totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
     if (!beforeImport) await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
     let comptaCalls = 0;
-    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
+    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger,
+      normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
+      assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
       lockSaleRow: async () => true, comptaClient: () => ({ paymentCorrection: async () => { comptaCalls++; return { ok: true }; } }),
       verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection, correctionKeyPour: corrections.correctionKeyPour, runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
     });
@@ -1041,8 +1093,9 @@ test("conflit conservé sans mutation, isolation A/B et ancien jour OPEN non fus
   const id = f.rows("cashDay")[0].id;
   const conflict = await f.sync.cashAction("close", input({ tenantId: tenantB, actionId: "cross" }), (tx: Row) => f.days.closeCashDay(tx, id, input({ tenantId: tenantB })));
   assert.equal(conflict.status, 404); assert.equal(f.rows("caisseSyncAction").find(r => r.actionId === "cross")!.state, "REJECTED");
-  const next = input({ actionId: "next", businessDay: "2026-10-16", occurredAt: "2026-10-16T01:00:00Z" });
-  const result = await f.sync.cashAction("open", next, (tx: Row) => f.days.openCashDay(tx, next));
+  const next = input({ actionId: "next", sourceKey: "opening-next-day", businessDay: "2026-10-16", occurredAt: "2026-10-16T01:00:00Z" });
+  const nextWithPoste = { ...next, posteId: "caisse-1" };
+  const result = await f.sync.cashAction("open", nextWithPoste, (tx: Row) => f.days.openCashDay(tx, nextWithPoste));
   assert.equal(result.body.error, "PREVIOUS_SESSION_OPEN"); assert.equal(f.rows("cashDay").length, 1);
 });
 test("2 close concurrents : premier comptage Z, second recomptage ; réouverture nouveau cycle, fond unique", async () => {
@@ -1124,7 +1177,8 @@ test("correction partagée : vente UUID majuscule puis rejeu minuscule conserve 
     payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
   await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
   let comptaCalls = 0;
-  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger,
+  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference,
+    findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
     assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed, lockSaleRow: async () => true,
     comptaClient: () => ({ paymentCorrection: async () => { comptaCalls++; return { ok: true }; } }),
     verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection,
@@ -1134,6 +1188,7 @@ test("correction partagée : vente UUID majuscule puis rejeu minuscule conserve 
   assert.notEqual(sale.id, sale.id.toUpperCase());
   const first = await correct(tenant.toUpperCase(), { saleId: sale.id.toUpperCase(), fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 });
   assert.equal(first.ok, true);
+  assert.ok(f.rows("sale")[0].payments.filter((p: Row) => p.settleRef?.startsWith("corr:")).every((p: Row) => p.settleRef.includes(sale.id)));
   const replay = await correct(tenant, { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 });
   assert.equal(replay.ok, true); assert.equal(replay.alreadyCorrected, true); assert.equal(comptaCalls, 1);
   await assert.rejects(correct(tenant, { saleId: "invalid-sale-id", fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 }),
@@ -1143,7 +1198,28 @@ test("correction partagée : vente UUID majuscule puis rejeu minuscule conserve 
   assert.equal(await expected(f, day.id), 25000n);
 });
 
-test("createSale et createGiftCardWithoutSale normalisent leurs UUID d'entrée avant accès aux ports", async () => {
+test('correction partagée : settleRef nouvelle dérivée de l’ID stocké malgré saleId reçu majuscule', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sourceType: 'synthetic', sourceId: 'corr-history', status: 'PAID', paidAt: now,
+    invoiceId: 'synthetic-invoice', comptaSyncedAt: now, totalXpf: 1000n, lines: [thousandLine()],
+    payments: [{ method: 'CASH', amountXpf: 1000n, settleRef: 'initial' }] } });
+  const correct = caisseFunction('corrigerMoyenPaiement', { withTenant: f.withTenant, ...f.ledger, normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference,
+    findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed, lockSaleRow: async () => true,
+    comptaClient: () => ({ paymentCorrection: async () => ({ ok: true }) }),
+    verifierCorrection: corrections.verifierCorrection, generationCorrection: corrections.generationCorrection,
+    correctionKeyPour: corrections.correctionKeyPour,
+    runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
+  });
+  const result = await correct(tenant, { saleId: sale.id.toUpperCase(), fromMethod: 'CASH', toMethod: 'CARD', amountXpf: 100 });
+  assert.equal(result.ok, true);
+  assert.ok(f.rows('sale')[0].payments.filter((p: Row) => p.settleRef?.startsWith('corr:')).every((p: Row) => p.settleRef.includes(sale.id)));
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'PAYMENT_CORRECTION').length, 1);
+  assert.equal(await expected(f, day.id), 25900n);
+});
+
+test("createSale garde posteId texte exact et normalise les autres UUID avant accès aux ports", async () => {
   fixture(); // fournit à caisseFunction les fonctions uuid/normalizeActionInput réellement chargées.
   const ids = {
     tenant: "ab000000-0000-0000-0000-000000000011", session: "ab000000-0000-0000-0000-000000000012",
@@ -1153,23 +1229,25 @@ test("createSale et createGiftCardWithoutSale normalisent leurs UUID d'entrée a
   };
   let salesCreated = 0, cardsCreated = 0, giftInput: Row | undefined, saleData: Row | undefined;
   const tx = {
-    sale: { create: async ({ data }: Row) => { salesCreated++; saleData = data; return { id: "new-sale", totalXpf: data.totalXpf }; } },
+    sale: { create: async ({ data }: Row) => { salesCreated++; saleData = data; return { id: "a0000000-0000-0000-0000-000000000099", totalXpf: data.totalXpf }; } },
     giftCard: { create: async ({ data }: Row) => { cardsCreated++; assert.equal(data.serviceId, ids.service); return data; } },
   };
   const globals = { withTenant: async (_tenantId: string, fn: (tx: Row) => Promise<unknown>) => fn(tx),
     assertLegacyWriteAllowed: async () => {}, validateGiftCard: (input: Row) => { giftInput = input; return { ok: true, data: { ...input } }; },
     GIFT_CARD_SELECT: {}, toGiftCardView: (row: Row) => row, Prisma: { PrismaClientKnownRequestError: class extends Error {} } };
-  const createSale = caisseFunction("createSale", globals);
+  const createSale = caisseFunction("createSale", { ...globals, uuid: activeSync.uuid, normalizeActionInput: activeSync.normalizeActionInput, receivedActionInput: activeSync.receivedActionInput });
   const upper = (id: string) => id.toUpperCase();
   assert.notEqual(ids.session, upper(ids.session));
   const sale = await createSale(upper(ids.tenant), { sessionId: upper(ids.session), cashierId: upper(ids.cashier), posteId: upper(ids.poste),
     lines: [{ kind: "PRODUCT", productId: upper(ids.product), label: "Article synthétique", qty: 1, unitXpf: 1000n }] });
   assert.equal(sale.ok, true); assert.equal(salesCreated, 1);
-  assert.equal(saleData!.sessionId, ids.session); assert.equal(saleData!.cashierId, ids.cashier); assert.equal(saleData!.posteId, ids.poste);
+  assert.equal(saleData!.sessionId, ids.session); assert.equal(saleData!.cashierId, ids.cashier); assert.equal(saleData!.posteId, upper(ids.poste));
   assert.equal(saleData!.lines.create[0].productId, ids.product);
+  const freePoste = await createSale(ids.tenant, { posteId: "caisse-1", lines: [{ kind: "OTHER", label: "X", qty: 1, unitXpf: 1n }] });
+  assert.equal(freePoste.ok, true); assert.equal(saleData!.posteId, "caisse-1");
   await assert.rejects(createSale(ids.tenant, { sessionId: "invalid-session", lines: [{ kind: "OTHER", label: "X", qty: 1, unitXpf: 1n }] }),
     (e: Row) => e.status === 400 && e.message === "INVALID_PAYLOAD");
-  assert.equal(salesCreated, 1, "session invalide refusée avant le port base");
+  assert.equal(salesCreated, 2, "session invalide refusée avant le port base");
 
   const createGift = caisseFunction("createGiftCardWithoutSale", globals);
   const created = await createGift(upper(ids.tenant), { code: "SYNTHETIC", amountXpf: 1000, serviceId: upper(ids.service), orderId: upper(ids.order) });
@@ -1265,6 +1343,7 @@ test('trois corrections distinctes CASH CARD CASH CARD : Compta converge, rejeux
   } });
   assert.equal((await native.checkoutSale(tenant, sale.id, [{ method: 'CASH', amountXpf: 1000n }], { sharedActionId: tenant })).ok, true);
   const correct = caisseFunction('corrigerMoyenPaiement', { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
     assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
     comptaClient: () => ({ paymentCorrection: async (args: Row) => {
       calls++; assert.ok(!keys.has(args.correctionKey)); keys.add(args.correctionKey);
@@ -1321,30 +1400,43 @@ test('journal : UUID normalises des la creation et snapshots rejoues sans doublo
 
 function sameResponse(actual: unknown, saved: unknown) { assert.equal(projection.canonical(actual), projection.canonical(saved)); }
 
-test('session OPEN : poste UUID historique majuscule retrouvé, ouvertures concurrentes sans doublon', async () => {
+test('session OPEN : poste libre texte exact, ouvertures concurrentes sans doublon', async () => {
   const f = fixture();
-  const old = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: actor.toUpperCase(), openingFloatXpf: 25000n } });
+  const old = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: "caisse-1", openingFloatXpf: 25000n } });
   await f.tx.cashSession.create({ data: { tenantId: tenantB, posteId: actor, openingFloatXpf: 99n } });
   const current = caisseFunction('currentSession', { withTenant: f.withTenant });
   const open = caisseFunction('openSessionTx', {});
-  for (const posteId of [actor, actor.toUpperCase(), 'eF000000-0000-0000-0000-000000000003']) {
-    assert.equal((await current(tenant, posteId)).id, old.id);
-  }
-  const results = await Promise.all([actor, actor.toUpperCase()].map(posteId =>
+  assert.equal((await current(tenant, "caisse-1")).id, old.id);
+  assert.equal(await current(tenant, "Caisse-1"), null);
+  const results = await Promise.all(["caisse-1", "caisse-1"].map(posteId =>
     f.withTenant(tenant, (tx: Row) => open(tx, tenant, f.sync.normalizeActionInput({ posteId, openedBy: actor, openingFloatXpf: 0n })))));
   for (const result of results) {
     assert.equal(result.ok, false); assert.equal(result.error, 'SESSION_ALREADY_OPEN'); assert.equal(result.sessionId, old.id);
   }
   assert.equal(f.rows('cashSession').length, 2);
-  assert.equal(f.rows('cashSession')[0].posteId, actor.toUpperCase());
+  assert.equal(f.rows('cashSession')[0].posteId, "caisse-1");
   assert.equal(f.rows('cashDay').length, 0);
 });
 
-test('avoir CASH : poste normalisé retrouve la session historique majuscule en préparation et finalisation', async () => {
+test('journal : correction historique corr UUID majuscule rattachée et Z juste', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sourceType: 'synthetic', sourceId: 'corr-history', status: 'PAID', paidAt: now,
+    totalXpf: 1000n, lines: [thousandLine()], payments: [{ method: 'CASH', amountXpf: 1000n, settleRef: 'initial' }] } });
+  const correctionBase = `corr:caisse:${sale.id.toUpperCase()}:legacy`;
+  await f.tx.salePayment.create({ data: { saleId: sale.id, method: 'CASH', amountXpf: -100n, settleRef: `${correctionBase}:out` } });
+  await f.tx.salePayment.create({ data: { saleId: sale.id, method: 'CARD', amountXpf: 100n, settleRef: `${correctionBase}:in` } });
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ sourceKey: 'attach-uppercase-correction', cycle: 0,
+    origins: [{ sourceType: 'synthetic', sourceId: 'corr-history' }] })));
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'PAYMENT_CORRECTION').length, 1);
+  assert.equal(await expected(f, day.id), 25900n);
+});
+
+test('avoir CASH : poste texte exact retrouvé en préparation et finalisation', async () => {
   const f = fixture();
-  const session = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: actor.toUpperCase(), openingFloatXpf: 25000n } });
+  const session = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: 'caisse-1', openingFloatXpf: 25000n } });
   await f.tx.cashSession.create({ data: { tenantId: tenantB, posteId: actor, openingFloatXpf: 99n } });
-  const sale = await f.tx.sale.create({ data: { tenantId: tenant, posteId: actor, sessionId: session.id, status: 'PAID',
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, posteId: 'caisse-1', sessionId: session.id, status: 'PAID',
     invoiceId: 'synthetic-invoice', totalXpf: 1000n, lines: [thousandLine()] } });
   let credits = 0;
   const native = financialPorts(f, { afterCredit: () => { credits++; } });
@@ -1354,18 +1446,18 @@ test('avoir CASH : poste normalisé retrouve la session historique majuscule en 
   assert.equal(credits, 1); assert.equal(f.rows('partialRefund').length, 1);
   assert.equal(f.rows('partialRefund')[0].status, 'DONE');
   assert.equal(f.rows('cashMovement').length, 1); assert.equal(f.rows('cashMovement')[0].sessionId, session.id);
-  assert.equal(f.rows('cashSession')[0].posteId, actor.toUpperCase());
+  assert.equal(f.rows('cashSession')[0].posteId, 'caisse-1');
   assert.equal(f.rows('cashDay').length, 0);
 });
 
-test('session OPEN : P2002 relit le poste historique sous trois formes', async () => {
+test('session OPEN : P2002 relit le poste historique exact', async () => {
   const f = fixture();
   class ConcurrentOpen extends Error { code = 'P2002'; }
   const open = caisseFunction('openSessionTx', { Prisma: { PrismaClientKnownRequestError: ConcurrentOpen } });
   const create = f.tx.cashSession.create.bind(f.tx.cashSession);
   let winner: Row;
   f.tx.cashSession.create = async ({ data }: Row) => {
-    winner = await create({ data: { ...data, posteId: actor.toUpperCase() } });
+    winner = await create({ data: { ...data, posteId: data.posteId } });
     throw new ConcurrentOpen();
   };
   const result = await open(f.tx, tenant, { posteId: actor, openedBy: actor, openingFloatXpf: 0n });
@@ -1373,16 +1465,17 @@ test('session OPEN : P2002 relit le poste historique sous trois formes', async (
   assert.equal(f.rows('cashSession').length, 1);
 });
 
-test('session OPEN : poste libre sensible à la casse, poste null conservé, nouvelle écriture UUID normalisée', async () => {
+test('session OPEN : caisse-1 accepté, Caisse-1 distinct, null conservé', async () => {
   const f = fixture();
   const current = caisseFunction('currentSession', { withTenant: f.withTenant });
   const open = caisseFunction('openSessionTx', {});
-  for (const posteId of ['ABC', 'abc', actor.toUpperCase(), null]) {
+  for (const posteId of ['caisse-1', 'Caisse-1', 'ABC', 'abc', actor.toUpperCase(), null]) {
     const result = await open(f.tx, tenant, { posteId, openedBy: actor, openingFloatXpf: 0n });
     assert.equal(result.ok, true);
     assert.equal((await current(tenant, posteId)).id, result.session.id);
   }
-  assert.deepEqual(f.rows('cashSession').map(s => s.posteId), ['ABC', 'abc', actor, null]);
+  assert.deepEqual(f.rows('cashSession').map(s => s.posteId), ['caisse-1', 'Caisse-1', 'ABC', 'abc', actor.toUpperCase(), null]);
+  assert.notEqual((await current(tenant, 'caisse-1')).id, (await current(tenant, 'Caisse-1')).id);
   assert.equal((await current(tenant)).posteId, null);
 });
 
@@ -1550,7 +1643,7 @@ test('journal : sourceRef non UUID et UUID incorpore restent exacts', async () =
     await f.ledger.appendDayFact(f.tx, tenant, day.id, { kind: 'MOVEMENT', sourceRef, deviceId: 'A', occurredAt: now,
       snapshot: { kind: 'CASH_OUT', amountXpf: '100' } });
   }
-  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 4);
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 3);
 });
 
 test('correction PENDING avant 5d9e72c : cle Compta ancienne conservee, nouveau format par action', async () => {
@@ -1570,6 +1663,7 @@ test('correction PENDING avant 5d9e72c : cle Compta ancienne conservee, nouveau 
   const calls: string[] = [], emitted = new Set<string>([oldKey]);
   const net = new Map([['CASH', 0], ['CARD', 1000]]);
   const correct = caisseFunction('corrigerMoyenPaiement', { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    normalizeComposedUuidReference: f.sync.normalizeComposedUuidReference, findHistoricalComposedReference: f.sync.findHistoricalComposedReference,
     assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
     comptaClient: () => ({ paymentCorrection: async (args: Row) => {
       calls.push(args.correctionKey);

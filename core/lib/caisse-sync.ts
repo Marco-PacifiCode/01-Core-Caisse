@@ -36,6 +36,20 @@ export function normalizeActionInput<T>(input: T): T {
   }
   return input;
 }
+/** Canonise uniquement les sous-chaînes UUID d'une référence métier composée. */
+export function normalizeComposedUuidReference(value: string): string {
+  return value.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, uuid => uuid.toLowerCase());
+}
+/** Formes exactes d'une référence historique contenant un ou plusieurs UUID. */
+export function historicalComposedReferenceKeys(received: string): string[] {
+  const normalized = normalizeComposedUuidReference(received);
+  const upper = normalized.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, uuid => uuid.toUpperCase());
+  return [...new Set([received, normalized, upper])];
+}
+export async function findHistoricalComposedReference<T>(received: string, read: (key: string) => Promise<T | null>): Promise<T | null> {
+  for (const key of historicalComposedReferenceKeys(received)) { const row = await read(key); if (row) return row; }
+  return null;
+}
 /** Tables historiques : au plus trois égalités indexées, sans réécrire la clé stockée. */
 export async function findHistoricalKey<T>(received: string, read: (key: string) => Promise<T | null>): Promise<T | null> {
   const normalized = normalizeActionInput(received);

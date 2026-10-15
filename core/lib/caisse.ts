@@ -77,7 +77,7 @@ import {
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 import { annulerInscription, inscrirePosteEnLigne } from "./postes";
 import { appendDayFact, consumePickupOrder, lockDay, lockSharedSale, prepareSharedCheckout, recordSharedGift, recordSharedSale } from "./cash-day-ledger";
-import { findHistoricalKey, findHistoricalSource, receivedActionInput, ackFinancial, lockCashTenant, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync";
+import { findHistoricalComposedReference, findHistoricalKey, findHistoricalSource, normalizeComposedUuidReference, receivedActionInput, ackFinancial, lockCashTenant, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync";
 import { assertLegacyWriteAllowed } from "./cash-day-guard";
 import { verifierCorrection } from "./payment-correction";
 
@@ -108,7 +108,9 @@ type OpenSessionInput = {
  * d'origine, inchangé. Cf. lib/postes.ts.
  */
 export async function openSession(tenantId: string, input: OpenSessionInput) {
+  const exactPosteId = input.posteId;
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
+  if (exactPosteId !== undefined) input.posteId = exactPosteId;
   const posteId = input.posteId ?? null;
   if (!posteId) return ouvrirSession(tenantId, input);
   const inscription = await inscrirePosteEnLigne(tenantId, posteId);
@@ -133,13 +135,13 @@ async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
 /** Variante interne L4 : la transaction et son verrou sont détenus par le gestionnaire de journée. */
 export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: string, input: OpenSessionInput) {
   const receivedPosteId = receivedActionInput(input).posteId ?? null;
+  const exactPosteId = receivedPosteId;
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
-  const posteId = input.posteId ?? null;
   const readOpen = () => {
     const read = (key: string | null) => tx.cashSession.findFirst({
       where: { tenantId, status: "OPEN", posteId: key }, select: { id: true },
     });
-    return receivedPosteId === null ? read(null) : findHistoricalKey(receivedPosteId, read);
+    return read(receivedPosteId);
   };
     // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
     // règle reste identique à avant : une seule pour le marchand.
@@ -154,7 +156,7 @@ export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: stri
           openedByName: input.openedByName ?? null,
           openingFloatXpf: input.openingFloatXpf,
           note: input.note ?? null,
-          posteId,
+          posteId: exactPosteId,
           ...(input.occurredAt ? { openedAt: input.occurredAt } : {}),
         },
       });
@@ -184,11 +186,10 @@ export async function currentSession(tenantId: string, posteId?: string | null) 
   // Pour les marchands mono-caisse, dont les sessions ont `posteId = NULL`, le
   // résultat est exactement celui d'avant.
   return withTenant(tenantId, (tx) => {
-    const read = (key: string | null) => tx.cashSession.findFirst({
-      where: { tenantId, status: "OPEN", posteId: key },
+    return tx.cashSession.findFirst({
+      where: { tenantId, status: "OPEN", posteId: receivedPosteId },
       orderBy: { openedAt: "desc" },
     });
-    return receivedPosteId === null ? read(null) : findHistoricalKey(receivedPosteId, read);
   });
 }
 
@@ -535,12 +536,13 @@ export async function createSale(
   | { ok: true; saleId: string; totalXpf: number; alreadyExisted: boolean }
 > {
   const received = receivedActionInput(input);
+  const receivedPosteId = input.posteId;
   tenantId = uuid(tenantId);
   input = normalizeActionInput(input);
+  if (receivedPosteId !== undefined) input.posteId = receivedPosteId;
   if (!input.lines || input.lines.length === 0) return { ok: false, error: "EMPTY" };
   if (input.sessionId != null) uuid(input.sessionId);
   if (input.cashierId != null) uuid(input.cashierId);
-  if (input.posteId != null) uuid(input.posteId);
   for (const line of input.lines) if (line.productId != null) uuid(line.productId);
   // Une vente ne peut pas avoir eu lieu demain. Une minute de tolérance couvre
   // le décalage d'horloge d'une tablette sans pour autant laisser passer une
@@ -1247,6 +1249,7 @@ export async function checkoutSale(
       const beforeLock = await lockSharedSale(tx, tenantId, saleId);
       if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
       const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
+      const storedSaleId = current.id;
       if (current.cashDayId !== beforeLock?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
       if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
       if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
@@ -1259,18 +1262,18 @@ export async function checkoutSale(
         if (current.status !== "DRAFT") return;
       }
       // On (re)crée les paiements uniquement si aucun n'est encore enregistré (évite les doublons au rejeu).
-      const already = await tx.salePayment.count({ where: { tenantId, saleId } });
+      const already = await tx.salePayment.count({ where: { tenantId, saleId: storedSaleId } });
       if (already === 0) {
         for (let i = 0; i < toPersist.length; i++) {
           const p = toPersist[i];
           await tx.salePayment.create({
             data: {
               tenantId,
-              saleId,
+              saleId: storedSaleId,
               method: p.method,
               amountXpf: p.amountXpf,
               tenderedXpf: p.tenderedXpf ?? null,
-              settleRef: `${CAISSE_SOURCE_TYPE}:${saleId}:${i}`,
+              settleRef: `${CAISSE_SOURCE_TYPE}:${storedSaleId}:${i}`,
             },
           });
         }
@@ -1426,7 +1429,7 @@ export async function checkoutSale(
       const redeemed = await redeemRewardDb(tx, {
         tenantId,
         rewardEntryId: loyaltyRedeem.rewardEntryId,
-        saleId,
+        saleId: current.id,
         discountXpf: loyaltyRedeem.discountXpf,
         occurredAt: datePaiement,
         actorId: options?.redeemLoyalty?.by ?? null,
@@ -1455,7 +1458,7 @@ export async function checkoutSale(
             program,
             clientFicheId: options.loyalty.clientFicheId,
             displayName: options.loyalty.displayName,
-            saleId,
+            saleId: current.id,
             points,
             occurredAt: datePaiement,
           });
@@ -1604,10 +1607,11 @@ export async function annulerVente(
           if (!current) throw new Error("SALE_NOT_FOUND");
           if (current.cashDayId !== beforeLock?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
           await checkRoute(tx, current, preparedLink);
-          if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) {
+          if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId: current.id } })) {
             return { ok: false as const, error: "PARTIAL_REFUND_EXISTS" as const, message: "Une réservation ou un avoir partiel interdit le void total." };
           }
           const sale = current;
+          const storedSaleId = current.id;
           if (current.status === "VOID") {
             if (actionId) {
               const action = await readAction(tx);
@@ -1620,11 +1624,11 @@ export async function annulerVente(
           }
           const retry = checkVoidSnapshot(current, prepared);
           if (retry) return retry;
-          await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
-          if (current.cashDayId) await recordSharedSale(tx, safeTenantId, saleId);
-          if (current.cashDayId && opts?.sharedActionId) await ackFinancial(tx, safeTenantId, opts.sharedActionId, { id: saleId, saleId, cashDayId: current.cashDayId, status: "VOID", creditNoteId });
+          await tx.sale.update({ where: { id: storedSaleId }, data: { status: "VOID", creditNoteId } });
+          if (current.cashDayId) await recordSharedSale(tx, safeTenantId, storedSaleId);
+          if (current.cashDayId && opts?.sharedActionId) await ackFinancial(tx, safeTenantId, opts.sharedActionId, { id: storedSaleId, saleId: storedSaleId, cashDayId: current.cashDayId, status: "VOID", creditNoteId });
           if (sale.status === "PAID") {
-            await reverseSaleLoyalty(tx, { tenantId, saleId });
+            await reverseSaleLoyalty(tx, { tenantId, saleId: storedSaleId });
           }
           if (actionId) await tx.voidAction.updateMany({
             where: { tenantId: safeTenantId, actionId: storedActionId },
@@ -1670,12 +1674,12 @@ export async function annulerVente(
             const existing = await readAction(tx);
             if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { error: "ACTION_ID_CONFLICT" as const };
             if (!existing) {
-              voidCreditKey = 'caisse:' + saleId + ':void:' + actionId;
-              await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId, actionId, status: "PENDING", outcome: { creditKey: voidCreditKey } } });
+              voidCreditKey = 'caisse:' + sale.id + ':void:' + actionId;
+              await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId: sale.id, actionId, status: "PENDING", outcome: { creditKey: voidCreditKey } } });
             }
           }
           if (sale.status === "PAID" && sale.invoiceId && !(sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId))) {
-            await tx.sale.update({ where: { id: saleId }, data: { voidPreparedAt: sale.voidPreparedAt ?? new Date() } });
+            await tx.sale.update({ where: { id: sale.id }, data: { voidPreparedAt: sale.voidPreparedAt ?? new Date() } });
           }
           return sale;
         });
@@ -1956,7 +1960,7 @@ export async function corrigerMoyenPaiement(
       const pending = await findHistoricalKey(receivedSaleId, entityKey => tx.caisseSyncAction.findFirst({ where: { tenantId, kind: "legacy-payment-correction", entityKey, state: "PENDING" } }));
       if (pending) throw new CashContractError("CORRECTION_IN_PROGRESS", 409);
       const actionId = input.actionId ?? randomUUID();
-      const correctionKey = 'corr:caisse:' + saleId + ':action:' + actionId;
+      const correctionKey = 'corr:caisse:' + current.id + ':action:' + actionId;
       const payload = { correctionKey, sortie: correctionKey + ':out', entree: correctionKey + ':in',
         invoiceId: current.invoiceId, fromMethod: input.fromMethod, toMethod: input.toMethod, amountXpf: input.amountXpf };
       prior = await tx.caisseSyncAction.create({ data: { tenantId, actionId, kind: "legacy-payment-correction", entityKey: saleId,
@@ -1983,13 +1987,18 @@ export async function corrigerMoyenPaiement(
     if (!current.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
     const reserved = await tx.caisseSyncAction.findFirstOrThrow({ where: actionWhere(action!.actionId) });
     if (reserved.state === "ACK") return input.actionId ? reserved.response as unknown as CorrectionResult : { ...(reserved.response as any), alreadyCorrected: true };
-    const already = await tx.salePayment.count({ where: { tenantId, saleId, settleRef: payload.sortie } });
+    const normalizedSortie = normalizeComposedUuidReference(payload.sortie);
+    const matchingPayment = current.payments.find(payment => payment.settleRef
+      && normalizeComposedUuidReference(payment.settleRef) === normalizedSortie)
+      ?? await findHistoricalComposedReference(payload.sortie, key => tx.salePayment.findFirst({ where: { tenantId, saleId: current.id, settleRef: key } }));
+    const already = matchingPayment ? 1 : 0;
     if (!already) {
-      await tx.salePayment.create({ data: { tenantId, saleId, method: input.fromMethod as PayMethod, amountXpf: -BigInt(input.amountXpf), tenderedXpf: null, settleRef: payload.sortie } });
-      await tx.salePayment.create({ data: { tenantId, saleId, method: input.toMethod as PayMethod, amountXpf: BigInt(input.amountXpf), tenderedXpf: null, settleRef: payload.entree } });
+      const storedSaleId = current.id;
+      await tx.salePayment.create({ data: { tenantId, saleId: storedSaleId, method: input.fromMethod as PayMethod, amountXpf: -BigInt(input.amountXpf), tenderedXpf: null, settleRef: `corr:caisse:${storedSaleId}:${payload.sortie.slice(`corr:caisse:${saleId}:`.length)}` } });
+      await tx.salePayment.create({ data: { tenantId, saleId: storedSaleId, method: input.toMethod as PayMethod, amountXpf: BigInt(input.amountXpf), tenderedXpf: null, settleRef: `corr:caisse:${storedSaleId}:${payload.entree.slice(`corr:caisse:${saleId}:`.length)}` } });
     }
-    if (current.cashDayId) await recordSharedSale(tx, tenantId, saleId);
-    const payments = [...current.payments, ...(!already ? [{ method: input.fromMethod, amountXpf: -BigInt(input.amountXpf) }, { method: input.toMethod, amountXpf: BigInt(input.amountXpf) }] : [])];
+    if (current.cashDayId) await recordSharedSale(tx, tenantId, current.id);
+    const payments = [...current.payments, ...(!already ? [{ method: input.fromMethod, amountXpf: -BigInt(input.amountXpf), settleRef: payload.sortie }, { method: input.toMethod, amountXpf: BigInt(input.amountXpf), settleRef: payload.entree }] : [])];
     const net = new Map<string, bigint>();
     for (const p of payments) net.set(p.method, (net.get(p.method) ?? 0n) + p.amountXpf);
     const result: CorrectionResult = { ok: true, alreadyCorrected: !!already, payments: [...net].map(([method, amount]) => ({ method, amountXpf: Number(amount) })) };

@@ -21,6 +21,7 @@
 
 import { expiresAtFor } from "./loyalty.ts";
 import { log } from "./log.ts";
+import { historicalComposedReferenceKeys } from "./caisse-sync.ts";
 
 // ── Le sous-ensemble de Prisma.TransactionClient réellement utilisé ici ────────────────────────
 // Volontairement étroit (et paramètres en `any`) : la vraie `Prisma.TransactionClient` le
@@ -559,10 +560,15 @@ export async function reverseSale(
   tx: LoyaltyTx,
   args: { tenantId: string; saleId: string },
 ): Promise<void> {
-  const pointsEntry = await tx.loyaltyEntry.findFirst({
-    where: { tenantId: args.tenantId, kind: "POINTS", ref: `points:sale:${args.saleId}` },
-    select: { accountId: true, points: true, occurredAt: true },
-  });
+  const findHistoricalEntry = async (kind: string, prefix: string, select: Record<string, boolean>) => {
+    for (const ref of historicalComposedReferenceKeys(`${prefix}${args.saleId}`)) {
+      const entry = await tx.loyaltyEntry.findFirst({ where: { tenantId: args.tenantId, kind, ref },
+        select });
+      if (entry) return entry;
+    }
+    return null;
+  };
+  const pointsEntry = await findHistoricalEntry("POINTS", "points:sale:", { accountId: true, points: true, occurredAt: true });
   if (pointsEntry && pointsEntry.points) {
     await insertEntry(tx, {
       tenantId: args.tenantId,
@@ -578,10 +584,7 @@ export async function reverseSale(
     });
   }
 
-  const redeemEntry = await tx.loyaltyEntry.findFirst({
-    where: { tenantId: args.tenantId, kind: "REDEEM", ref: `redeem:sale:${args.saleId}` },
-    select: { accountId: true, rewardEntryId: true, occurredAt: true },
-  });
+  const redeemEntry = await findHistoricalEntry("REDEEM", "redeem:sale:", { accountId: true, rewardEntryId: true, occurredAt: true });
   if (redeemEntry && redeemEntry.rewardEntryId) {
     await tx.loyaltyEntry.updateMany({
       where: { id: redeemEntry.rewardEntryId, tenantId: args.tenantId },

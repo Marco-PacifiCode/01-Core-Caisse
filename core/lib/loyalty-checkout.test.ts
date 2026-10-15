@@ -817,6 +817,21 @@ test("reverseSale : vente sans points ni récompense -> aucune écriture", async
   assert.equal(entries.length, 0);
 });
 
+test("reverseSale : retrouve les références historiques en UUID majuscule, annule une seule fois", async () => {
+  const saleId = "ab000000-0000-4000-8000-000000000099";
+  const pointsEntry = seedReward({ id: "points-upper", kind: "POINTS", points: 27, ref: `points:sale:${saleId.toUpperCase()}`, saleId });
+  const reward = seedReward({ id: "reward-upper" });
+  const redeemEntry = seedReward({ id: "redeem-upper", kind: "REDEEM", ref: `redeem:sale:${saleId.toUpperCase()}`, saleId,
+    rewardEntryId: reward.id, discountXpf: 500n });
+  reward.redeemedAt = new Date("2026-09-15T10:00:00Z"); reward.redeemedSaleId = saleId;
+  const { tx, entries } = makeFakeTx([pointsEntry, reward, redeemEntry]);
+  await reverseSale(tx, { tenantId: TENANT, saleId });
+  await reverseSale(tx, { tenantId: TENANT, saleId });
+  assert.equal(entries.filter(e => e.kind === "REVERSAL" && e.points === -27).length, 1);
+  assert.equal(entries.find(e => e.id === reward.id)!.redeemedAt, null);
+  assert.equal(entries.filter(e => e.kind === "REVERSAL" && e.rewardEntryId === reward.id).length, 1);
+});
+
 // ══════════════════════════════════════════════════════════════════════════════════════════
 // reverseSale — UNE REPRISE APPARTIENT AU CYCLE DU CRÉDIT QU'ELLE ANNULE — contre-QA sur 9a98e32
 //
@@ -1313,7 +1328,7 @@ test("checkoutSale : rejeu idempotent d'une vente déjà PAID -> retour anticip�
 test("annulerVente : reprise fidélité UNIQUEMENT si la vente était PAID, dans la MÊME transaction que markVoid", () => {
   const corps = corpsAnnulerVente();
   const iGuard = corps.indexOf('if (sale.status === "PAID") {');
-  const iCall = corps.indexOf("await reverseSaleLoyalty(tx, { tenantId, saleId });");
+  const iCall = corps.indexOf("await reverseSaleLoyalty(tx, { tenantId, saleId: storedSaleId });");
   assert.ok(iGuard > -1, "garde `sale.status === PAID` introuvable");
   assert.ok(iCall > -1, "appel à reverseSaleLoyalty introuvable, ou porte encore un occurredAt");
   assert.ok(iGuard < iCall && iCall - iGuard < 700, "l'appel doit être DANS la garde PAID, pas ailleurs");

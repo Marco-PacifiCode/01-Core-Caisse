@@ -1,6 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { businessDay, canonical, CashContractError, factDelta, jsonValue, requireCash, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
-import { lockCashTenant, normalizeActionId, normalizeActionInput, uuid, type CashTx } from "./caisse-sync";
+import { findHistoricalComposedReference, lockCashTenant, normalizeActionId, normalizeActionInput, normalizeComposedUuidReference, uuid, type CashTx } from "./caisse-sync";
 
 // Tenant → Day → Sale : verrouiller le tenant avant toute recherche de CashDay.
 // Toute transaction prenant les deux verrous lit d'abord cashDayId
@@ -23,7 +23,9 @@ export async function appendDayFact(tx: CashTx, tenantId: string, cashDayId: str
   await lockDay(tx, tenantId, cashDayId);
   const snapshot = jsonValue(normalizeActionInput(input.snapshot as Record<string, unknown>)) as Prisma.InputJsonValue;
   const cashDeltaXpf = factDelta(input.kind, snapshot);
-  const old = await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId, kind: input.kind, sourceRef: input.sourceRef } });
+  const old = await findHistoricalComposedReference(input.sourceRef, sourceRef => tx.cashDayEvent.findFirst({
+    where: { tenantId, cashDayId, kind: input.kind, sourceRef },
+  }));
   if (old) {
     if (canonical(normalizeActionInput(old.snapshot as Record<string, unknown>)) !== canonical(snapshot)) throw new CashContractError("SOURCE_CONFLICT", 409);
     return old;
@@ -69,13 +71,17 @@ export async function recordSharedSale(tx: CashTx, tenantId: string, saleId: str
         parTaux: taxes(lines), ticketNumber: sale.ticketNumber, deviceName: sale.deviceName, sellerId: sale.sellerId, sellerName: sale.sellerName } });
     for (const p of corrections) {
       const ref = p.settleRef!;
-      requireCash(ref.startsWith(`corr:caisse:${sale.id}:`) && (ref.endsWith(":out") || ref.endsWith(":in")));
+      const normalizedRef = normalizeComposedUuidReference(ref);
+      const expectedPrefix = normalizeComposedUuidReference(`corr:caisse:${sale.id}:`);
+      requireCash(normalizedRef.startsWith(expectedPrefix) && (normalizedRef.endsWith(":out") || normalizedRef.endsWith(":in")));
       if (!ref.endsWith(":out")) {
-        requireCash(corrections.some(out => out.settleRef === ref.slice(0, -3) + ":out"));
+        const expectedOut = normalizeComposedUuidReference(ref.slice(0, -3) + ":out");
+        requireCash(corrections.some(out => out.settleRef && normalizeComposedUuidReference(out.settleRef) === expectedOut));
         continue;
       }
-      const pair = corrections.filter(into => into.settleRef === ref.slice(0, -4) + ":in");
-      requireCash(pair.length === 1 && corrections.filter(out => out.settleRef === ref).length === 1);
+      const expectedIn = normalizeComposedUuidReference(ref.slice(0, -4) + ":in");
+      const pair = corrections.filter(into => into.settleRef && normalizeComposedUuidReference(into.settleRef) === expectedIn);
+      requireCash(pair.length === 1 && corrections.filter(out => out.settleRef && normalizeComposedUuidReference(out.settleRef) === normalizedRef).length === 1);
       await appendDayFact(tx, tenantId, day.id, { kind: "PAYMENT_CORRECTION", sourceRef: ref, saleId: sale.id,
         deviceId: sale.deviceId ?? "legacy", occurredAt: p.createdAt ?? occurredAt,
         snapshot: { saleRef: sale.id, payments: [p, pair[0]].map(payment => ({ method: payment.method, amountXpf: String(payment.amountXpf) })) } });
