@@ -7,6 +7,7 @@ type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
 export async function partialRefundWithPorts(tenantId: string, saleId: string, input: RefundInput, deps: {
   transact<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+  // Le port natif prend le verrou tenant et applique assertLegacyWriteAllowed sans cashDayId.
   lockTenant(tx: Tx): Promise<void>;
   lockSale(tx: Tx): Promise<boolean>;
   lockAction(tx: Tx): Promise<void>;

@@ -4,6 +4,7 @@ import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-
 import { date, lockCashTenant, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
+import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
 
 export function sourceAuthor(b: ActionInput) {
   const receivedById = uuid(b.receivedById);
@@ -18,6 +19,7 @@ function dayOf(b: ActionInput) {
 }
 export async function openCashDay(tx: CashTx, b: ActionInput) {
   await lockCashTenant(tx, b.tenantId);
+  await assertNoLegacyOperationInProgress(tx, b.tenantId);
   const business = dayOf(b), tenantId = b.tenantId, author = sourceAuthor(b);
   const sourceKey = text(b.sourceKey, 300), localSessionKey = text(b.localSessionKey, 300);
   const openingFloatXpf = xpfInteger(b.openingFloatXpf);
@@ -162,6 +164,8 @@ export async function ledgerPage(tx: CashTx, tenantId: string, id: string, q: UR
       fondsNonRetenus: openings.filter((o: { sourceKey: string; openingFloatXpf: bigint }) => visibleOpeningKeys.has(o.sourceKey) && o.openingFloatXpf !== day.canonicalSession.openingFloatXpf) } };
 }
 export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
+  await lockCashTenant(tx, b.tenantId);
+  await assertNoLegacyOperationInProgress(tx, b.tenantId);
   const day = await lockDay(tx, b.tenantId, id);
   const sessions = b.sessionIds ?? [], origins = b.origins ?? [], localVoids = b.localVoids ?? [];
   requireCash(Array.isArray(sessions) && Array.isArray(origins) && Array.isArray(localVoids));

@@ -39,6 +39,7 @@
 // =============================================================================
 
 import type { Prisma } from "@prisma/client";
+import { CashContractError } from "./cash-day-projection";
 
 /**
  * Plafond d'attente sur le verrou. Une caisse qui attend indéfiniment est PIRE qu'une
@@ -107,7 +108,12 @@ export async function lockSaleRow(
 export async function lockVoidResource(tx: Prisma.TransactionClient, tenantId: string, resource: string): Promise<void> {
   try {
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${SALE_LOCK_TIMEOUT}, true)`;
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId.toLowerCase() + ':' + resource}, 0))`;
+    if (!UUID_RE.test(tenantId)) throw new CashContractError("INVALID_TENANT_ID", 400);
+    const normalizedTenant = tenantId.toLowerCase();
+    const resourceMatch = /^(action|partial-action):(.+)$/.exec(resource);
+    if (!resourceMatch || !UUID_RE.test(resourceMatch[2])) throw new CashContractError("INVALID_ACTION_ID", 400);
+    const normalizedResource = `${resourceMatch[1]}:${resourceMatch[2].toLowerCase()}`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${normalizedTenant + ':' + normalizedResource}, 0))`;
   } catch (err) {
     if (isLockTimeout(err)) throw new SaleLockTimeoutError();
     throw err;

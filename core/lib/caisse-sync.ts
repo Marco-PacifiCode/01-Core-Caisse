@@ -20,7 +20,8 @@ export function envelope(value: unknown, idempotencyKey: string | null): ActionI
   return b as ActionInput;
 }
 export async function lockCashTenant(tx: CashTx, tenantId: string) {
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-l4:' + tenantId}, 0))`;
+  const normalized = uuid(tenantId);
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-l4:' + normalized}, 0))`;
 }
 export type ActionResponse = { status: number; body: JsonRecord };
 /** L'accusé et la mutation métier commitent ensemble, y compris les candidats refusés. */
@@ -32,10 +33,12 @@ export async function cashAction(kind: string, b: ActionInput, mutate: (tx: Cash
     const previous = await tx.caisseSyncAction.findUnique({ where: key });
     if (previous) {
       if (previous.requestHash !== requestHash) return { status: 409, body: { ok: false, error: "ACTION_ID_CONFLICT" } };
-      const saved = object(previous.response);
-      return { status: Number(saved.status), body: { ...object(saved.body), alreadyApplied: previous.state === "ACK" } };
+      if (previous.state !== "PENDING") {
+        const saved = object(previous.response);
+        return { status: Number(saved.status), body: { ...object(saved.body), alreadyApplied: previous.state === "ACK" } };
+      }
     }
-    await tx.caisseSyncAction.create({ data: { tenantId: b.tenantId, actionId: b.actionId, deviceId: b.deviceId,
+    if (!previous) await tx.caisseSyncAction.create({ data: { tenantId: b.tenantId, actionId: b.actionId, deviceId: b.deviceId,
       kind, entityKey: b.entityKey, requestHash, payload: jsonValue(b) as Prisma.InputJsonValue } });
     await tx.$executeRawUnsafe("SAVEPOINT cash_l4_business");
     let result: ActionResponse;
@@ -48,7 +51,8 @@ export async function cashAction(kind: string, b: ActionInput, mutate: (tx: Cash
       await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT cash_l4_business");
       result = { status: e.status, body: { ok: false, error: e.message, ...(e.data === undefined ? {} : { data: jsonValue(e.data) }) } };
     }
-    await tx.caisseSyncAction.update({ where: key, data: { state: result.status === 200 ? "ACK" : result.status === 409 ? "CONFLICT" : "REJECTED",
+    const retryable = result.status === 409 && result.body.error === "LEGACY_IN_PROGRESS";
+    await tx.caisseSyncAction.update({ where: key, data: { state: result.status === 200 ? "ACK" : retryable ? "PENDING" : result.status === 409 ? "CONFLICT" : "REJECTED",
       response: jsonValue(result) as Prisma.InputJsonValue } });
     return result;
   });

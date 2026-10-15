@@ -80,7 +80,7 @@ function corpsCancelGiftCard(): string {
 }
 function corpsCloseSession(): string {
   const source = caisseSrc();
-  assert.match(exportBody(source, "closeSession("), /withTenant\(tenantId, tx => closeSessionTx\(tx, tenantId, input\)\)/);
+  assert.match(exportBody(source, "closeSession("), /withTenant\(tenantId, async tx => \{[\s\S]*assertLegacyWriteAllowed\(tx, tenantId\)[\s\S]*closeSessionTx\(tx, tenantId, input\)/);
   return exportBody(source, "closeSessionTx");
 }
 function corpsCheckoutSale(): string {

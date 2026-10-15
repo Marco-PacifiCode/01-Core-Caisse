@@ -12,17 +12,24 @@ import {
   type PaymentInput,
 } from "@/lib/caisse";
 import type { LineKind, PayMethod } from "@prisma/client";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
 export async function openSessionAction(openingFloatXpf: number, note?: string): Promise<string | undefined> {
   const { user, tenant } = await requireStaff("/caisse");
   if (await cashDayGuard(tenant.id, { openSession: true })) return CASHDAY_ROUTE_REQUIRED.error;
-  const res = await openSession(tenant.id, {
-    openedBy: user.id,
-    openingFloatXpf: BigInt(Math.round(openingFloatXpf || 0)),
-    note: note?.trim() || undefined,
-  });
+  let res;
+  try {
+    res = await openSession(tenant.id, {
+      openedBy: user.id,
+      openingFloatXpf: BigInt(Math.round(openingFloatXpf || 0)),
+      note: note?.trim() || undefined,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return error.message;
+    throw error;
+  }
   if (!res.ok) return "Une session est déjà ouverte.";
   revalidatePath("/caisse");
 }
@@ -45,11 +52,17 @@ export type ZReportResult = {
 export async function closeSessionAction(sessionId: string, closingCountedXpf: number): Promise<ZReportResult> {
   const { user, tenant } = await requireStaff("/caisse");
   if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
-  const res = await closeSession(tenant.id, {
-    sessionId,
-    closedBy: user.id,
-    closingCountedXpf: BigInt(Math.round(closingCountedXpf || 0)),
-  });
+  let res;
+  try {
+    res = await closeSession(tenant.id, {
+      sessionId,
+      closedBy: user.id,
+      closingCountedXpf: BigInt(Math.round(closingCountedXpf || 0)),
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return { ok: false, error: error.message };
+    throw error;
+  }
   if (!res.ok) return { ok: false, error: "Session introuvable." };
   revalidatePath("/caisse");
   const r = res.report;
@@ -122,12 +135,18 @@ export async function checkoutAction(
     unitXpf: BigInt(Math.round(l.unitXpf)),
   }));
 
-  const created = await createSale(tenant.id, {
-    cashierId: user.id,
-    sessionId: sessionId ?? null,
-    clientName: clientName?.trim() || null,
-    lines: saleLines,
-  });
+  let created;
+  try {
+    created = await createSale(tenant.id, {
+      cashierId: user.id,
+      sessionId: sessionId ?? null,
+      clientName: clientName?.trim() || null,
+      lines: saleLines,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return { ok: false, error: error.message };
+    throw error;
+  }
   if (!created.ok) {
     const msg =
       created.error === "PRODUCT_LINE_WITHOUT_PRODUCT"
@@ -144,7 +163,13 @@ export async function checkoutAction(
     tenderedXpf: p.tenderedXpf !== undefined ? BigInt(Math.round(p.tenderedXpf)) : undefined,
   }));
 
-  const res = await checkoutSale(tenant.id, created.saleId, pays);
+  let res;
+  try {
+    res = await checkoutSale(tenant.id, created.saleId, pays);
+  } catch (error) {
+    if (error instanceof CashContractError) return { ok: false, error: error.message };
+    throw error;
+  }
   if (!res.ok) {
     const msg =
       res.error === "UNDERPAID"

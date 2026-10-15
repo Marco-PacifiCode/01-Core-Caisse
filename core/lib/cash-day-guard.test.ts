@@ -6,6 +6,7 @@ import ts from "typescript";
 import * as refundPolicy from "./partial-refund.ts";
 import * as projection from "./cash-day-projection.ts";
 import * as credit from "./credit.ts";
+import { createHash } from "node:crypto";
 
 type Row = Record<string, any>;
 const tenant = "10000000-0000-0000-0000-000000000001";
@@ -34,7 +35,8 @@ function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "oth
     cashDaySession: { findUnique: async ({ where }: Row) => aliases.find(row => match(row, where.tenantId_sessionId)) ?? null },
     sale: { findFirst: async ({ where }: Row) => sales.find(row => match(row, where)) ?? null },
   };
-  const guard = load("cash-day-guard.ts", { "./tenant": { withTenant: async (_tenant: string, fn: (tx: unknown) => unknown) => fn(tx) } });
+  const guard = load("cash-day-guard.ts", { "./tenant": { withTenant: async (_tenant: string, fn: (tx: unknown) => unknown) => fn(tx) },
+    "./caisse-sync": { lockCashTenant: async () => {}, uuid: (v: string) => v }, "./cash-day-projection": projection });
   const writes: string[] = [];
   const native = Object.fromEntries(["openSession", "closeSession", "createSale", "checkoutSale", "annulerVente", "rembourserPartiellement", "corrigerMoyenPaiement", "importerCloture"].map(name =>
     [name, async () => { writes.push(name); return { ok: true, session: { id: sessionId, openingFloatXpf: 25000n }, report: {}, saleId }; }]));
@@ -127,6 +129,85 @@ test("import Z HTTP : CashContractError après la garde renvoie 409", async () =
   const route = load("../app/api/sessions/import/route.ts", f.imports);
   const response = await route.POST({ json: async () => ({ tenantId: tenant, openedBy: actionId }) });
   assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+});
+
+test("verrous consultatifs : UUID majuscules et minuscules produisent la même clé normalisée", async () => {
+  const sync = load("caisse-sync.ts", { "node:crypto": { createHash }, "./tenant": {}, "./cash-day-projection": projection });
+  const seen: unknown[] = [];
+  const tx = { $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) { seen.push(values[0]); return Promise.resolve([]); } };
+  const lower = "abcdefab-cdef-abcd-efab-cdefabcdefab";
+  const upper = lower.toUpperCase();
+  assert.notEqual(lower, upper);
+  await sync.lockCashTenant(tx, upper);
+  await sync.lockCashTenant(tx, lower);
+  assert.equal(seen[0], `cash-l4:${lower}`);
+  assert.equal(seen[1], `cash-l4:${lower}`);
+  await assert.rejects(sync.lockCashTenant(tx, "invalid-uuid"), (e: Row) => e.status === 400);
+  assert.equal(seen.length, 2, "UUID invalide refusé avant la requête SQL");
+});
+
+test("verrou d'action : tenant et UUID d'action normalisés et invalides refusés en 400", async () => {
+  const locks = load("sale-lock.ts", { "./cash-day-projection": projection });
+  const seen: unknown[] = [];
+  const tx = {
+    $executeRaw: async () => [],
+    $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) { seen.push(values[0]); return Promise.resolve([]); },
+  };
+  const lowerTenant = "abcdefab-cdef-abcd-efab-cdefabcdefab";
+  const lowerAction = "fedcbafe-dcba-fedc-bafe-dcbafedcbafe";
+  const upperTenant = lowerTenant.toUpperCase();
+  const upperAction = lowerAction.toUpperCase();
+  assert.notEqual(lowerTenant, upperTenant);
+  assert.notEqual(lowerAction, upperAction);
+  for (const prefix of ["action", "partial-action"]) {
+    await locks.lockVoidResource(tx, upperTenant, `${prefix}:${upperAction}`);
+    await locks.lockVoidResource(tx, lowerTenant, `${prefix}:${lowerAction}`);
+    assert.equal(seen.at(-2), `${lowerTenant}:${prefix}:${lowerAction}`);
+    assert.equal(seen.at(-1), `${lowerTenant}:${prefix}:${lowerAction}`);
+  }
+  assert.deepEqual(seen, [
+    `${lowerTenant}:action:${lowerAction}`, `${lowerTenant}:action:${lowerAction}`,
+    `${lowerTenant}:partial-action:${lowerAction}`, `${lowerTenant}:partial-action:${lowerAction}`,
+  ]);
+  await assert.rejects(locks.lockVoidResource(tx, "tenant-invalid", `action:${actionId}`), (e: Row) => e.status === 400);
+  await assert.rejects(locks.lockVoidResource(tx, tenant, "action:invalid"), (e: Row) => e.status === 400);
+});
+
+test("routes historiques renvoient 409 si la transaction signale CASHDAY_ROUTE_REQUIRED", async () => {
+  const targets: [string, string][] = [
+    ["sessions/route.ts", "openSession"], ["sessions/[id]/close/route.ts", "closeSession"],
+    ["sales/route.ts", "createSale"], ["movements/route.ts", "recordCashMovement"],
+  ];
+  const bodies: Row[] = [
+    { tenantId: tenant, openedBy: actionId },
+    { tenantId: tenant, closedBy: actionId, closingCountedXpf: 25000 },
+    { tenantId: tenant, lines: [{ kind: "OTHER", label: "Synthétique", qty: 1, unitXpf: 1000 }] },
+    { tenantId: tenant, kind: "CASH_OUT", amountXpf: 500, reason: "Retrait synthétique" },
+  ];
+  for (let i = 0; i < targets.length; i++) {
+    const f = fixture("standalone");
+    f.imports["@/lib/cash-movement"] = { isCashMovementKind: () => true, normalizeMovementAmount: () => ({ ok: true, amountXpf: 500n }),
+      normalizeMovementReason: () => "retrait", normalizeMovementRef: () => null, PARTIAL_REFUND_REF_PREFIX: "partial-refund:" };
+    f.imports["@/lib/caisse"][targets[i][1]] = async () => { throw new projection.CashContractError("CASHDAY_ROUTE_REQUIRED", 409); };
+    const route = load(`../app/api/${targets[i][0]}`, f.imports);
+    const response = await route.POST({ json: async () => bodies[i], headers: new Headers() }, { params: Promise.resolve({ id: sessionId }) });
+    assert.equal(response.status, 409, targets[i][0]);
+    assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+  }
+});
+
+test("actions historiques traduisent les erreurs transactionnelles en erreur métier", async () => {
+  for (const method of ["openSession", "closeSession", "createSale", "checkoutSale"]) {
+    const f = fixture("standalone");
+    f.imports["@/lib/caisse"][method] = async () => { throw new projection.CashContractError("CASHDAY_ROUTE_REQUIRED", 409); };
+    const actions = load("../app/caisse/actions.ts", f.imports);
+    if (method === "openSession") assert.equal(await actions.openSessionAction(25000), "CASHDAY_ROUTE_REQUIRED");
+    if (method === "closeSession") assert.equal((await actions.closeSessionAction(sessionId, 25000)).error, "CASHDAY_ROUTE_REQUIRED");
+    if (method === "createSale" || method === "checkoutSale") {
+      const result = await actions.checkoutAction(sessionId, [{ kind: "OTHER", label: "Synthétique", qty: 1, unitXpf: 1000 }], [{ method: "CASH", amountXpf: 1000 }]);
+      assert.equal(result.ok, false, method); assert.equal(result.error, "CASHDAY_ROUTE_REQUIRED", method);
+    }
+  }
 });
 test("actions serveur : refus avant toute écriture CashDay, comportement natif conservé", async () => {
   for (const mode of ["canonical", "alias", "standalone"] as const) {
