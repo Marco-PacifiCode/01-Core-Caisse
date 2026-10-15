@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import { businessDay, canonical, CashContractError, factDelta, jsonValue, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
+import { businessDay, canonical, CashContractError, factDelta, jsonValue, requireCash, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
 import { lockCashTenant, type CashTx } from "./caisse-sync";
 
 export async function lockDay(tx: CashTx, tenantId: string, cashDayId: string) {
@@ -49,9 +49,24 @@ export async function recordSharedSale(tx: CashTx, tenantId: string, saleId: str
   if (businessDay(occurredAt) !== day.businessDay) throw new CashContractError("DAY_MISMATCH", 409);
   if (sale.status === "PAID" || sale.status === "VOID" && sale.paidAt) {
     const lines = jsonValue(sale.lines) as FrozenLine[];
+    // Les contre-écritures gardent leurs propres faits : SALE_PAID reste immuable au rejeu.
+    const corrections = sale.payments.filter(p => p.settleRef?.startsWith("corr:"));
     await appendDayFact(tx, tenantId, day.id, { kind: "SALE_PAID", sourceRef: sale.id, saleId: sale.id,
-      deviceId: sale.deviceId ?? "legacy", occurredAt, snapshot: { totalXpf: sale.totalXpf, lines, payments: sale.payments,
+      deviceId: sale.deviceId ?? "legacy", occurredAt, snapshot: { totalXpf: sale.totalXpf, lines, payments: sale.payments.filter(p => !p.settleRef?.startsWith("corr:")),
         parTaux: taxes(lines), ticketNumber: sale.ticketNumber, deviceName: sale.deviceName, sellerId: sale.sellerId, sellerName: sale.sellerName } });
+    for (const p of corrections) {
+      const ref = p.settleRef!;
+      requireCash(ref.startsWith(`corr:caisse:${sale.id}:`) && (ref.endsWith(":out") || ref.endsWith(":in")));
+      if (!ref.endsWith(":out")) {
+        requireCash(corrections.some(out => out.settleRef === ref.slice(0, -3) + ":out"));
+        continue;
+      }
+      const pair = corrections.filter(into => into.settleRef === ref.slice(0, -4) + ":in");
+      requireCash(pair.length === 1 && corrections.filter(out => out.settleRef === ref).length === 1);
+      await appendDayFact(tx, tenantId, day.id, { kind: "PAYMENT_CORRECTION", sourceRef: ref, saleId: sale.id,
+        deviceId: sale.deviceId ?? "legacy", occurredAt: p.createdAt ?? occurredAt,
+        snapshot: { saleRef: sale.id, payments: [p, pair[0]].map(payment => ({ method: payment.method, amountXpf: String(payment.amountXpf) })) } });
+    }
   }
   if (sale.status === "VOID") await appendDayFact(tx, tenantId, day.id, { kind: sale.paidAt ? "SALE_VOID" : "LOCAL_VOID",
     sourceRef: sale.id, saleId: sale.id, deviceId: sale.deviceId ?? "legacy", occurredAt: sale.updatedAt,

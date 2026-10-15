@@ -1722,12 +1722,16 @@ export async function corrigerMoyenPaiement(
         // Le verrou ne porte que sur cette transaction d'écriture — la comptabilité a déjà
         // été appelée par `runPaymentCorrection` AVANT, hors de toute transaction (cf.
         // l'avertissement en tête de lib/sale-lock.ts).
+        const shared = await lockSharedSale(tx, tenantId, args.saleId);
         await lockSaleRow(tx, args.saleId, tenantId);
 
         const already = await tx.salePayment.count({
           where: { tenantId, saleId: args.saleId, settleRef: args.sortie },
         });
-        if (already > 0) return { inserted: false };
+        if (already > 0) {
+          if (shared?.cashDayId) await recordSharedSale(tx, tenantId, args.saleId);
+          return { inserted: false };
+        }
 
         await tx.salePayment.create({
           data: {
@@ -1749,6 +1753,7 @@ export async function corrigerMoyenPaiement(
             settleRef: args.entree,
           },
         });
+        if (shared?.cashDayId) await recordSharedSale(tx, tenantId, args.saleId);
         return { inserted: true };
       });
     },

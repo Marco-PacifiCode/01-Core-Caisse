@@ -63,13 +63,13 @@ export function taxes(lines: readonly FrozenLine[]) {
     return { tgcRatePpm, ttcXpf: String(ttcXpf), htXpf: String(ttcXpf - tgcXpf), tgcXpf: String(tgcXpf) };
   });
 }
-export function paymentParts(raw: unknown) {
+export function paymentParts(raw: unknown, signed = false) {
   requireCash(Array.isArray(raw));
   const byMethod: Record<string, bigint> = {};
   for (const item of raw) {
     const p = object(item);
     requireCash(typeof p.method === "string" && ["CASH", "CARD", "TRANSFER", "CHEQUE", "OTHER"].includes(p.method));
-    byMethod[p.method] = (byMethod[p.method] ?? 0n) + xpfInteger(p.amountXpf);
+    byMethod[p.method] = (byMethod[p.method] ?? 0n) + xpfInteger(p.amountXpf, signed);
   }
   return byMethod;
 }
@@ -87,6 +87,14 @@ export function factDelta(kind: string, snapshot: unknown): bigint {
     return parts.CASH ?? 0n;
   }
   if (kind === "PARTIAL_REFUND_DONE") return -(paymentParts(s.payments).CASH ?? 0n);
+  if (kind === "PAYMENT_CORRECTION") {
+    requireCash(typeof s.saleRef === "string" && s.saleRef.length > 0);
+    requireCash(Array.isArray(s.payments) && s.payments.length === 2);
+    const [out, into] = s.payments.map(object);
+    const amount = xpfInteger(into.amountXpf);
+    requireCash(amount > 0n && xpfInteger(out.amountXpf, true) === -amount && out.method !== into.method);
+    return paymentParts(s.payments, true).CASH ?? 0n;
+  }
   if (kind === "MOVEMENT") {
     requireCash(["CASH_IN", "CASH_OUT", "REFUND"].includes(String(s.kind)));
     // Les avoirs EXTERNAL figurent seulement dans PARTIAL_REFUND_DONE.
@@ -115,6 +123,11 @@ function totals(facts: DayFact[], fond: bigint) {
       }
     }
     if (f.kind === "PARTIAL_REFUND_DONE") refunds -= f.cashDeltaXpf;
+    if (f.kind === "PAYMENT_CORRECTION" && !voided.has(String(s.saleRef))) {
+      const parts = paymentParts(s.payments, true);
+      for (const [k, n] of Object.entries(parts)) byMethod[k] = (byMethod[k] ?? 0n) + n;
+      cash += parts.CASH ?? 0n;
+    }
     if (f.kind === "MOVEMENT") movements += f.cashDeltaXpf;
     if (f.kind === "GIFT_CARD_REDEEMED") { gift += xpfInteger(s.amountXpf); giftCount++; }
   }

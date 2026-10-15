@@ -99,7 +99,14 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     requireCash(native.ok, "NOT_FOUND", 404);
     report = native.report;
     // Heure d'origine seulement à la première clôture ; aucune pièce fermée n'est réécrite.
-    if (!native.alreadyClosed) await tx.cashSession.update({ where: { id: day.currentSessionId }, data: { closedAt: occurredAt } });
+    if (!native.alreadyClosed) {
+      const variance = countedXpf - expected;
+      safeXpf(variance);
+      await tx.cashSession.update({ where: { id: day.currentSessionId }, data: {
+        closedAt: occurredAt, expectedXpf: expected, varianceXpf: variance,
+      } });
+      report = { ...native.report, expectedXpf: safeXpf(expected), varianceXpf: safeXpf(variance) };
+    }
   }
   const closure = await tx.cashDayClosure.create({ data: { tenantId: b.tenantId, cashDayId, sourceKey, cycle, deviceId: b.deviceId,
     deviceName: text(b.deviceName), ...author, occurredAt, countedXpf, localExpectedXpf, localVarianceXpf,
@@ -155,30 +162,36 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
     requireCash(!alias || alias.cashDayId === id, "DAY_MISMATCH", 409);
     if (!alias) await tx.cashDaySession.create({ data: { tenantId: b.tenantId, cashDayId: id, sessionId, cycle: Number(b.cycle) } });
   }
+  // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins.
+  const refunds = (await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
+    OR: [{ cashDayId: null }, { cashDayId: id }] } })).filter(refund => {
+    const input = object(refund.input);
+    return input.refundMethod === "CASH" && businessDay(input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
+  });
   const saleIds: string[] = [];
   for (const value of origins) {
     const origin = object(value), sourceType = text(origin.sourceType), sourceId = text(origin.sourceId, 300);
     const sale = await tx.sale.findFirst({ where: { tenantId: b.tenantId, sourceType, sourceId } });
     requireCash(sale, "NOT_FOUND", 404);
-    requireCash(businessDay(sale.paidAt ?? sale.createdAt) === day.businessDay && (!sale.cashDayId || sale.cashDayId === id), "DAY_MISMATCH", 409);
+    if (businessDay(sale.paidAt ?? sale.createdAt) !== day.businessDay) {
+      // L'origine peut désigner la vente d'un avoir du jour ; la vente reste dans son Z d'origine.
+      requireCash(refunds.some(refund => refund.saleId === sale.id), "DAY_MISMATCH", 409);
+      continue;
+    }
+    requireCash(!sale.cashDayId || sale.cashDayId === id, "DAY_MISMATCH", 409);
     await tx.sale.update({ where: { id: sale.id }, data: { cashDayId: id, sessionId: day.canonicalSessionId } });
     await recordSharedSale(tx, b.tenantId, sale.id);
-    // Les avoirs confirmés ont leur propre clé : un complément ne change pas la vente.
-    const refunds = await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, saleId: sale.id, status: "DONE" } });
-    for (const refund of refunds) {
+    saleIds.push(sale.id);
+  }
+  // Même clé par avoir, qu'il soit découvert avec sa vente ou par l'import du jour de rendu.
+  for (const refund of refunds) {
       const input = object(refund.input), plan = object(refund.plan);
-      if (input.refundMethod !== "CASH") continue;
-      // Avoir rendu un AUTRE jour : il sort d'un autre tiroir, il n'entre pas dans ce Z (et ne bloque pas l'import).
-      if (refund.cashDayId && refund.cashDayId !== id) continue;
       const occurredAt = input.occurredAt ? date(input.occurredAt) : refund.createdAt;
-      if (businessDay(occurredAt) !== day.businessDay) continue;
       await appendDayFact(tx, b.tenantId, id, { kind: "PARTIAL_REFUND_DONE", sourceRef: refund.actionId,
-        refundActionId: refund.id, deviceId: refund.deviceId ?? sale.deviceId ?? "legacy", occurredAt,
+        refundActionId: refund.id, deviceId: refund.deviceId ?? "legacy", occurredAt,
         snapshot: { payments: [{ method: "CASH", amountXpf: String(xpfInteger(String(plan.amountXpf))) }],
           parTaux: (plan.parTaux as unknown[]).map(v => { const t = object(v); return { tgcRatePpm: t.tgcRatePpm,
             htXpf: String(t.htXpf), tgcXpf: String(t.tgcXpf), ttcXpf: String(t.ttcXpf) }; }) } });
-    }
-    saleIds.push(sale.id);
   }
   for (const value of localVoids) {
     const v = object(value); const occurredAt = date(v.occurredAt);

@@ -107,3 +107,30 @@ test("snapshot incohérent/ref différent : refus sans calcul silencieux", () =>
   assert.throws(() => project([{ ...f, cashDeltaXpf: 2000n }]));
   assert.throws(() => project([f, sale(2, "a", 2000)]));
 });
+
+test("correction CASH vers CARD : fait signé idempotent, CA inchangé et annulation cohérente", () => {
+  const paid = sale(1, "corrected", 1000);
+  const correction = fact(2, "PAYMENT_CORRECTION", "correction:out", { saleRef: "corrected",
+    payments: [{ method: "CASH", amountXpf: "-1000" }, { method: "CARD", amountXpf: "1000" }] });
+  assert.equal(project([paid], [], 1n).totauxCourants.expectedXpf, 26000n);
+  const out = project([paid, correction, correction]).totauxCourants;
+  assert.equal(out.expectedXpf, 25000n); assert.equal(out.totalSalesXpf, 1000n);
+  assert.equal(out.byMethod.CASH, 0n); assert.equal(out.byMethod.CARD, 1000n);
+  const cancelled = project([paid, correction, fact(3, "SALE_VOID", "corrected", { saleRef: "corrected" })]);
+  assert.equal(cancelled.totauxCourants.expectedXpf, 25000n);
+  assert.equal(cancelled.totauxCourants.totalSalesXpf, 0n);
+});
+
+test("négatif réservé au couple équilibré de PAYMENT_CORRECTION", () => {
+  const payments = [{ method: "CASH", amountXpf: "-1000" }, { method: "CARD", amountXpf: "1000" }];
+  assert.throws(() => factDelta("SALE_PAID", { totalXpf: "0", lines: [], parTaux: [], payments }));
+  assert.throws(() => factDelta("PARTIAL_REFUND_DONE", { payments }));
+  assert.throws(() => factDelta("MOVEMENT", { kind: "CASH_OUT", amountXpf: "-1000" }));
+  for (const invalid of [
+    { payments },
+    { saleRef: "s", payments: [payments[0]] },
+    { saleRef: "s", payments: [payments[0], { method: "CARD", amountXpf: "999" }] },
+    { saleRef: "s", payments: [payments[0], { method: "CASH", amountXpf: "1000" }] },
+    { saleRef: "s", payments: [{ method: "CARD", amountXpf: "1000" }, payments[0]] },
+  ]) assert.throws(() => factDelta("PAYMENT_CORRECTION", invalid));
+});

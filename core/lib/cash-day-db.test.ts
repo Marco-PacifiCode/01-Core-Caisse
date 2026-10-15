@@ -11,6 +11,10 @@ import * as policy from "./cash-shared-policy.ts";
 import * as money from "./money.ts";
 import * as credit from "./credit.ts";
 import * as refundPolicy from "./partial-refund.ts";
+import * as movements from "./cash-movement.ts";
+import * as gifts from "./gift-card.ts";
+import * as reports from "./z-report.ts";
+import * as corrections from "./payment-correction.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "10000000-0000-0000-0000-000000000001", tenantB = "10000000-0000-0000-0000-000000000002";
@@ -51,7 +55,7 @@ function fixture() {
   }
   const tx: Row = {};
   tx.salePayment = {
-    async count({ where }: Row) { return state.sale.find(s => s.id === where.saleId)!.payments.length; },
+    async count({ where }: Row) { return state.sale.find(s => s.id === where.saleId)!.payments.filter((p: Row) => match(p, where.settleRef === undefined ? {} : { settleRef: where.settleRef })).length; },
     async findMany({ where }: Row) { return structuredClone(state.sale.find(s => s.id === where.saleId)!.payments); },
     async create({ data }: Row) { state.sale.find(s => s.id === data.saleId)!.payments.push(structuredClone(data)); return data; },
   };
@@ -61,6 +65,7 @@ function fixture() {
       out.canonicalSession = structuredClone(state.cashSession.find(s => s.id === row.canonicalSessionId));
       out.currentSession = structuredClone(state.cashSession.find(s => s.id === row.currentSessionId));
     }
+    if (name === "sale" && include?.session) out.session = structuredClone(state.cashSession.find(s => s.id === row.sessionId) ?? null);
     return out;
   }
   for (const name of names) {
@@ -105,6 +110,7 @@ function fixture() {
     return [];
   };
   tx.$executeRawUnsafe = async (sql: string) => { queries.push(sql); if (sql.startsWith("SAVEPOINT")) saved = structuredClone(state); if (sql.startsWith("ROLLBACK TO")) state = structuredClone(saved!); };
+  tx.$executeRaw = async (strings: TemplateStringsArray) => { queries.push(strings.join("?")); };
   async function withTenant<T>(_tenantId: string, fn: (tx: any) => Promise<T>): Promise<T> {
     const pending = tail; let release!: () => void; tail = new Promise<void>(resolve => release = resolve); await pending;
     const before = structuredClone(state);
@@ -118,21 +124,93 @@ function fixture() {
       if (old) return { ok: false, sessionId: old.id };
       return { ok: true, session: await tx.cashSession.create({ data: { tenantId, ...b, openedAt: b.occurredAt } }) };
     },
-    async closeSessionTx(tx: Row, tenantId: string, b: Row) {
-      const s = await tx.cashSession.findFirst({ where: { tenantId, id: b.sessionId } }); assert.ok(s);
-      if (s.status === "CLOSED") return { ok: true, report: s, alreadyClosed: true };
-      await tx.cashSession.update({ where: { id: s.id }, data: { status: "CLOSED", closingCountedXpf: b.closingCountedXpf, expectedXpf: s.openingFloatXpf } });
-      return { ok: true, report: s, alreadyClosed: false };
-    },
+    closeSessionTx: caisseFunction("closeSessionTx", { ...movements, ...gifts, ...reports }),
   };
   const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection });
   const shared = load("cash-shared-data.ts", { "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
   const sales = load("cash-day-sales.ts", { "./cash-day-ledger": ledger, "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
-  return { tx, sync, ledger, days, shared, sales, withTenant, rows: (name: string) => structuredClone(state[name]), queries };
+  return { tx, sync, ledger, days, shared, sales, native, withTenant, rows: (name: string) => structuredClone(state[name]), queries };
 }
 function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open-a", entityKey: "day", deviceId: "A", deviceName: "Synthétique A", occurredAt: now.toISOString(),
   actorId: actor, actorName: "Opérateur synthétique", receivedById: actor, businessDay: "2026-10-15", localSessionKey: "local-A", sourceKey: "opening-A", openingFloatXpf: "25000", ...overrides }; }
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
+
+test("avoir J+1 sur vente J : Z 26000 puis 24800, origine acceptée et rejeu sans doublon", async () => {
+  for (const explicitDate of [true, false]) {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const first = f.rows("cashDay")[0].id, tomorrow = "2026-10-16T01:00:00.000Z";
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "yesterday",
+      status: "PAID", paidAt: now, totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+    await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+      createdAt: new Date(tomorrow), input: { refundMethod: "CASH", ...(explicitDate ? { occurredAt: tomorrow } : {}) }, plan: { amountXpf: 200, parTaux: [] } } });
+    const attach = input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "yesterday" }] });
+    await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, first, attach));
+    const c = input({ sourceKey: "close-J", cycle: 0, closureMode: "ONLINE", countedXpf: "26000", localExpectedXpf: "26000", localVarianceXpf: "0" });
+    await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, first, c));
+    await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input({ businessDay: "2026-10-16", occurredAt: tomorrow,
+      sourceKey: "opening-J+1", localSessionKey: "local-J+1" })));
+    const second = f.rows("cashDay")[1].id;
+    // L'import du jour trouve l'avoir même sans origine de vente fournie.
+    await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, second, input({ cycle: 0 })));
+    for (let i = 0; i < 2; i++) await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, second, attach));
+    for (const [id, expected] of [[first, 26000n], [second, 24800n]] as const) {
+      const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+      assert.equal(page.projection.totauxCourants.expectedXpf, expected);
+    }
+    assert.equal(f.rows("sale")[0].cashDayId, first);
+    assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 1);
+    assert.equal(f.rows("cashDayEvent").find(e => e.kind === "PARTIAL_REFUND_DONE")!.cashDayId, second);
+  }
+});
+
+test("clôture CashDay : ledger 25800 avec avoir 200, théorique persisté et écart zéro", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "close-refund",
+    status: "PAID", paidAt: now, totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+    input: { refundMethod: "CASH" }, plan: { amountXpf: 200, parTaux: [] } } });
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "close-refund" }] })));
+  const c = input({ sourceKey: "close", cycle: 0, closureMode: "ONLINE", countedXpf: "25800", localExpectedXpf: "25800", localVarianceXpf: "0" });
+  const result = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, id, c));
+  assert.equal(result.report.expectedXpf, 25800); assert.equal(result.report.varianceXpf, 0);
+  const session = f.rows("cashSession")[0];
+  assert.equal(session.expectedXpf, 25800n); assert.equal(session.varianceXpf, 0n);
+  await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, id, c));
+  const native = await f.withTenant(tenant, (tx: Row) => f.native.closeSessionTx(tx, tenant, { sessionId: session.id, closingCountedXpf: 0n }));
+  assert.equal(native.report.expectedXpf, 25800); assert.equal(native.report.varianceXpf, 0);
+  const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+  assert.equal(page.projection.ecartZ, 0n);
+});
+
+test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000, rejeu sans doublon", async () => {
+  for (const beforeImport of [false, true]) {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const id = f.rows("cashDay")[0].id;
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: beforeImport ? null : id,
+      sourceType: "synthetic", sourceId: "corrected", status: "PAID", paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now,
+      totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
+    if (!beforeImport) await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger,
+      lockSaleRow: async () => true, comptaClient: () => ({ paymentCorrection: async () => ({ ok: true }) }),
+      runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
+    });
+    const b = { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 };
+    const results = await Promise.all([correct(tenant, b), correct(tenant, b)]);
+    assert.ok(results.every(r => r.ok)); assert.ok(results.some(r => r.alreadyCorrected));
+    const attach = input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "corrected" }] });
+    for (let i = 0; i < 2; i++) await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, attach));
+    const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+    assert.equal(f.rows("cashSession")[0].status, "OPEN");
+    assert.equal(page.projection.totauxCourants.expectedXpf, 25000n);
+    assert.equal(page.projection.totauxCourants.byMethod.CASH, 0n);
+    assert.equal(page.projection.totauxCourants.byMethod.CARD, 1000n);
+    assert.equal(page.projection.totauxCourants.totalSalesXpf, 1000n);
+    assert.equal(f.rows("sale")[0].payments.length, 3);
+    assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "SALE_PAID").length, 1);
+    assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PAYMENT_CORRECTION").length, 1);
+  }
+});
 
 test("import : avoir espèces existant, théorique 25 800, complément et rejeu sans doublon", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
