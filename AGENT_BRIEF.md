@@ -487,7 +487,8 @@ historique).
 - v1 sans remise globale (le total = somme des lignes ; une remise = ligne OTHER négative).
 - Reçu = endpoint Compta (pas de PDF local) → zéro duplication du moteur de rendu.
 
-## Dernières actions
+## Dernières actions
+- 16/10 : lecture `GET /api/cash-days/legacy/pending-closures` (sessions historiques rattachées, CLOSED, sans Z importé ; curseur exclusif closedAt/id, limit 1-200) pour que la reprise de la Rôtisserie retrouve un Z dont l'import a échoué après le rattachement. Lecture seule, 759 tests.
 
 - `2026-10-16` — Lot L4, quatorzième correctif (`bf7e2a3`) : posteId texte libre, références dérivées depuis l'id stocké. 733 tests. Non fusionné.
 - `2026-10-16` — Lot L4 VALIDÉ : 15ᵉ relecture GPT = APPROVE ; posteId exact aussi à l'import de clôture (`491151f`). 734 tests. Non fusionné, non déployé.

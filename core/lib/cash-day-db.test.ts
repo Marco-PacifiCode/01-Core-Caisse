@@ -65,6 +65,8 @@ function fixture(enforceDayBeforeSale = false) {
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
       if (k === "currentSession") return match(state.cashSession.find(s => s.id === row.currentSessionId) ?? {}, v);
+      if (k === "session" && row.sessionId) return match(state.cashSession.find(s => s.id === row.sessionId && s.tenantId === row.tenantId) ?? {}, v);
+      if (k === "cashDay" && row.cashDayId) return match(state.cashDay.find(d => d.id === row.cashDayId && d.tenantId === row.tenantId) ?? {}, v);
       if (k === "canonicalDays" || k === "currentDays" || k === "dayAliases") {
         const related = k === "dayAliases" ? state.cashDaySession.filter(d => d.sessionId === row.id)
           : state.cashDay.filter(d => d[k === "canonicalDays" ? "canonicalSessionId" : "currentSessionId"] === row.id);
@@ -76,7 +78,7 @@ function fixture(enforceDayBeforeSale = false) {
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
         op === "lte" ? row[k] <= n! : op === "lt" ? row[k] < n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : op === "notIn" ? !(n as unknown[]).includes(row[k]) : false);
-      return row[k] === v;
+      return row[k] instanceof Date && v instanceof Date ? row[k].getTime() === v.getTime() : row[k] === v;
     });
   }
   const tx: Row = {};
@@ -93,6 +95,10 @@ function fixture(enforceDayBeforeSale = false) {
       if (include.events) out.events = structuredClone(state.cashDayEvent.filter(e => e.cashDayId === row.id && match(e, include.events.where))
         .sort((a, b) => a.sequence > b.sequence ? -1 : a.sequence < b.sequence ? 1 : 0).slice(0, include.events.take));
     }
+    if (name === "cashDaySession" && include) {
+      out.cashDay = structuredClone(state.cashDay.find(d => d.tenantId === row.tenantId && d.id === row.cashDayId));
+      out.session = structuredClone(state.cashSession.find(s => s.tenantId === row.tenantId && s.id === row.sessionId));
+    }
     if (name === "sale" && include?.session) out.session = structuredClone(state.cashSession.find(s => s.id === row.sessionId) ?? null);
     return out;
   }
@@ -105,8 +111,13 @@ function fixture(enforceDayBeforeSale = false) {
       async findFirstOrThrow(args: Row) { return this.findUniqueOrThrow(args); },
       async findMany({ where, orderBy, take, include, select }: Row = {}) {
         let rows = state[name].filter(r => match(r, where));
-        const sort = Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : [];
-        rows.sort((a, b) => { for (const item of sort) for (const [k, direction] of Object.entries(item)) if (a[k] !== b[k]) return (a[k] < b[k] ? -1 : 1) * (direction === "desc" ? -1 : 1); return 0; });
+      const sort = Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : [];
+        rows.sort((a, b) => { for (const item of sort) for (const [k, direction] of Object.entries(item)) {
+          const left = name === "cashDaySession" && k === "session" ? state.cashSession.find(s => s.tenantId === a.tenantId && s.id === a.sessionId)?.closedAt : a[k];
+          const right = name === "cashDaySession" && k === "session" ? state.cashSession.find(s => s.tenantId === b.tenantId && s.id === b.sessionId)?.closedAt : b[k];
+          const leftValue = left instanceof Date ? left.getTime() : left, rightValue = right instanceof Date ? right.getTime() : right;
+          if (leftValue !== rightValue) return (leftValue < rightValue ? -1 : 1) * (direction === "desc" ? -1 : 1);
+        } return 0; });
         return (take ? rows.slice(0, take) : rows).map(row => {
           const out = view(name, row, include);
           return select ? Object.fromEntries(Object.keys(select).map(k => [k, out[k]])) : out;
@@ -372,6 +383,59 @@ test("GET legacy : jours croissants UTC+11, exclusions canonique/courante/alias/
   assert.equal((await get("&cursor=2026-10-16")).body.days.length, 0);
   assert.equal((await get("", actor)).body.days.length, 0);
   assert.equal(f.queries.length, queryCount);
+});
+
+test("GET legacy pending-closures : sessions CLOSED rattachées sans Z, ordre/cursor exclusif et validations", async () => {
+  const f = fixture();
+  const day = await f.tx.cashDay.create({ data: { tenantId: tenant, businessDay: "2026-10-15", cycle: 2 } });
+  const make = async (closedAt: string, status = "CLOSED", tenantId = tenant) => {
+    const session = await f.tx.cashSession.create({ data: { tenantId, status, openedAt: now, closedAt: new Date(closedAt),
+      openingFloatXpf: 500n, closingCountedXpf: 600n, expectedXpf: 550n, varianceXpf: 50n } });
+    return session;
+  };
+  const three = await make("2026-10-15T03:00:00Z"), one = await make("2026-10-15T02:00:00Z"), two = await make("2026-10-15T03:00:00Z");
+  const open = await make("2026-10-15T04:00:00Z", "OPEN");
+  const unattached = await make("2026-10-15T05:00:00Z");
+  const foreign = await make("2026-10-15T06:00:00Z", "CLOSED", tenantB);
+  for (const session of [one, two, three, open]) await f.tx.cashDaySession.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: session.id, cycle: 1 } });
+  await f.tx.cashDaySession.create({ data: { tenantId: tenantB, cashDayId: day.id, sessionId: foreign.id, cycle: 0 } });
+  const route = api(f, "cash-days/legacy/pending-closures/route.ts", {});
+  const get = (suffix = "", id = tenant.toUpperCase()) => route.GET({ url: `http://test/api?tenantId=${id}${suffix}` });
+  const before = f.rows("cashDaySession"), queryCount = f.queries.length;
+  const first = await get("&limit=2");
+  assert.equal(first.status, 200);
+  assert.deepEqual(Array.from(first.body.items, (x: Row) => x.session.id), [one.id, three.id]);
+  assert.equal(first.body.items[0].cashDayId, day.id);
+  assert.equal(first.body.items[0].businessDay, "2026-10-15");
+  assert.equal(first.body.items[0].cycle, 2);
+  assert.equal(first.body.items[0].session.openingFloatXpf, "500");
+  assert.equal(first.body.nextCursor, three.id);
+  const second = await get(`&limit=2&cursor=${three.id}`);
+  assert.deepEqual(Array.from(second.body.items, (x: Row) => x.session.id), [two.id]);
+  assert.equal(second.body.nextCursor, null);
+  const g = fixture();
+  await g.days.openCashDay(g.tx, input());
+  const liveDay = g.rows("cashDay")[0];
+  const legacy = await g.tx.cashSession.create({ data: { tenantId: tenant, status: "CLOSED", openedAt: now,
+    closedAt: new Date("2026-10-15T02:00:00Z"), openingFloatXpf: 500n } });
+  await g.days.attachLegacy(g.tx, liveDay.id, input({ sessionIds: [legacy.id], cycle: 0 }));
+  await g.days.closeCashDay(g.tx, liveDay.id, input({ sourceKey: "legacy-z", cycle: 0, closureMode: "IMPORT",
+    countedXpf: "600", localExpectedXpf: "550", localVarianceXpf: "50", legacySessionId: legacy.id,
+    legacySnapshot: { knownSourceRefs: [] } }));
+  const closedRoute = api(g, "cash-days/legacy/pending-closures/route.ts", {});
+  const closed = await closedRoute.GET({ url: `http://test/api?tenantId=${tenant}` });
+  assert.equal(closed.body.items.some((item: Row) => item.session.id === legacy.id), false);
+  assert.deepEqual((await get("", actor)).body.items, []);
+  for (const suffix of ["limit=0", "limit=-1", "limit=1.5", "limit=", "limit=x", "limit=201"])
+    assert.equal((await get(`&${suffix}`)).status, 400, suffix);
+  const unknownCursor = await get(`&cursor=${"ff000000-0000-0000-0000-000000000000"}`);
+  assert.equal(unknownCursor.status, 400);
+  assert.equal(unknownCursor.body.error, "INVALID_CURSOR");
+  const otherTenantCursor = await get(`&cursor=${foreign.id}`);
+  assert.equal(otherTenantCursor.status, 400);
+  assert.equal(otherTenantCursor.body.error, "INVALID_CURSOR");
+  assert.equal(f.queries.length, queryCount, "aucune requête de verrouillage");
+  assert.deepEqual(f.rows("cashDaySession"), before);
 });
 
 test("GET legacy : plafond commun 200, more et comptage sans source non tronqué", async () => {

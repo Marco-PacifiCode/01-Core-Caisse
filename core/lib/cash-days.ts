@@ -136,6 +136,46 @@ export async function listLegacyCashDays(tx: CashTx, tenantId: string, q: URLSea
   }
   return { days, nextCursor: null };
 }
+
+export async function listPendingLegacyClosures(tx: CashTx, tenantId: string, q: URLSearchParams) {
+  tenantId = uuid(tenantId);
+  const raw = q.get("limit");
+  requireCash(raw === null || /^[0-9]+$/.test(raw));
+  const limit = raw === null ? 100 : Number(raw);
+  requireCash(Number.isSafeInteger(limit) && limit >= 1 && limit <= 200);
+  const cursor = q.has("cursor") ? uuid(q.get("cursor")) : null;
+  let after: { closedAt: Date; id: string } | null = null;
+  if (cursor) {
+    const session = await tx.cashSession.findFirst({ where: { tenantId, id: cursor }, select: { id: true, closedAt: true } });
+    requireCash(session?.closedAt, "INVALID_CURSOR");
+    after = { closedAt: session.closedAt, id: session.id };
+  }
+  const pending: Array<{ cashDayId: string; businessDay: string; cycle: number; session: Record<string, unknown> }> = [];
+  let scanAfter = after;
+  while (pending.length <= limit) {
+    const aliases = await tx.cashDaySession.findMany({ where: { tenantId,
+      session: { tenantId, status: "CLOSED", closedAt: { not: null }, ...(scanAfter ? { OR: [
+        { closedAt: { gt: scanAfter.closedAt } }, { AND: [{ closedAt: scanAfter.closedAt }, { id: { gt: scanAfter.id } }] },
+      ] } : {}) }, cashDay: { tenantId } },
+      orderBy: [{ session: { closedAt: "asc" } }, { sessionId: "asc" }], take: 201,
+      include: { cashDay: { select: { id: true, businessDay: true, cycle: true } }, session: { select: {
+        id: true, status: true, sourceType: true, sourceId: true, openedAt: true, closedAt: true,
+        openingFloatXpf: true, closingCountedXpf: true, expectedXpf: true, varianceXpf: true,
+      } } } });
+    if (!aliases.length) break;
+    for (const alias of aliases) {
+      scanAfter = { closedAt: alias.session.closedAt!, id: alias.session.id };
+      if (await tx.cashDayClosure.findFirst({ where: { tenantId, cashDayId: alias.cashDayId, legacySessionId: alias.sessionId } })) continue;
+      pending.push({ cashDayId: alias.cashDay.id, businessDay: alias.cashDay.businessDay, cycle: alias.cashDay.cycle,
+        session: { id: alias.session.id, status: alias.session.status, sourceType: alias.session.sourceType, sourceId: alias.session.sourceId,
+          openedAt: alias.session.openedAt, closedAt: alias.session.closedAt, openingFloatXpf: alias.session.openingFloatXpf,
+          closingCountedXpf: alias.session.closingCountedXpf, expectedXpf: alias.session.expectedXpf, varianceXpf: alias.session.varianceXpf } });
+      if (pending.length > limit) break;
+    }
+    if (pending.length > limit || aliases.length < 201) break;
+  }
+  return { items: pending.slice(0, limit), nextCursor: pending.length > limit ? pending[limit - 1].session.id : null };
+}
 export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput) {
   cashDayId = uuid(cashDayId); b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
