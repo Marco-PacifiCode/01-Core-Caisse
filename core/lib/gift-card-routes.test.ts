@@ -79,7 +79,9 @@ function corpsCancelGiftCard(): string {
   return exportBody(caisseSrc(), "cancelGiftCard");
 }
 function corpsCloseSession(): string {
-  return exportBody(caisseSrc(), "closeSession");
+  const source = caisseSrc();
+  assert.match(exportBody(source, "closeSession("), /withTenant\(tenantId, tx => closeSessionTx\(tx, tenantId, input\)\)/);
+  return exportBody(source, "closeSessionTx");
 }
 function corpsCheckoutSale(): string {
   return exportBody(caisseSrc(), "checkoutSale");

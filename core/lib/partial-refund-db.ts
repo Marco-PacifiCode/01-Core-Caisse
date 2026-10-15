@@ -10,6 +10,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
   lockSale(tx: Tx): Promise<boolean>;
   lockAction(tx: Tx): Promise<void>;
   compta: ComptaClient;
+  recordDrawer?(tx: Tx, action: { id: string }, plan: RefundPlan): Promise<void>;
 }): Promise<RefundResult> {
   const key = { tenantId_actionId: { tenantId, actionId: input.actionId } };
   const readExisting = async (tx: Tx): Promise<RefundReservation | ReturnType<typeof refuse> | null> => {
@@ -55,6 +56,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (coreDrawer && !session) return refuse("NO_OPEN_SESSION");
         if (coreDrawer && await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } })) return refuse("REFUND_REF_CONFLICT");
         await tx.partialRefund.create({ data: { tenantId, saleId, actionId: input.actionId, sessionId: session?.id,
+          ...(input.cashDayId ? { cashDayId: input.cashDayId, drawerBusinessDay: input.drawerBusinessDay, deviceId: input.deviceId } : {}),
           input: input as unknown as Prisma.InputJsonValue, plan: plan as unknown as Prisma.InputJsonValue } });
         return { input, plan };
       });
@@ -90,6 +92,10 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
           ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}), plan: reservation.plan,
           doneAt: new Date().toISOString(), ...(saleChanged ? { saleChanged: true as const } : {}) };
         await tx.partialRefund.update({ where: key, data: { status: "DONE", creditNoteId, outcome: outcome as unknown as Prisma.InputJsonValue } });
+        if (input.cashDayId && deps.recordDrawer) {
+          const action = await tx.partialRefund.findUniqueOrThrow({ where: key });
+          await deps.recordDrawer(tx, action, reservation.plan);
+        }
         if (reservation.plan.fullyRefunded && !saleChanged) await tx.sale.update({ where: { id: saleId }, data: { fullyRefundedAt: new Date() } });
         return outcome;
       });

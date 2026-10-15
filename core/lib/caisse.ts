@@ -75,6 +75,8 @@ import {
 } from "./loyalty-db";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 import { annulerInscription, inscrirePosteEnLigne } from "./postes";
+import { appendDayFact, consumePickupOrder, lockDay, lockSharedSale, prepareSharedCheckout, recordSharedGift, recordSharedSale } from "./cash-day-ledger";
+import { ackFinancial } from "./caisse-sync";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
@@ -92,6 +94,7 @@ type OpenSessionInput = {
   /** Poste (caisse physique) qui ouvre. Omis = marchand mono-caisse :
    *  comportement d'origine, une seule session ouverte pour tout le tenant. */
   posteId?: string | null;
+  occurredAt?: Date;
 };
 
 /**
@@ -117,8 +120,12 @@ export async function openSession(tenantId: string, input: OpenSessionInput) {
 }
 
 async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
+  return withTenant(tenantId, tx => openSessionTx(tx, tenantId, input));
+}
+
+/** Variante interne L4 : la transaction et son verrou sont détenus par le gestionnaire de journée. */
+export async function openSessionTx(tx: Prisma.TransactionClient, tenantId: string, input: OpenSessionInput) {
   const posteId = input.posteId ?? null;
-  return withTenant(tenantId, async (tx) => {
     // Une seule session OPEN à la fois PAR POSTE (2026-08-15). Sans poste, la
     // règle reste identique à avant : une seule pour le marchand.
     const existing = await tx.cashSession.findFirst({
@@ -136,6 +143,7 @@ async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
           openingFloatXpf: input.openingFloatXpf,
           note: input.note ?? null,
           posteId,
+          ...(input.occurredAt ? { openedAt: input.occurredAt } : {}),
         },
       });
       return { ok: true as const, session };
@@ -155,7 +163,6 @@ async function ouvrirSession(tenantId: string, input: OpenSessionInput) {
       }
       throw e;
     }
-  });
 }
 
 /** Session OPEN courante du tenant (ou null). */
@@ -220,7 +227,13 @@ export async function closeSession(
   tenantId: string,
   input: { sessionId: string; closedBy: string; closedByName?: string; closingCountedXpf: bigint },
 ): Promise<{ ok: false; error: "SESSION_NOT_FOUND" } | { ok: true; report: ZReport; alreadyClosed: boolean }> {
-  return withTenant(tenantId, async (tx) => {
+  return withTenant(tenantId, tx => closeSessionTx(tx, tenantId, input));
+}
+
+export async function closeSessionTx(
+  tx: Prisma.TransactionClient, tenantId: string,
+  input: { sessionId: string; closedBy: string; closedByName?: string; closingCountedXpf: bigint },
+): Promise<{ ok: false; error: "SESSION_NOT_FOUND" } | { ok: true; report: ZReport; alreadyClosed: boolean }> {
     // Sérialise le Z avec la finalisation d'un REFUND: lecture après le verrou.
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${"3s"}, true)`;
     await tx.$queryRaw`SELECT "id" FROM "CashSession" WHERE "id" = ${input.sessionId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
@@ -351,7 +364,6 @@ export async function closeSession(
       alreadyClosed: false,
       report: buildReport(input.closingCountedXpf, variance, expected),
     };
-  });
 }
 
 // ─── Import de clôture Z hors ligne (2026-08-23, Rôtisserie de Pouembout) ───
@@ -591,6 +603,7 @@ export type PaymentInput = {
  * `checkoutSale(tenantId, saleId, payments)` se comporte exactement comme avant PC-0064.
  */
 export type CheckoutOptions = {
+  sharedActionId?: string;
   /**
    * Date RÉELLE de l'encaissement, quand elle diffère de son enregistrement.
    * Pendant du `occurredAt` de `createSale` : une caisse hors ligne remonte des
@@ -1084,6 +1097,11 @@ export async function checkoutSale(
   // Persiste les nouveaux paiements (avec settleRef déterministe) s'il y en a.
   if (toPersist.length > 0) {
     await withTenant(tenantId, async (tx) => {
+      if (sale.cashDayId) {
+        await lockSharedSale(tx, tenantId, saleId);
+        const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
+        if (current.status !== "DRAFT") return;
+      }
       // On (re)crée les paiements uniquement si aucun n'est encore enregistré (évite les doublons au rejeu).
       const already = await tx.salePayment.count({ where: { tenantId, saleId } });
       if (already === 0) {
@@ -1146,6 +1164,7 @@ export async function checkoutSale(
   // base : c'est le lien non ambigu documenté dans loyalty.ts (`GiftCard.saleId`, pas une ligne).
   const giftCardSalesXpf = giftCardsToIssue.reduce((t, g) => t + g.amountXpf, 0n);
   const issued = await withTenant(tenantId, async (tx) => {
+    if (sale.cashDayId && !await prepareSharedCheckout(tx, tenantId, saleId)) return [] as GiftCardIssued[];
     // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
     // Une date future est ignorée plutôt que refusée : le ticket est déjà
     // encaissé au comptoir, on ne bloque pas sa remontée pour une horloge mal
@@ -1165,6 +1184,11 @@ export async function checkoutSale(
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
     await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    if (sale.cashDayId) {
+      await consumePickupOrder(tx, tenantId, saleId);
+      await recordSharedSale(tx, tenantId, saleId);
+      if (options?.sharedActionId) await ackFinancial(tx, tenantId, options.sharedActionId, { id: saleId, saleId, status: "PAID" });
+    }
     // 🔴 LES BONS SE CONSOMMENT ICI, dans la MÊME transaction que le passage à PAID — pour la
     //    raison exactement symétrique de leur création : zéro fenêtre entre « le bon est brûlé »
     //    et « la vente est payée ». L'UPDATE est CONDITIONNEL (`redeemedAt: null`) : s'il rend
@@ -1188,6 +1212,7 @@ export async function checkoutSale(
         race.id = g.id;
         throw new Error("GIFT_CARD_RACE");
       }
+      if (sale.cashDayId) await recordSharedGift(tx, tenantId, sale.cashDayId, g.id, sale.deviceId ?? "legacy", datePaiement);
     }
     if (giftCardsToIssue.length === 0) return [] as GiftCardIssued[];
     const rows: GiftCardIssued[] = [];
@@ -1373,7 +1398,7 @@ export type AnnulerVenteResult =
 export async function annulerVente(
   tenantId: string,
   saleId: string,
-  opts?: { reason?: string; actionId?: string },
+  opts?: { reason?: string; actionId?: string; sharedActionId?: string },
 ): Promise<AnnulerVenteResult> {
   const safeTenantId = assertTenantId(tenantId);
   const actionId = opts?.actionId?.toLowerCase();
@@ -1385,6 +1410,7 @@ export async function annulerVente(
     const persist: VoidPersist = {
       async markVoid(creditNoteId, prepared) {
         return withTenant(safeTenantId, async (tx) => {
+          await lockSharedSale(tx, safeTenantId, saleId);
           if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
           const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
           if (!current) throw new Error("SALE_NOT_FOUND");
@@ -1405,6 +1431,8 @@ export async function annulerVente(
           const retry = checkVoidSnapshot(current, prepared);
           if (retry) return retry;
           await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
+          if (current.cashDayId) await recordSharedSale(tx, safeTenantId, saleId);
+          if (current.cashDayId && opts?.sharedActionId) await ackFinancial(tx, safeTenantId, opts.sharedActionId, { id: saleId, saleId, status: "VOID", creditNoteId });
           if (sale.status === "PAID") {
             await reverseSaleLoyalty(tx, { tenantId, saleId });
           }
@@ -1419,6 +1447,7 @@ export async function annulerVente(
     return await runPreparedVoidSale({
       async prepare() {
         return withTenant(safeTenantId, async (tx) => {
+          await lockSharedSale(tx, safeTenantId, saleId);
           if (actionId) await lockVoidResource(tx, safeTenantId, 'action:' + actionId);
           if (!await lockSaleRow(tx, saleId, safeTenantId)) return { error: "SALE_NOT_FOUND" as const };
           const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
@@ -1459,7 +1488,24 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
   return partialRefundWithPorts(safeTenantId, saleId, normalized, {
     transact: fn => withTenant(safeTenantId, fn),
     lockAction: tx => lockVoidResource(tx, safeTenantId, "partial-action:" + normalized.actionId),
-    lockSale: tx => lockSaleRow(tx, saleId, safeTenantId),
+    lockSale: async tx => {
+      if (normalized.cashDayId) {
+        const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
+        if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
+      }
+      await lockSharedSale(tx, safeTenantId, saleId);
+      return lockSaleRow(tx, saleId, safeTenantId);
+    },
+    recordDrawer: async (tx, action, plan) => {
+      if (!normalized.cashDayId) return;
+      const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
+      if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
+      await appendDayFact(tx, safeTenantId, day.id, { kind: "PARTIAL_REFUND_DONE", sourceRef: normalized.actionId,
+        refundActionId: action.id, deviceId: normalized.deviceId!, occurredAt: new Date(normalized.occurredAt!),
+        snapshot: { payments: [{ method: normalized.refundMethod, amountXpf: String(plan.amountXpf) }],
+          parTaux: plan.parTaux.map(t => ({ tgcRatePpm: t.tgcRatePpm, htXpf: String(t.htXpf), tgcXpf: String(t.tgcXpf), ttcXpf: String(t.ttcXpf) })) } });
+      await ackFinancial(tx, safeTenantId, normalized.actionId, { id: action.id, actionId: normalized.actionId, amountXpf: String(plan.amountXpf) });
+    },
     compta: comptaClient(),
   });
 }
