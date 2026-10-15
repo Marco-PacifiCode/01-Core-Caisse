@@ -98,10 +98,14 @@ export async function listLegacyCashDays(tx: CashTx, tenantId: string, q: URLSea
   while (days.length <= limit) {
     const session = await tx.cashSession.findFirst({ where: { ...sessionWhere, ...(since ? { openedAt: { gte: since } } : {}) },
       orderBy: [{ openedAt: "asc" }, { id: "asc" }], select: { openedAt: true } });
-    const sale = await tx.sale.findFirst({ where: { ...saleWhere, ...(since ? { createdAt: { gte: since } } : {}) },
+    // Jour d'une vente = paidAt ?? createdAt, même règle que attachLegacy (sinon DAY_MISMATCH).
+    const paid = await tx.sale.findFirst({ where: { ...saleWhere, paidAt: since ? { not: null, gte: since } : { not: null } },
+      orderBy: [{ paidAt: "asc" }, { id: "asc" }], select: { paidAt: true } });
+    const unpaid = await tx.sale.findFirst({ where: { ...saleWhere, paidAt: null, ...(since ? { createdAt: { gte: since } } : {}) },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }], select: { createdAt: true } });
-    if (!session && !sale) break;
-    const firstAt = !sale || session && session.openedAt <= sale.createdAt ? session!.openedAt : sale.createdAt;
+    const saleAt = [paid?.paidAt, unpaid?.createdAt].filter((at): at is Date => !!at).sort((x, y) => x.getTime() - y.getTime())[0];
+    if (!session && !saleAt) break;
+    const firstAt = !saleAt || session && session.openedAt <= saleAt ? session!.openedAt : saleAt;
     const business = businessDay(firstAt);
     if (days.length === limit) return { days, nextCursor: days[days.length - 1].businessDay };
     const gte = startOf(business), lt = new Date(gte.getTime() + 86400000);
@@ -109,17 +113,19 @@ export async function listLegacyCashDays(tx: CashTx, tenantId: string, q: URLSea
       orderBy: [{ openedAt: "asc" }, { id: "asc" }], take: 201,
       select: { id: true, status: true, sourceType: true, sourceId: true, openedAt: true, closedAt: true,
         openingFloatXpf: true, closingCountedXpf: true, expectedXpf: true, varianceXpf: true } });
-    const origins = await tx.sale.findMany({ where: { ...saleWhere, createdAt: { gte, lt },
+    const ofDay = { OR: [{ paidAt: { gte, lt } }, { paidAt: null, createdAt: { gte, lt } }] };
+    const origins = (await tx.sale.findMany({ where: { ...saleWhere, ...ofDay,
       sourceType: { not: null, notIn: [""] }, sourceId: { not: null, notIn: [""] } },
-      orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: 201,
-      select: { id: true, sourceType: true, sourceId: true, status: true, totalXpf: true, createdAt: true } });
-    const salesWithoutSource = await tx.sale.count({ where: { ...saleWhere, createdAt: { gte, lt },
-      OR: [{ sourceType: null }, { sourceId: null }, { sourceType: "" }, { sourceId: "" }] } });
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: { id: true, sourceType: true, sourceId: true, status: true, totalXpf: true, createdAt: true, paidAt: true } }))
+      .sort((x, y) => (x.paidAt ?? x.createdAt).getTime() - (y.paidAt ?? y.createdAt).getTime() || x.id.localeCompare(y.id)).slice(0, 201);
+    const salesWithoutSource = await tx.sale.count({ where: { ...saleWhere, AND: [ofDay,
+      { OR: [{ sourceType: null }, { sourceId: null }, { sourceType: "" }, { sourceId: "" }] }] } });
     const day = await tx.cashDay.findUnique({ where: { tenantId_scope_businessDay: { tenantId, scope: "rotisserie-caisse", businessDay: business } }, select: { id: true } });
     // Plafond commun sessions + origines, avec un ordre stable entre les deux listes.
     const entries = [
       ...sessions.map(s => ({ kind: "session", id: s.id, at: s.openedAt })),
-      ...origins.map(s => ({ kind: "origin", id: s.id, at: s.createdAt })),
+      ...origins.map(s => ({ kind: "origin", id: s.id, at: s.paidAt ?? s.createdAt })),
     ].sort((a, b) => a.at.getTime() - b.at.getTime() || a.id.localeCompare(b.id) || a.kind.localeCompare(b.kind));
     const visible = new Set(entries.slice(0, 200).map(e => `${e.kind}:${e.id}`));
     days.push({ businessDay: business, cashDayId: day?.id ?? null,

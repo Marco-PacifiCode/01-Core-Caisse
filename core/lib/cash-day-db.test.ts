@@ -72,6 +72,7 @@ function fixture(enforceDayBeforeSale = false) {
       }
       if (k === "payments") return !!state.sale.find(s => s.id === row.id)?.payments?.length;
       if (k === "OR") return v.some((w: Row) => match(row, w));
+      if (k === "AND") return v.every((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
         op === "lte" ? row[k] <= n! : op === "lt" ? row[k] < n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : op === "notIn" ? !(n as unknown[]).includes(row[k]) : false);
@@ -355,14 +356,20 @@ test("GET legacy : jours croissants UTC+11, exclusions canonique/courante/alias/
   assert.equal(response.body.days[0].cashDayId, null);
   assert.equal(response.body.nextCursor, "2026-10-14");
   const last = await get(`&limit=2&cursor=${response.body.nextCursor}`);
-  assert.equal(last.body.days.length, 1); assert.equal(last.body.nextCursor, null);
+  assert.equal(last.body.days.length, 2); assert.equal(last.body.nextCursor, null);
   const entry = last.body.days[0];
   assert.equal(entry.businessDay, "2026-10-15"); assert.equal(entry.cashDayId, day.id);
   assert.deepEqual(Array.from(entry.sessions, (s: Row) => s.id), [allSessions[2].id]);
-  assert.deepEqual(Array.from(entry.origins, (s: Row) => s.saleId), [sale.id]);
-  assert.equal(entry.origins[0].totalXpf, "1200"); assert.equal(entry.salesWithoutSource, 3); assert.equal(entry.more, false);
-  assert.equal((await get()).body.days.length, 3);
-  assert.equal((await get("&cursor=2026-10-15")).body.days.length, 0);
+  assert.deepEqual(Array.from(entry.origins, (s: Row) => s.saleId), []);
+  assert.equal(entry.salesWithoutSource, 3); assert.equal(entry.more, false);
+  // Créée le 15, payée le 16 : rangée au jour de paiement, comme attachLegacy (paidAt ?? createdAt).
+  const paidDay = last.body.days[1];
+  assert.equal(paidDay.businessDay, "2026-10-16"); assert.equal(paidDay.cashDayId, null);
+  assert.deepEqual(Array.from(paidDay.origins, (s: Row) => s.saleId), [sale.id]);
+  assert.equal(paidDay.origins[0].totalXpf, "1200"); assert.equal(paidDay.salesWithoutSource, 0);
+  assert.equal((await get()).body.days.length, 4);
+  assert.equal((await get("&cursor=2026-10-15")).body.days.length, 1);
+  assert.equal((await get("&cursor=2026-10-16")).body.days.length, 0);
   assert.equal((await get("", actor)).body.days.length, 0);
   assert.equal(f.queries.length, queryCount);
 });
