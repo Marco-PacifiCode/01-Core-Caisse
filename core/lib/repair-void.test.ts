@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, shouldWriteSyncError, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
 import { CoreClientError } from "./clients.ts";
 import type { ComptaClient, StockClient } from "./clients.ts";
 
@@ -12,9 +12,9 @@ function fixture() {
     lines: [{ id: "line-test", kind: "PRODUCT", label: "Produit test", productId: "product-test", qty: 1, unitXpf: 1000n }],
     payments: [{ id: "payment-test", method: "CASH", amountXpf: 1000n, settleRef: null }],
   };
-  const db = { sale: structuredClone(photo) as SyncSaleSnapshot | null };
+  const db = { sale: structuredClone(photo) as SyncSaleSnapshot | null, syncAttempts: 0 };
   const calls = { createInvoice: 0, settle: 0, recordSale: 0, creditNote: 0, recordFailure: 0, clearError: 0 };
-  const hooks: { create?: () => void; saved?: () => void; creditFailure?: CoreClientError } = {};
+  const hooks: { create?: () => void; saved?: () => void; settle?: () => void; recordSale?: () => void; creditFailure?: CoreClientError } = {};
   const credits: string[] = [];
   const guard: SyncGuard = {
     async reread() { return db.sale ? structuredClone(db.sale) : null; },
@@ -44,8 +44,15 @@ function fixture() {
     async saveInvoiceRef() { assert.fail("Le chemin gardé doit écrire via le garde"); },
     async markComptaSynced() { db.sale!.comptaSyncedAt = new Date(); },
     async markStockSynced() { db.sale!.stockSyncedAt = new Date(); },
-    async recordFailure(detail) { calls.recordFailure++; db.sale!.syncError = detail; },
-    async clearError() { calls.clearError++; db.sale!.syncError = null; },
+    async recordFailure(detail) {
+      calls.recordFailure++;
+      db.syncAttempts++;
+      if (shouldWriteSyncError(db.sale!.syncError, detail)) db.sale!.syncError = detail;
+    },
+    async clearError() {
+      calls.clearError++;
+      if (shouldWriteSyncError(db.sale!.syncError, null)) db.sale!.syncError = null;
+    },
   };
   const compta: ComptaClient = {
     async createInvoice() {
@@ -53,7 +60,7 @@ function fixture() {
       hooks.create?.();
       return { invoiceId: "invoice-test", number: "FAC-TEST", totalXpf: 1000, alreadyExisted: false };
     },
-    async settle() { calls.settle++; return { ok: true, invoiceId: "invoice-test", paid: 1000, remaining: 0 }; },
+    async settle() { calls.settle++; hooks.settle?.(); return { ok: true, invoiceId: "invoice-test", paid: 1000, remaining: 0 }; },
     async creditNote(input) {
       calls.creditNote++;
       credits.push(input.invoiceId);
@@ -68,6 +75,7 @@ function fixture() {
   const stock: StockClient = {
     async recordSale() {
       calls.recordSale++;
+      hooks.recordSale?.();
       return { ok: true, movementId: "movement-test", productId: "product-test", qtyOnHand: 0, alreadyExisted: false };
     },
   };
@@ -206,4 +214,60 @@ test("j) facture concurrente différente : arrêt et trace, aucun avoir/règleme
   assert.equal(f.calls.recordSale, 0);
   assert.equal(f.calls.recordFailure, 1);
   assert.match(f.db.sale!.syncError!, /INVOICE_CONFLICT.*invoice-test.*invoice-other/);
+});
+
+test("k) annulation pendant settle : effet comptable marqué et course signalée", async () => {
+  const f = fixture();
+  f.hooks.settle = () => { f.db.sale!.status = "VOID"; };
+  const out = await f.run();
+  assert.equal(f.calls.settle, 1);
+  assert.equal(out.settledOnVoidingSale, true);
+  assert.ok(f.db.sale!.comptaSyncedAt);
+  assert.equal(out.synced, false);
+  assert.equal(out.stopped, "VOID");
+  assert.equal(f.calls.recordSale, 0);
+  assert.equal(f.calls.creditNote, 0);
+});
+
+test("l) annulation pendant recordSale : effet stock marqué et course signalée", async () => {
+  const f = fixture();
+  f.hooks.recordSale = () => { f.db.sale!.status = "VOID"; };
+  const out = await f.run();
+  assert.equal(f.calls.recordSale, 1);
+  assert.equal(out.stockOnVoidingSale, true);
+  assert.ok(f.db.sale!.stockSyncedAt);
+  assert.equal(out.stockDecremented, 1);
+  assert.equal(out.synced, true);
+  assert.equal(f.calls.creditNote, 0);
+});
+
+test("m) persistance : marqueur protégé et tentatives toujours incrémentées", async () => {
+  const f = fixture();
+  const marker = `${NEUTRALISATION_MARKER} avoir en échec`;
+  f.db.sale!.syncError = marker;
+  await f.persist.recordFailure("compta:settle http 500 panne test");
+  assert.equal(f.db.sale!.syncError, marker);
+  assert.equal(f.db.syncAttempts, 1);
+  await f.persist.clearError();
+  assert.equal(f.db.sale!.syncError, marker);
+  assert.equal(f.db.syncAttempts, 1);
+  const detail = `${NEUTRALISATION_MARKER} nouvel échec`;
+  await f.persist.recordFailure(detail);
+  assert.equal(f.db.sale!.syncError, detail);
+  assert.equal(f.db.syncAttempts, 2);
+  assert.equal(shouldWriteSyncError(null, "compta:échec"), true);
+  assert.equal(shouldWriteSyncError(null, null), true);
+  assert.equal(shouldWriteSyncError("compta:échec", null), true);
+  assert.equal(shouldWriteSyncError("compta:échec", "stock:échec"), true);
+});
+
+test("annulation préparée pendant les appels : les deux fenêtres sont signalées", async () => {
+  for (const stage of ["settle", "recordSale"] as const) {
+    const f = fixture();
+    f.hooks[stage] = () => { f.db.sale!.voidPreparedAt = new Date(); };
+    const out = await f.run();
+    assert.equal(out[stage === "settle" ? "settledOnVoidingSale" : "stockOnVoidingSale"], true);
+    assert.ok(stage === "settle" ? f.db.sale!.comptaSyncedAt : f.db.sale!.stockSyncedAt);
+    assert.equal(f.calls.creditNote, 0);
+  }
 });

@@ -91,6 +91,10 @@ export type CoreFailure = {
 };
 
 export const NEUTRALISATION_MARKER = "NEUTRALISATION_EN_ATTENTE";
+/** Une synchro ordinaire ne peut ni remplacer ni effacer une neutralisation en attente. */
+export function shouldWriteSyncError(current: string | null | undefined, detail: string | null): boolean {
+  return !current?.startsWith(NEUTRALISATION_MARKER) || !!detail?.startsWith(NEUTRALISATION_MARKER);
+}
 const NEUTRALISATION_REASON = "Vente annulée pendant la synchro : facture neutralisée";
 
 /** Transactions courtes sous verrou, sans appel réseau. */
@@ -106,6 +110,8 @@ export type SyncGuard = {
 export type SyncOutcome = {
   stopped?: "VOID" | "VOID_IN_PROGRESS" | "NOT_FOUND" | "LOCKED" | "INVOICE_CONFLICT";
   neutralized?: boolean;
+  settledOnVoidingSale?: boolean;
+  stockOnVoidingSale?: boolean;
   synced: boolean;
   invoiceId: string | null;
   invoiceNumber: string | null;
@@ -169,17 +175,24 @@ function stoppedFor(sale: SyncSaleSnapshot | null): SyncOutcome["stopped"] {
   if (sale.voidPreparedAt) return "VOID_IN_PROGRESS";
 }
 
+/**
+ * Relecture sous verrou avant chaque étape ; appels réseau hors verrou.
+ * Facture créée pendant une annulation directe : neutralisation (décision Marco 15/10).
+ * Relecture après règlements et stock, puis marquage de leurs effets externes.
+ * Fenêtres résiduelles signalées par settledOnVoidingSale / stockOnVoidingSale.
+ */
 async function runGuardedSaleSync(
   compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard,
 ): Promise<SyncOutcome> {
   let invoiceId: string | null = null;
   let invoiceNumber: string | null = null;
   let stockDecremented = 0;
+  const races: Pick<SyncOutcome, "settledOnVoidingSale" | "stockOnVoidingSale"> = {};
   const stop = async (stopped: NonNullable<SyncOutcome["stopped"]>): Promise<SyncOutcome> => {
     if (stopped === "VOID_IN_PROGRESS") {
       await persist.recordFailure("VOID_IN_PROGRESS annulation en cours : synchro Compta/Stock suspendue");
     }
-    return { synced: false, failure: null, stopped, invoiceId, invoiceNumber, stockDecremented };
+    return { synced: false, failure: null, stopped, invoiceId, invoiceNumber, stockDecremented, ...races };
   };
   const reread = async () => {
     const cur = await guard.reread();
@@ -227,6 +240,8 @@ async function runGuardedSaleSync(
           amountXpf: Number(p.amountXpf), method: p.method,
           paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
       }
+      const afterSettle = await guard.reread();
+      if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
       await persist.markComptaSynced();
     }
     cur = await reread();
@@ -239,15 +254,17 @@ async function runGuardedSaleSync(
           sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
         stockDecremented++;
       }
+      const afterStock = await guard.reread();
+      if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
       await persist.markStockSynced();
     }
     await persist.clearError();
-    return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented };
+    return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented, ...races };
   } catch (e) {
     const failure = asCoreFailure(e);
     if (!failure) throw e;
     await persist.recordFailure(formatFailure(failure));
-    return { synced: false, failure, invoiceId, invoiceNumber, stockDecremented };
+    return { synced: false, failure, invoiceId, invoiceNumber, stockDecremented, ...races };
   }
 }
 

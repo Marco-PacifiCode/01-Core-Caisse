@@ -37,7 +37,7 @@ import {
   type GiftCardRedeemRefusal,
   type GiftCardRefusal,
 } from "./gift-card";
-import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, shouldWriteSyncError, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { checkVoidSnapshot, runPreparedVoidSale, type VoidRetry, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
@@ -797,12 +797,26 @@ function guardFor(tenantId: string, saleId: string): SyncGuard {
 function persistFor(tenantId: string, saleId: string): SyncPersist {
   const update = (data: Prisma.SaleUpdateInput) =>
     withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data })).then(() => undefined);
+  const unprotectedError = {
+    OR: [{ syncError: null }, { NOT: { syncError: { startsWith: NEUTRALISATION_MARKER } } }],
+  };
   return {
     saveInvoiceRef: (invoiceId, invoiceNumber) => update({ invoiceId, invoiceNumber }),
     markComptaSynced: () => update({ comptaSyncedAt: new Date() }),
     markStockSynced: () => update({ stockSyncedAt: new Date() }),
-    recordFailure: (detail) => update({ syncError: detail, syncAttempts: { increment: 1 } }),
-    clearError: () => update({ syncError: null }),
+    recordFailure: (detail) => withTenant(tenantId, async (tx) => {
+      // Décision pure pour le marqueur ; le filtre vérifie atomiquement la valeur actuelle.
+      const result = await tx.sale.updateMany({
+        where: { id: saleId, tenantId, ...(!shouldWriteSyncError(NEUTRALISATION_MARKER, detail) ? unprotectedError : {}) },
+        data: { syncError: detail, syncAttempts: { increment: 1 } },
+      });
+      if (result.count === 0) {
+        await tx.sale.updateMany({ where: { id: saleId, tenantId }, data: { syncAttempts: { increment: 1 } } });
+      }
+    }),
+    clearError: () => withTenant(tenantId, async (tx) => {
+      await tx.sale.updateMany({ where: { id: saleId, tenantId, ...unprotectedError }, data: { syncError: null } });
+    }),
   };
 }
 
@@ -831,6 +845,12 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
   if (outcome.neutralized || (outcome.stopped === "VOID" && outcome.failure) || outcome.stopped === "INVOICE_CONFLICT") {
     log.error("caisse.saleSyncNeutralization", new Error(outcome.failure ? formatFailure(outcome.failure) : outcome.stopped ?? "neutralized"), {
       saleId: sale.id, tenantId: sale.tenantId, neutralized: outcome.neutralized, invoiceId: outcome.invoiceId,
+    });
+  }
+  if (outcome.settledOnVoidingSale || outcome.stockOnVoidingSale) {
+    log.error("caisse.saleSyncRaceVoid", new Error("Effet externe pendant une annulation : arbitrage humain requis"), {
+      saleId: sale.id, tenantId: sale.tenantId,
+      settledOnVoidingSale: outcome.settledOnVoidingSale, stockOnVoidingSale: outcome.stockOnVoidingSale,
     });
   }
   if (!outcome.synced && outcome.failure) {
@@ -871,6 +891,9 @@ export async function repairSale(tenantId: string, saleId: string): Promise<Repa
   if (sale.status === "VOID" && sale.syncError?.startsWith(NEUTRALISATION_MARKER)) {
     try {
       const result = await retryNeutralization(toSnapshot(sale), comptaClient(), guardFor(tenantId, saleId));
+      if (result.failure) {
+        await persistFor(tenantId, saleId).recordFailure(`${NEUTRALISATION_MARKER} ${formatFailure(result.failure)}`);
+      }
       if (result.neutralized || result.failure) {
         log.error("caisse.repairNeutralization", new Error(result.failure ? formatFailure(result.failure) : "Facture neutralisée"), { saleId, tenantId });
       }

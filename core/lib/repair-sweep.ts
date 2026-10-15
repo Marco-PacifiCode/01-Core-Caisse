@@ -29,6 +29,8 @@ import {
   stuckSalesWhere,
 } from "./repair-policy";
 
+// Lot borné ; le tri par tentatives fait tourner les échecs durables sans bloquer les autres.
+const NEUTRALIZATION_BATCH_LIMIT = 50;
 const cronDbUrl = process.env.CRON_DATABASE_URL ?? process.env.DATABASE_URL;
 const globalForCron = globalThis as unknown as { cronPrisma?: PrismaClient };
 const cronPrisma =
@@ -64,7 +66,7 @@ export async function sweepPendingSales(limit = 200): Promise<RepairSweepReport>
     where: { status: "VOID", syncError: { startsWith: NEUTRALISATION_MARKER }, invoiceId: { not: null }, creditNoteId: null },
     select: { id: true, tenantId: true },
     orderBy: PENDING_SALES_ORDER,
-    take: limit,
+    take: Math.min(limit, NEUTRALIZATION_BATCH_LIMIT),
   });
 
   // Comptage SÉPARÉ des ventes qui s'enlisent (indépendant de la fenêtre et du backoff) : sans ça,
