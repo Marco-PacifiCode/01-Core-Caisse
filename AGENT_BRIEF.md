@@ -4,13 +4,15 @@
 
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
-## 🧾 2026-10-15 — RÉPARATION ET VENTE ANNULÉE : plus de facture ni de règlement pour une VOID — fusionné, ⛔ NON DÉPLOYÉ
+## 🧾 2026-10-15/16 — RÉPARATION ET VENTE ANNULÉE : plus de facture, de règlement ni de stock pour une VOID — fusionné, ⛔ NON DÉPLOYÉ (QCM : part avec le déploiement Core-Caisse du chantier quotas/caisse unique)
 
 - **Défaut (préexistant, relevé par relecture GPT)** : `repairSale`/`syncLoadedSale` travaillaient sur une photo chargée avant la synchro ; une vente annulée entre-temps était facturée, soldée et décrémentée sans avoir.
 - **Correctif** (`lib/sync.ts` `runGuardedSaleSync` + `SyncGuard`, `lib/caisse.ts` `guardFor`) : avant chaque étape (facture, règlements, stock), relecture sous `lockSaleRow` en transaction courte, **aucun appel réseau sous verrou** (doctrine `sale-lock.ts`). VOID ou `voidPreparedAt` → arrêt sans appel. Référence facture enregistrée seulement si la vente relue est encore PAID.
 - **Décision Marco (QCM 15/10)** : annulation directe survenue PENDANT `createInvoice` → la facture tout juste créée est **neutralisée par un avoir** et rattachée à la vente VOID. Avoir en échec → `syncError` = `NEUTRALISATION_EN_ATTENTE …`, repris par `repairSale` et le balayage (50 max/passage) ; une synchro ordinaire n'écrase jamais ce marqueur. Une facture existant AVANT l'annulation reste régularisée par l'avoir d'`annulerVente`.
-- **Fenêtres résiduelles assumées** (doctrine sans verrou réseau) : annulation pendant les appels `settle` ou `recordSale` → effet externe conservé, signalé au watchdog (`caisse.saleSyncRaceVoid`) pour arbitrage. Encaissement : la réponse dit encore PAID si une annulation concurrente tombe pendant la synchro (non traité).
-- Nouvelles erreurs de `POST /api/sales/:id/repair` (409) : `VOID_IN_PROGRESS`, `SALE_LOCKED`, `INVOICE_CONFLICT`. Test `lib/repair-void.test.ts` (cas a→m). 504 tests verts, tsc 0.
+- **Décision Marco (QCM 16/10) « l'annulation attend »** : avant d'envoyer les règlements ou les sorties de stock, la synchro revendique la vente sous verrou (`syncError` = `SYNC_EN_COURS jusqu'au <iso> #<id>`, propriétaire unique, échéance = appels × délai client + 5 s). `annulerVente` refuse en **409 `SYNC_IN_PROGRESS`** tant que la revendication est vivante, ou tant qu'une étape commencée n'est pas confirmée (`SYNC_A_REPRENDRE …` après timeout, échec partiel, plantage). L'échéance ne libère jamais l'annulation : elle permet seulement à une autre synchro de reprendre la main. Étape confirmée = date posée + marqueur retiré dans la même transaction (`completeSync`). ⚠️ Une vente dont la synchro reste en échec ne peut pas être annulée avant la reprise (balayage, backoff `repair-policy.ts`) ou un arbitrage.
+- Encaissement : `status` vaut `"VOID"` si la synchro trouve la vente annulée (`checkoutStatusAfterSync`) ; `checkout-retrocompat.test.ts` tolère cette seule substitution.
+- Nouvelles erreurs de `POST /api/sales/:id/repair` (409) : `VOID_IN_PROGRESS`, `SALE_LOCKED`, `INVOICE_CONFLICT`. Tests `lib/repair-void.test.ts` (a→ae) ; 523 tests verts, tsc 0 ; trois relectures GPT à risque traitées.
+- Hors périmètre, non traité : le remboursement partiel (`partial-refund-db.ts`) ne consulte pas le marqueur de synchro.
 
 ## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ✅ BRANCHÉ LE 15/10 AU SOIR (accord QCM Marco)
 

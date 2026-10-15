@@ -20,6 +20,33 @@
 // import type uniquement : aucun import runtime → chargeable par `node --test` sans bundler.
 import type { ComptaClient, StockClient, CoreFailureKind } from "./clients";
 
+export const SYNC_EN_COURS_MARKER = "SYNC_EN_COURS";
+// Marge après la durée maximale cumulée des appels pour couvrir la libération de la revendication.
+export const SYNC_CLAIM_MARGIN_MS = 5000;
+export const SYNC_A_REPRENDRE_MARKER = "SYNC_A_REPRENDRE";
+export function syncClaimFor(calls: number, now: Date, timeoutMs: number, claimId: string): string {
+  const until = new Date(now.getTime() + calls * timeoutMs + SYNC_CLAIM_MARGIN_MS).toISOString();
+  return `${SYNC_EN_COURS_MARKER} jusqu'au ${until} #${claimId}`;
+}
+export function claimState(syncError: string | null | undefined, now: Date): "none" | "live" | "stale" {
+  if (syncError?.startsWith(SYNC_A_REPRENDRE_MARKER)) return "stale";
+  if (!syncError?.startsWith(SYNC_EN_COURS_MARKER)) return "none";
+  const match = syncError.match(/^SYNC_EN_COURS jusqu'au (\S+)(?: #[^\s]+)?$/);
+  const until = match ? Date.parse(match[1]) : NaN;
+  return Number.isFinite(until) && until > now.getTime() ? "live" : "stale";
+}
+export function syncBlocksVoid(sale: Pick<SyncSaleSnapshot, "status" | "syncError" | "comptaSyncedAt" | "stockSyncedAt"> & {
+  lines: { kind: string; productId: string | null }[];
+}, now: Date): boolean {
+  return sale.status === "PAID" &&
+    (claimState(sale.syncError, now) === "live" ||
+      (!!(sale.syncError?.startsWith(SYNC_EN_COURS_MARKER) || sale.syncError?.startsWith(SYNC_A_REPRENDRE_MARKER)) &&
+        (!sale.comptaSyncedAt || (!sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId)))));
+}
+export function checkoutStatusAfterSync(outcome: SyncOutcome | null | undefined): "PAID" | "VOID" {
+  return outcome?.stopped === "VOID" || outcome?.settledOnVoidingSale || outcome?.stockOnVoidingSale ? "VOID" : "PAID";
+}
+
 export const CAISSE_SOURCE_TYPE = "caisse";
 
 export type SyncLine = {
@@ -91,20 +118,30 @@ export type CoreFailure = {
 };
 
 export const NEUTRALISATION_MARKER = "NEUTRALISATION_EN_ATTENTE";
-/** Une synchro ordinaire ne peut ni remplacer ni effacer une neutralisation en attente. */
+/** Une écriture ordinaire préserve les étapes en vol, à reprendre et les neutralisations. */
 export function shouldWriteSyncError(current: string | null | undefined, detail: string | null): boolean {
-  return !current?.startsWith(NEUTRALISATION_MARKER) || !!detail?.startsWith(NEUTRALISATION_MARKER);
+  const protectedError = (value: string | null | undefined) =>
+    [NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER].some(marker => value?.startsWith(marker));
+  return !protectedError(current) || protectedError(detail);
 }
 const NEUTRALISATION_REASON = "Vente annulée pendant la synchro : facture neutralisée";
 
 /** Transactions courtes sous verrou, sans appel réseau. */
 export type SyncGuard = {
   reread(): Promise<SyncSaleSnapshot | null>;
+  claimSync(claim: string, phase: "compta" | "stock"): Promise<
+    { claimed: true; fresh: SyncSaleSnapshot } |
+    { claimed: false; busy: false; done: true; fresh: SyncSaleSnapshot } |
+    { claimed: false; busy: boolean; done?: false; fresh: SyncSaleSnapshot | null }
+  >;
+  completeSync(claim: string, phase: "compta" | "stock"): Promise<void>;
+  failSync(claim: string, phase: "compta" | "stock", detail: string): Promise<void>;
   saveInvoiceRefIfLive(invoiceId: string, invoiceNumber: string | null): Promise<
     { saved: true } | { saved: false; fresh: SyncSaleSnapshot | null }
   >;
   attachOrphanInvoice(invoiceId: string, invoiceNumber: string | null): Promise<boolean>;
   attachNeutralization(invoiceId: string, creditNoteId: string): Promise<void>;
+  failNeutralization(invoiceId: string, detail: string): Promise<void>;
 };
 
 export type SyncOutcome = {
@@ -182,11 +219,12 @@ function stoppedFor(sale: SyncSaleSnapshot | null): SyncOutcome["stopped"] {
  * Fenêtres résiduelles signalées par settledOnVoidingSale / stockOnVoidingSale.
  */
 async function runGuardedSaleSync(
-  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard,
+  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard, timeoutMs: number,
 ): Promise<SyncOutcome> {
   let invoiceId: string | null = null;
   let invoiceNumber: string | null = null;
   let stockDecremented = 0;
+  let active: { claim: string; phase: "compta" | "stock" } | null = null;
   const races: Pick<SyncOutcome, "settledOnVoidingSale" | "stockOnVoidingSale"> = {};
   const stop = async (stopped: NonNullable<SyncOutcome["stopped"]>): Promise<SyncOutcome> => {
     if (stopped === "VOID_IN_PROGRESS") {
@@ -235,35 +273,77 @@ async function runGuardedSaleSync(
     if (!cur) return await stop("NOT_FOUND");
     if (!cur.comptaSyncedAt) {
       if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent");
-      for (const p of cur.payments) {
-        await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
-          amountXpf: Number(p.amountXpf), method: p.method,
-          paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+      if (cur.payments.length) {
+        const claim = syncClaimFor(cur.payments.length, new Date(), timeoutMs, crypto.randomUUID());
+        const result = await guard.claimSync(claim, "compta");
+        if (!result.claimed && !result.done) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
+        if (result.claimed) active = { claim, phase: "compta" };
+        cur = result.fresh;
+      } else cur = await guard.reread();
+      invoiceId = cur?.invoiceId ?? null;
+      invoiceNumber = cur?.invoiceNumber ?? null;
+      stopped = stoppedFor(cur);
+      if (stopped) return await stop(stopped);
+      if (!cur) return await stop("NOT_FOUND");
+      if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent après relecture");
+      if (!cur.comptaSyncedAt) {
+        for (const p of cur.payments) {
+          await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
+            amountXpf: Number(p.amountXpf), method: p.method,
+            paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+        }
+        const afterSettle = await guard.reread();
+        if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
+        if (active) await guard.completeSync(active.claim, "compta");
+        else await persist.markComptaSynced();
+        active = null;
       }
-      const afterSettle = await guard.reread();
-      if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
-      await persist.markComptaSynced();
     }
     cur = await reread();
     stopped = stoppedFor(cur);
     if (stopped) return await stop(stopped);
     if (!cur) return await stop("NOT_FOUND");
     if (!cur.stockSyncedAt) {
-      for (const l of cur.lines.filter(l => l.kind === "PRODUCT" && l.productId)) {
-        await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
-          sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
-        stockDecremented++;
-      }
-      const afterStock = await guard.reread();
-      if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
-      await persist.markStockSynced();
+      let productLines = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId);
+      if (productLines.length) {
+        const claim = syncClaimFor(productLines.length, new Date(), timeoutMs, crypto.randomUUID());
+        const result = await guard.claimSync(claim, "stock");
+        if (!result.claimed && !result.done) return await stop(result.busy ? "LOCKED" : stoppedFor(result.fresh) ?? "LOCKED");
+        if (result.claimed) active = { claim, phase: "stock" };
+        cur = result.fresh;
+        productLines = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId);
+      } else cur = await guard.reread();
+      invoiceId = cur?.invoiceId ?? null;
+      invoiceNumber = cur?.invoiceNumber ?? null;
+      stopped = stoppedFor(cur);
+      if (stopped) return await stop(stopped);
+      if (!cur) return await stop("NOT_FOUND");
+      if (!cur.stockSyncedAt) {
+        for (const l of productLines) {
+          await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
+            sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
+          stockDecremented++;
+        }
+        const afterStock = await guard.reread();
+        if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
+        if (active) await guard.completeSync(active.claim, "stock");
+        else await persist.markStockSynced();
+        active = null;
+      } else stockDecremented = productLines.length;
     }
     await persist.clearError();
     return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented, ...races };
   } catch (e) {
     const failure = asCoreFailure(e);
-    if (!failure) throw e;
-    await persist.recordFailure(formatFailure(failure));
+    if (!failure) {
+      if (active) {
+        try { await guard.failSync(active.claim, active.phase, e instanceof Error ? e.message : String(e)); }
+        catch { /* Préserver l'erreur d'origine. */ }
+      }
+      throw e;
+    }
+    if (active) await guard.failSync(active.claim, active.phase, formatFailure(failure));
+    else await persist.recordFailure(formatFailure(failure));
     return { synced: false, failure, invoiceId, invoiceNumber, stockDecremented, ...races };
   }
 }
@@ -282,8 +362,9 @@ export async function runSaleSync(
   stock: StockClient,
   persist: SyncPersist,
   guard?: SyncGuard,
+  timeoutMs = 8000,
 ): Promise<SyncOutcome> {
-  if (guard) return runGuardedSaleSync(compta, stock, persist, guard);
+  if (guard) return runGuardedSaleSync(compta, stock, persist, guard, timeoutMs);
   let invoiceId = sale.invoiceId;
   let invoiceNumber = sale.invoiceNumber;
   const productLines = sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId);

@@ -37,7 +37,8 @@ import {
   type GiftCardRedeemRefusal,
   type GiftCardRefusal,
 } from "./gift-card";
-import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, shouldWriteSyncError, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER, claimState, syncBlocksVoid, checkoutStatusAfterSync, shouldWriteSyncError, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
+import { coreClientTimeoutMs } from "./clients";
 import { checkVoidSnapshot, runPreparedVoidSale, type VoidRetry, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
@@ -774,6 +775,33 @@ function guardFor(tenantId: string, saleId: string): SyncGuard {
     });
   return {
     reread: () => locked(async (_tx, sale) => sale ? toSnapshot(sale) : null),
+    claimSync: (claim, phase) => locked(async (tx, sale) => {
+      const fresh = sale ? toSnapshot(sale) : null;
+      if (!sale || sale.status !== "PAID" || sale.voidPreparedAt) return { claimed: false as const, busy: false, fresh };
+      if (phase === "compta" ? sale.comptaSyncedAt : sale.stockSyncedAt) {
+        return { claimed: false as const, busy: false as const, done: true as const, fresh: toSnapshot(sale) };
+      }
+      if (claimState(sale.syncError, new Date()) === "live" && sale.syncError !== claim) {
+        return { claimed: false as const, busy: true, fresh };
+      }
+      await tx.sale.update({ where: { id: saleId }, data: { syncError: claim } });
+      return { claimed: true as const, fresh: { ...toSnapshot(sale), syncError: claim } };
+    }),
+    completeSync: (claim, phase) => locked(async (tx, sale) => {
+      if (!sale) return;
+      await tx.sale.update({ where: { id: saleId }, data: {
+        [phase === "compta" ? "comptaSyncedAt" : "stockSyncedAt"]: new Date(),
+        ...(sale.syncError === claim ? { syncError: null } : {}),
+      } });
+    }),
+    failSync: (claim, phase, detail) => locked(async (tx, sale) => {
+      if (!sale) return;
+      const done = phase === "compta" ? sale.comptaSyncedAt : sale.stockSyncedAt;
+      await tx.sale.update({ where: { id: saleId }, data: {
+        syncAttempts: { increment: 1 },
+        ...(sale.syncError === claim ? { syncError: done ? null : `${SYNC_A_REPRENDRE_MARKER} ${detail}` } : {}),
+      } });
+    }),
     saveInvoiceRefIfLive: (invoiceId, invoiceNumber) => locked(async (tx, sale) => {
       if (!sale || sale.status !== "PAID" || sale.voidPreparedAt || (sale.invoiceId && sale.invoiceId !== invoiceId)) {
         return { saved: false as const, fresh: sale ? toSnapshot(sale) : null };
@@ -791,6 +819,14 @@ function guardFor(tenantId: string, saleId: string): SyncGuard {
         await tx.sale.update({ where: { id: saleId }, data: { creditNoteId, syncError: null } });
       }
     }),
+    failNeutralization: (invoiceId, detail) => locked(async (tx, sale) => {
+      if (!sale) return;
+      await tx.sale.update({ where: { id: saleId }, data: {
+        syncAttempts: { increment: 1 },
+        ...(sale.status === "VOID" && sale.invoiceId === invoiceId && !sale.creditNoteId
+          ? { syncError: `${NEUTRALISATION_MARKER} ${detail}` } : {}),
+      } });
+    }),
   };
 }
 
@@ -798,7 +834,9 @@ function persistFor(tenantId: string, saleId: string): SyncPersist {
   const update = (data: Prisma.SaleUpdateInput) =>
     withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data })).then(() => undefined);
   const unprotectedError = {
-    OR: [{ syncError: null }, { NOT: { syncError: { startsWith: NEUTRALISATION_MARKER } } }],
+    OR: [{ syncError: null }, { NOT: { OR:
+      [NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER].map(marker => ({ syncError: { startsWith: marker } })),
+    } }],
   };
   return {
     saveInvoiceRef: (invoiceId, invoiceNumber) => update({ invoiceId, invoiceNumber }),
@@ -833,6 +871,7 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
       stockClient(),
       persistFor(sale.tenantId, sale.id),
       guardFor(sale.tenantId, sale.id),
+      coreClientTimeoutMs(),
     );
   } catch (e) {
     if (e instanceof SaleLockTimeoutError) {
@@ -892,7 +931,7 @@ export async function repairSale(tenantId: string, saleId: string): Promise<Repa
     try {
       const result = await retryNeutralization(toSnapshot(sale), comptaClient(), guardFor(tenantId, saleId));
       if (result.failure) {
-        await persistFor(tenantId, saleId).recordFailure(`${NEUTRALISATION_MARKER} ${formatFailure(result.failure)}`);
+        await guardFor(tenantId, saleId).failNeutralization(sale.invoiceId!, formatFailure(result.failure));
       }
       if (result.neutralized || result.failure) {
         log.error("caisse.repairNeutralization", new Error(result.failure ? formatFailure(result.failure) : "Facture neutralisée"), { saleId, tenantId });
@@ -1020,7 +1059,7 @@ export async function checkoutSale(
     return {
       ok: true,
       saleId: sale.id,
-      status: "PAID",
+      status: checkoutStatusAfterSync(outcome),
       invoiceId,
       invoiceNumber: outcome ? outcome.invoiceNumber : sale.invoiceNumber,
       totalXpf: Number(sale.totalXpf),
@@ -1412,7 +1451,7 @@ export async function checkoutSale(
   return {
     ok: true,
     saleId,
-    status: "PAID",
+    status: checkoutStatusAfterSync(outcome),
     invoiceId: outcome.invoiceId,
     invoiceNumber: outcome.invoiceNumber,
     totalXpf: Number(sale.totalXpf),
@@ -1446,7 +1485,7 @@ export type AnnulerVenteResult =
   | { ok: false; error: "SALE_NOT_FOUND" }
   | { ok: false; error: "STOCK_DECREMENTED" }
   | { ok: false; error: "CREDIT_NOTE_FAILED"; detail: string }
-  | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" };
+  | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" | "SYNC_IN_PROGRESS" };
 
 /**
  * ANNULE une vente, quel que soit son état (DRAFT/PAID/VOID) — distincte de `voidSale` ci-dessus
@@ -1517,6 +1556,7 @@ export async function annulerVente(
           if (!sale) return { error: "SALE_NOT_FOUND" as const };
           if (sale.status === "VOID") return sale;
           if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) return { error: "PARTIAL_REFUND_EXISTS" as const };
+          if (syncBlocksVoid(sale, new Date())) return { error: "SYNC_IN_PROGRESS" as const };
           if (actionId) {
             const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
             if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { error: "ACTION_ID_CONFLICT" as const };
