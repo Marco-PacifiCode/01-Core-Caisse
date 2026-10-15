@@ -217,6 +217,15 @@ test("importerCloture rattrape la course sur l'index unique (P2002) comme openSe
   assert.match(bloc.slice(0, 3000), /uniq_session_external_source/);
 });
 
+test("importerCloture écrit le posteId reçu tel quel (texte libre, jamais mis en minuscules)", () => {
+  const src = readCaisse();
+  const bloc = src.slice(src.indexOf("export async function importerCloture"));
+  const fin = bloc.indexOf("\nexport ");
+  const corps = fin > 0 ? bloc.slice(0, fin) : bloc;
+  assert.match(corps, /prepared\.posteId = received\.posteId\?\.trim\(\) \|\| null;/);
+  assert.ok(corps.indexOf("prepared.posteId = received.posteId") < corps.indexOf("posteId: prepared.posteId"));
+});
+
 test("importerCloture crée la session directement CLOSED", () => {
   const src = readCaisse();
   const bloc = src.slice(src.indexOf("export async function importerCloture"));

@@ -421,6 +421,8 @@ export async function importerCloture(tenantId: string, input: ImporterClotureIn
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
   const prepared = prepareClotureImport(input);
   if (!prepared.ok) return prepared;
+  // posteId = texte libre exact, jamais normalisé (même règle qu'openSession).
+  prepared.posteId = received.posteId?.trim() || null;
   const source = { sourceType: received.sourceType?.trim(), sourceId: received.sourceId?.trim() };
   // La validation métier retire les espaces AVANT de normaliser une nouvelle clé.
   prepared.sourceType = normalizeActionInput(prepared.sourceType);
