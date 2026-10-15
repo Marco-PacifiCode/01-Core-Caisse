@@ -18,6 +18,7 @@ import * as corrections from "./payment-correction.ts";
 import * as voidPolicy from "./void-sale.ts";
 import * as importsPolicy from "./import-cloture.ts";
 import * as loyalty from "./loyalty.ts";
+import { syncBlocksVoid, checkoutStatusAfterSync } from "./sync.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "ab000000-0000-0000-0000-000000000001", tenantB = "cd000000-0000-0000-0000-000000000002";
@@ -45,7 +46,8 @@ function caisseFunction(name: string, globals: Row) {
     assertLegacyWriteAllowed: globals.assertLegacyWriteAllowed, lockCashTenant: globals.lockCashTenant ?? tenantLock,
     uuid: activeSync.uuid, findHistoricalKey: activeSync.findHistoricalKey, findHistoricalSource: activeSync.findHistoricalSource,
     receivedActionInput: activeSync.receivedActionInput, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
-    randomUUID: require("node:crypto").randomUUID, createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
+    randomUUID: require("node:crypto").randomUUID, createHash: require("node:crypto").createHash, canonical: projection.canonical,
+    syncBlocksVoid, checkoutStatusAfterSync, ...globals });
 }
 type Row = Record<string, any>;
 function fixture(enforceDayBeforeSale = false) {

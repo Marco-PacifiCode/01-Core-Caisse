@@ -54,12 +54,12 @@ export type VoidOutcome =
 
 /** Orchestration commune : la préparation est déjà commitée quand Compta est appelé. */
 export async function runPreparedVoidSale<T extends VoidSaleSnapshot>(deps: {
-  prepare(): Promise<T | { error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" }>;
+  prepare(): Promise<T | { error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" | "SYNC_IN_PROGRESS" }>;
   compta: ComptaClient;
   tenantId: string;
   persist: VoidPersist;
   reason?: string;
-}): Promise<VoidOutcome | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" }> {
+}): Promise<VoidOutcome | { ok: false; error: "SALE_NOT_FOUND" | "ACTION_ID_CONFLICT" | "PARTIAL_REFUND_EXISTS" | "SYNC_IN_PROGRESS" }> {
   const prepared = await deps.prepare();
   if ("error" in prepared) return { ok: false, error: prepared.error };
   return runVoidSale(prepared, deps.tenantId, deps.compta, deps.persist, { reason: deps.reason });
