@@ -28,6 +28,9 @@ function timeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? n : 8000;
 }
 
+/** Délai maximal d'un appel S2S sortant (ms), partagé avec la fenêtre de revendication de synchro. */
+export function coreClientTimeoutMs(): number { return timeoutMs(); }
+
 /** Cibles S2S (pour le healthcheck /api/health — sondes de joignabilité). */
 export function coreClientTargets(): { compta: string; stock: string; mocked: boolean } {
   return { compta: comptaUrl(), stock: stockUrl(), mocked: mockEnabled() };

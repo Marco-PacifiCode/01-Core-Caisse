@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, shouldWriteSyncError, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, syncClaimFor, syncInProgress, checkoutStatusAfterSync, shouldWriteSyncError, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
 import { CoreClientError } from "./clients.ts";
 import type { ComptaClient, StockClient } from "./clients.ts";
 
@@ -13,11 +13,21 @@ function fixture() {
     payments: [{ id: "payment-test", method: "CASH", amountXpf: 1000n, settleRef: null }],
   };
   const db = { sale: structuredClone(photo) as SyncSaleSnapshot | null, syncAttempts: 0 };
-  const calls = { createInvoice: 0, settle: 0, recordSale: 0, creditNote: 0, recordFailure: 0, clearError: 0 };
-  const hooks: { create?: () => void; saved?: () => void; settle?: () => void; recordSale?: () => void; creditFailure?: CoreClientError } = {};
+  const calls = { createInvoice: 0, settle: 0, recordSale: 0, creditNote: 0, recordFailure: 0, clearError: 0, releaseSync: 0 };
+  const hooks: { create?: () => void; saved?: () => void; claim?: () => void; settle?: () => void; recordSale?: () => void; creditFailure?: CoreClientError } = {};
   const credits: string[] = [];
   const guard: SyncGuard = {
     async reread() { return db.sale ? structuredClone(db.sale) : null; },
+    async claimSync(claim) {
+      hooks.claim?.();
+      const s = db.sale;
+      if (s?.status === "PAID" && !s.voidPreparedAt) s.syncError = claim;
+      return s ? structuredClone(s) : null;
+    },
+    async releaseSync() {
+      calls.releaseSync++;
+      if (db.sale?.syncError?.startsWith(SYNC_EN_COURS_MARKER)) db.sale.syncError = null;
+    },
     async saveInvoiceRefIfLive(invoiceId, invoiceNumber) {
       const s = db.sale;
       if (!s || s.status !== "PAID" || s.voidPreparedAt || (s.invoiceId && s.invoiceId !== invoiceId)) {
@@ -80,7 +90,7 @@ function fixture() {
     },
   };
   return { photo, db, calls, hooks, guard, persist, compta, stock, credits,
-    run: () => runSaleSync(photo, compta, stock, persist, guard) };
+    run: (timeoutMs = 8000) => runSaleSync(photo, compta, stock, persist, guard, timeoutMs) };
 }
 
 function assertNoExternal(f: ReturnType<typeof fixture>) {
@@ -270,4 +280,85 @@ test("annulation préparée pendant les appels : les deux fenêtres sont signal�
     assert.ok(stage === "settle" ? f.db.sale!.comptaSyncedAt : f.db.sale!.stockSyncedAt);
     assert.equal(f.calls.creditNote, 0);
   }
+});
+
+test("n) la revendication couvre tous les règlements et est libérée après l'étape", async () => {
+  const f = fixture();
+  const timeout = 8000;
+  const started = Date.now();
+  f.db.sale!.payments.push({ ...f.db.sale!.payments[0], id: "payment-2" });
+  f.hooks.settle = () => {
+    assert.ok(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER));
+    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1]);
+    assert.ok(due >= started + 2 * timeout);
+  };
+  f.hooks.claim = () => {
+    if (f.calls.settle > 0) assert.equal(f.calls.releaseSync, 1, "la revendication des règlements doit être libérée avant la revendication stock");
+  };
+  await f.run(timeout);
+  assert.equal(f.calls.settle, 2);
+  assert.equal(Boolean(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER)), false);
+});
+
+test("o) la revendication couvre toutes les sorties stock et est libérée après l'étape", async () => {
+  const f = fixture();
+  const timeout = 8000;
+  const started = Date.now();
+  f.db.sale!.comptaSyncedAt = new Date();
+  f.db.sale!.lines.push({ ...f.db.sale!.lines[0], id: "line-2" });
+  f.hooks.recordSale = () => {
+    assert.ok(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER));
+    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1]);
+    assert.ok(due >= started + 2 * timeout);
+  };
+  await f.run(timeout);
+  assert.equal(f.calls.recordSale, 2);
+  assert.equal(Boolean(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER)), false);
+});
+
+test("p) syncInProgress reconnaît seulement une échéance future valide", () => {
+  const now = new Date("2026-10-15T00:00:00.000Z");
+  assert.equal(syncInProgress(syncClaimFor(1, now, 1000), now), true);
+  assert.equal(syncInProgress(`${SYNC_EN_COURS_MARKER} jusqu'au 2026-10-14T23:59:59.000Z`, now), false);
+  assert.equal(syncInProgress(`${SYNC_EN_COURS_MARKER} illisible`, now), false);
+  assert.equal(syncInProgress(null, now), false);
+  assert.equal(syncInProgress(`${NEUTRALISATION_MARKER} attente`, now), false);
+});
+
+test("q) un échec core pendant settle remplace la revendication", async () => {
+  const f = fixture();
+  f.hooks.settle = () => { throw new CoreClientError("compta", "settle", 500, "panne", "http"); };
+  const out = await f.run();
+  assert.equal(out.synced, false);
+  assert.equal(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER), false);
+  assert.equal(syncInProgress(f.db.sale!.syncError, new Date()), false);
+  assert.match(f.db.sale!.syncError!, /compta:settle/);
+});
+
+test("r) runSaleSync arrête au retour de claimSync si la vente devient VOID ou préparée", async () => {
+  for (const stage of ["settle", "recordSale"] as const) {
+    for (const change of ["VOID", "PREPARED"] as const) {
+      const f = fixture();
+      if (stage === "recordSale") f.db.sale!.comptaSyncedAt = new Date();
+      f.db.sale!.invoiceId = "invoice-test";
+      f.hooks.claim = () => {
+        if (change === "VOID") f.db.sale!.status = "VOID";
+        else f.db.sale!.voidPreparedAt = new Date();
+      };
+      const out = await f.run();
+      assert.equal(out.stopped, change === "VOID" ? "VOID" : "VOID_IN_PROGRESS");
+      assert.equal(f.calls.settle, 0);
+      assert.equal(f.calls.recordSale, 0);
+      assert.equal(Boolean(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER)), false);
+    }
+  }
+});
+
+test("s) checkoutStatusAfterSync ne renvoie VOID que pour l'arrêt VOID", () => {
+  assert.equal(checkoutStatusAfterSync({ stopped: "VOID" } as any), "VOID");
+  assert.equal(checkoutStatusAfterSync(null), "PAID");
+  assert.equal(checkoutStatusAfterSync({ synced: true } as any), "PAID");
+  assert.equal(checkoutStatusAfterSync({ stopped: "NOT_FOUND" } as any), "PAID");
+  assert.equal(checkoutStatusAfterSync({ stopped: "VOID_IN_PROGRESS" } as any), "PAID");
+  assert.equal(checkoutStatusAfterSync({ stopped: "LOCKED" } as any), "PAID");
 });

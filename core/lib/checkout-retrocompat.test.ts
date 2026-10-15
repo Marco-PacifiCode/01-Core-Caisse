@@ -135,7 +135,11 @@ test("(b) réponse 200 de checkoutSale, rows.push des bons émis et type GiftCar
   const fnC = fnSource(cur, "export async function checkoutSale(");
   // Bloc de la réponse 200 : `return { ok: true, saleId, status: "PAID", … }`.
   const ret = (s: string) => block(s, "return {\n    ok: true,\n    saleId,", 0).text;
-  assert.equal(ret(fnC.replace(/\r\n/g, "\n")), ret(fnP.replace(/\r\n/g, "\n")), "réponse 200 modifiée");
+  // 16/10 : `status` n'est plus le littéral "PAID" — une annulation concurrente pendant la synchro
+  // le fait valoir "VOID" (checkoutStatusAfterSync). Même champ, même place ; les surfaces lisent
+  // `ok`/`syncPending`, pas `status`. Seule cette substitution est tolérée.
+  const statusPermis = (s: string) => s.replace("status: checkoutStatusAfterSync(outcome),", 'status: "PAID",');
+  assert.equal(statusPermis(ret(fnC.replace(/\r\n/g, "\n"))), ret(fnP.replace(/\r\n/g, "\n")), "réponse 200 modifiée");
   // Éléments de `giftCards[]` dans la réponse.
   assertOnlyAdditions(block(fnP, "rows.push({").text, block(fnC, "rows.push({").text, "rows.push");
   assertOnlyAdditions(block(prod, "export type GiftCardIssued").text, block(cur, "export type GiftCardIssued").text, "GiftCardIssued");

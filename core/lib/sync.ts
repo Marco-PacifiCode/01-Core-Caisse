@@ -20,6 +20,24 @@
 // import type uniquement : aucun import runtime → chargeable par `node --test` sans bundler.
 import type { ComptaClient, StockClient, CoreFailureKind } from "./clients";
 
+export const SYNC_EN_COURS_MARKER = "SYNC_EN_COURS";
+// Marge après la durée maximale cumulée des appels pour couvrir la libération de la revendication.
+export const SYNC_CLAIM_MARGIN_MS = 5000;
+export function syncClaimFor(calls: number, now: Date, timeoutMs: number): string {
+  const until = new Date(now.getTime() + calls * timeoutMs + SYNC_CLAIM_MARGIN_MS).toISOString();
+  return `${SYNC_EN_COURS_MARKER} jusqu'au ${until}`;
+}
+export function syncInProgress(syncError: string | null | undefined, now: Date): boolean {
+  if (!syncError?.startsWith(SYNC_EN_COURS_MARKER)) return false;
+  const match = syncError.match(/^SYNC_EN_COURS jusqu'au (.+)$/);
+  if (!match) return false;
+  const until = Date.parse(match[1]);
+  return Number.isFinite(until) && until > now.getTime();
+}
+export function checkoutStatusAfterSync(outcome: SyncOutcome | null | undefined): "PAID" | "VOID" {
+  return outcome?.stopped === "VOID" ? "VOID" : "PAID";
+}
+
 export const CAISSE_SOURCE_TYPE = "caisse";
 
 export type SyncLine = {
@@ -100,6 +118,8 @@ const NEUTRALISATION_REASON = "Vente annulée pendant la synchro : facture neutr
 /** Transactions courtes sous verrou, sans appel réseau. */
 export type SyncGuard = {
   reread(): Promise<SyncSaleSnapshot | null>;
+  claimSync(claim: string): Promise<SyncSaleSnapshot | null>;
+  releaseSync(): Promise<void>;
   saveInvoiceRefIfLive(invoiceId: string, invoiceNumber: string | null): Promise<
     { saved: true } | { saved: false; fresh: SyncSaleSnapshot | null }
   >;
@@ -182,7 +202,7 @@ function stoppedFor(sale: SyncSaleSnapshot | null): SyncOutcome["stopped"] {
  * Fenêtres résiduelles signalées par settledOnVoidingSale / stockOnVoidingSale.
  */
 async function runGuardedSaleSync(
-  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard,
+  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard, timeoutMs: number,
 ): Promise<SyncOutcome> {
   let invoiceId: string | null = null;
   let invoiceNumber: string | null = null;
@@ -235,6 +255,13 @@ async function runGuardedSaleSync(
     if (!cur) return await stop("NOT_FOUND");
     if (!cur.comptaSyncedAt) {
       if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent");
+      cur = cur.payments.length ? await guard.claimSync(syncClaimFor(cur.payments.length, new Date(), timeoutMs)) : await guard.reread();
+      invoiceId = cur?.invoiceId ?? null;
+      invoiceNumber = cur?.invoiceNumber ?? null;
+      stopped = stoppedFor(cur);
+      if (stopped) return await stop(stopped);
+      if (!cur) return await stop("NOT_FOUND");
+      if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent après relecture");
       for (const p of cur.payments) {
         await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
           amountXpf: Number(p.amountXpf), method: p.method,
@@ -243,13 +270,21 @@ async function runGuardedSaleSync(
       const afterSettle = await guard.reread();
       if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
       await persist.markComptaSynced();
+      await guard.releaseSync();
     }
     cur = await reread();
     stopped = stoppedFor(cur);
     if (stopped) return await stop(stopped);
     if (!cur) return await stop("NOT_FOUND");
     if (!cur.stockSyncedAt) {
-      for (const l of cur.lines.filter(l => l.kind === "PRODUCT" && l.productId)) {
+      const productLines = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId);
+      cur = productLines.length ? await guard.claimSync(syncClaimFor(productLines.length, new Date(), timeoutMs)) : await guard.reread();
+      invoiceId = cur?.invoiceId ?? null;
+      invoiceNumber = cur?.invoiceNumber ?? null;
+      stopped = stoppedFor(cur);
+      if (stopped) return await stop(stopped);
+      if (!cur) return await stop("NOT_FOUND");
+      for (const l of productLines) {
         await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
           sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
         stockDecremented++;
@@ -257,6 +292,7 @@ async function runGuardedSaleSync(
       const afterStock = await guard.reread();
       if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
       await persist.markStockSynced();
+      await guard.releaseSync();
     }
     await persist.clearError();
     return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented, ...races };
@@ -264,6 +300,7 @@ async function runGuardedSaleSync(
     const failure = asCoreFailure(e);
     if (!failure) throw e;
     await persist.recordFailure(formatFailure(failure));
+    await guard.releaseSync();
     return { synced: false, failure, invoiceId, invoiceNumber, stockDecremented, ...races };
   }
 }
@@ -282,8 +319,9 @@ export async function runSaleSync(
   stock: StockClient,
   persist: SyncPersist,
   guard?: SyncGuard,
+  timeoutMs = 8000,
 ): Promise<SyncOutcome> {
-  if (guard) return runGuardedSaleSync(compta, stock, persist, guard);
+  if (guard) return runGuardedSaleSync(compta, stock, persist, guard, timeoutMs);
   let invoiceId = sale.invoiceId;
   let invoiceNumber = sale.invoiceNumber;
   const productLines = sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId);

@@ -103,6 +103,19 @@ test("une vente DRAFT passe à VOID sans appeler Compta", async () => {
   assert.equal(state.status, "VOID");
 });
 
+test("t) une préparation SYNC_IN_PROGRESS s'arrête avant tout avoir", async () => {
+  const compta = makeCompta();
+  const { persist } = makePersist();
+  const out = await runPreparedVoidSale({
+    async prepare() { return { error: "SYNC_IN_PROGRESS" as const }; },
+    compta: compta.client,
+    tenantId: TENANT,
+    persist,
+  });
+  assert.deepEqual(out, { ok: false, error: "SYNC_IN_PROGRESS" });
+  assert.equal(compta.calls.creditNote, 0);
+});
+
 test("une vente PAID avec facture émet un avoir PUIS passe à VOID", async () => {
   const compta = makeCompta();
   const { persist, state } = makePersist();
@@ -209,6 +222,7 @@ test("la route mappe les erreurs sur les bons statuts HTTP", () => {
   const body = readRoute();
   assert.match(body, /SALE_NOT_FOUND:\s*404/);
   assert.match(body, /STOCK_DECREMENTED:\s*409/);
+  assert.match(body, /SYNC_IN_PROGRESS:\s*409/);
   assert.match(body, /CREDIT_NOTE_FAILED:\s*502/);
   assert.match(body, /ACTION_ID_CONFLICT:\s*409/);
 
