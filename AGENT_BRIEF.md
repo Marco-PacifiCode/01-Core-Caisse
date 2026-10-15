@@ -12,7 +12,10 @@
 - **Fenêtres résiduelles assumées** (doctrine sans verrou réseau) : annulation pendant les appels `settle` ou `recordSale` → effet externe conservé, signalé au watchdog (`caisse.saleSyncRaceVoid`) pour arbitrage. Encaissement : la réponse dit encore PAID si une annulation concurrente tombe pendant la synchro (non traité).
 - Nouvelles erreurs de `POST /api/sales/:id/repair` (409) : `VOID_IN_PROGRESS`, `SALE_LOCKED`, `INVOICE_CONFLICT`. Test `lib/repair-void.test.ts` (cas a→m). 504 tests verts, tsc 0.
 
-## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ⛔ NON DÉPLOYÉ, migration NON JOUÉE, verrou NON BRANCHÉ
+## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ✅ BRANCHÉ LE 15/10 AU SOIR (accord QCM Marco)
+
+- **15/10 au soir (session 00-Architecture, QCM Marco « Oui, ce soir »)** : migration `20261005130000_postes` jouée et prouvée (migrate-local, structure d'avant conservée : `/home/deploy/backups/premigration/core-caisse-20261015T115508Z-avant.sql`, données non sauvegardées à cause de FORCE RLS — défaut du script signalé) ; `CORE_AUTH_API_KEY` (clé commune de Core-Auth) posée dans le `.env` ; déployé `a223ea3` (PR #67 comprise), santé 200, table `Poste` vide. Core-Auth a `CORE_AUTH_ADMIN_KEY` (l'admin peut écrire les droits). **Aucun droit n'existe dans Core-Auth (`DroitTenant` = 0 ligne) : aucun plafond ne joue** tant que l'admin n'en envoie pas. La suite côté admin (colonne « utilisé », écran de consommation, dépôt-vente) est confiée à la session 01-PacifiCode. Les branches « caisse unique » de la Rôtisserie partent après, avec leur propre accord.
+
 
 - **État au 2026-10-06** : seul l'admin PacifiCode est en production (catalogue à niveaux, brique sur l'abonnement, tenant Core sur le client ; son envoi des droits reste inerte, aucune clé posée). **Ici rien n'a bougé** : ce moteur n'est pas déployé avec le registre des postes, la migration `20261005130000_postes` n'est pas jouée, Core-Auth non plus (sa table des droits n'existe pas en production), `CORE_AUTH_API_KEY` n'est pas posée → aucun verrou actif. Le plafond de postes suit désormais une grille à 6 niveaux côté catalogue (1, 2, 3, 4, 6, 10 postes) : ce moteur ne connaît que le `plafond` reçu de Core-Auth, rien à adapter ici. Ordre de branchement et décisions : brief de l'admin PacifiCode, `[ch:quotas]`.
 
