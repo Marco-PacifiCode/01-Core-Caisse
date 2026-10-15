@@ -19,6 +19,7 @@
 
 import { PrismaClient } from "@prisma/client";
 import { repairSale } from "./caisse";
+import { NEUTRALISATION_MARKER } from "./sync";
 import { log } from "./log";
 import {
   PENDING_SALES_ORDER,
@@ -59,15 +60,21 @@ export async function sweepPendingSales(limit = 200): Promise<RepairSweepReport>
     orderBy: PENDING_SALES_ORDER,
     take: limit,
   });
+  const neutralizations = await cronPrisma.sale.findMany({
+    where: { status: "VOID", syncError: { startsWith: NEUTRALISATION_MARKER }, invoiceId: { not: null }, creditNoteId: null },
+    select: { id: true, tenantId: true },
+    orderBy: PENDING_SALES_ORDER,
+    take: limit,
+  });
 
   // Comptage SÉPARÉ des ventes qui s'enlisent (indépendant de la fenêtre et du backoff) : sans ça,
   // une vente insoluble redevient invisible dès qu'elle est écartée de la fenêtre — on remplacerait
   // une famine bruyante par un enlisement silencieux.
   const stuck = await cronPrisma.sale.count({ where: stuckSalesWhere() });
 
-  const report: RepairSweepReport = { scanned: pending.length, repaired: 0, stillPending: 0, failures: [], stuck };
+  const report: RepairSweepReport = { scanned: pending.length + neutralizations.length, repaired: 0, stillPending: 0, failures: [], stuck };
 
-  for (const s of pending) {
+  for (const s of [...pending, ...neutralizations]) {
     try {
       const res = await repairSale(s.tenantId, s.id);
       if (res.ok && res.synced) {

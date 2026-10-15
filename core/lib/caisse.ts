@@ -37,7 +37,7 @@ import {
   type GiftCardRedeemRefusal,
   type GiftCardRefusal,
 } from "./gift-card";
-import { runSaleSync, CAISSE_SOURCE_TYPE, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { checkVoidSnapshot, runPreparedVoidSale, type VoidRetry, type VoidPersist } from "./void-sale";
 import {
   runPaymentCorrection,
@@ -49,7 +49,7 @@ import { prepareClotureImport, type ImportClotureInput, type ImportClotureError 
 import { expectedXpfPourRapport, creditXpfPourRapport } from "./z-report";
 import { checkoutUnderpaidGuard, dueAtNoonUtcIso, type CreditOptions } from "./credit";
 import { prisma } from "./prisma";
-import { lockSaleRow, lockVoidResource } from "./sale-lock";
+import { lockSaleRow, lockVoidResource, SaleLockTimeoutError } from "./sale-lock";
 import { partialRefundWithPorts } from "./partial-refund-db";
 import { validRefundInput, refuse, type RefundInput, type RefundResult } from "./partial-refund";
 import {
@@ -726,6 +726,10 @@ type LoadedSale = NonNullable<Awaited<ReturnType<typeof getSale>>>;
 
 function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
   return {
+    status: sale.status,
+    voidPreparedAt: sale.voidPreparedAt,
+    creditNoteId: sale.creditNoteId,
+    syncError: sale.syncError,
     id: sale.id,
     tenantId: sale.tenantId,
     sourceId: sale.sourceId,
@@ -760,6 +764,36 @@ function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
   };
 }
 
+function guardFor(tenantId: string, saleId: string): SyncGuard {
+  const locked = <T>(decide: (tx: Prisma.TransactionClient, sale: LoadedSale | null) => Promise<T>) =>
+    withTenant(tenantId, async tx => {
+      const sale = await lockSaleRow(tx, saleId, tenantId)
+        ? await tx.sale.findFirst({ where: { id: saleId, tenantId }, include: { lines: true, payments: true } })
+        : null;
+      return decide(tx, sale);
+    });
+  return {
+    reread: () => locked(async (_tx, sale) => sale ? toSnapshot(sale) : null),
+    saveInvoiceRefIfLive: (invoiceId, invoiceNumber) => locked(async (tx, sale) => {
+      if (!sale || sale.status !== "PAID" || sale.voidPreparedAt || (sale.invoiceId && sale.invoiceId !== invoiceId)) {
+        return { saved: false as const, fresh: sale ? toSnapshot(sale) : null };
+      }
+      await tx.sale.update({ where: { id: saleId }, data: { invoiceId, invoiceNumber } });
+      return { saved: true as const };
+    }),
+    attachOrphanInvoice: (invoiceId, invoiceNumber) => locked(async (tx, sale) => {
+      if (!sale || sale.status !== "VOID" || sale.invoiceId) return false;
+      await tx.sale.update({ where: { id: saleId }, data: { invoiceId, invoiceNumber, syncError: NEUTRALISATION_MARKER } });
+      return true;
+    }),
+    attachNeutralization: (invoiceId, creditNoteId) => locked(async (tx, sale) => {
+      if (sale?.status === "VOID" && sale.invoiceId === invoiceId) {
+        await tx.sale.update({ where: { id: saleId }, data: { creditNoteId, syncError: null } });
+      }
+    }),
+  };
+}
+
 function persistFor(tenantId: string, saleId: string): SyncPersist {
   const update = (data: Prisma.SaleUpdateInput) =>
     withTenant(tenantId, (tx) => tx.sale.update({ where: { id: saleId }, data })).then(() => undefined);
@@ -777,12 +811,29 @@ function persistFor(tenantId: string, saleId: string): SyncPersist {
  * N'échoue jamais sur un échec core : l'issue est retournée + persistée (syncError/syncAttempts).
  */
 async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
-  const outcome = await runSaleSync(
-    toSnapshot(sale),
-    comptaClient(),
-    stockClient(),
-    persistFor(sale.tenantId, sale.id),
-  );
+  let outcome: SyncOutcome;
+  try {
+    outcome = await runSaleSync(
+      toSnapshot(sale),
+      comptaClient(),
+      stockClient(),
+      persistFor(sale.tenantId, sale.id),
+      guardFor(sale.tenantId, sale.id),
+    );
+  } catch (e) {
+    if (e instanceof SaleLockTimeoutError) {
+      log.warn("caisse.saleSyncLocked", { saleId: sale.id, tenantId: sale.tenantId });
+      return { synced: false, failure: null, stopped: "LOCKED", invoiceId: sale.invoiceId, invoiceNumber: sale.invoiceNumber, stockDecremented: 0 };
+    }
+    log.error("caisse.saleSyncUnexpected", e, { saleId: sale.id, tenantId: sale.tenantId });
+    // L'encaissement est déjà commité : la reprise traitera aussi les pannes DB inattendues.
+    return { synced: false, failure: null, stopped: "LOCKED", invoiceId: sale.invoiceId, invoiceNumber: sale.invoiceNumber, stockDecremented: 0 };
+  }
+  if (outcome.neutralized || (outcome.stopped === "VOID" && outcome.failure) || outcome.stopped === "INVOICE_CONFLICT") {
+    log.error("caisse.saleSyncNeutralization", new Error(outcome.failure ? formatFailure(outcome.failure) : outcome.stopped ?? "neutralized"), {
+      saleId: sale.id, tenantId: sale.tenantId, neutralized: outcome.neutralized, invoiceId: outcome.invoiceId,
+    });
+  }
   if (!outcome.synced && outcome.failure) {
     const f = outcome.failure;
     // Socle observabilité : pont inter-cores (Compta/Stock) en échec après encaissement → watchdog.
@@ -799,7 +850,7 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
 }
 
 export type RepairResult =
-  | { ok: false; error: "SALE_NOT_FOUND" | "NOT_PAID" }
+  | { ok: false; error: "SALE_NOT_FOUND" | "NOT_PAID" | "VOID_IN_PROGRESS" | "SALE_LOCKED" | "INVOICE_CONFLICT" }
   | {
       ok: true;
       saleId: string;
@@ -818,6 +869,21 @@ export type RepairResult =
 export async function repairSale(tenantId: string, saleId: string): Promise<RepairResult> {
   const sale = await getSale(tenantId, saleId);
   if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
+  if (sale.status === "VOID" && sale.syncError?.startsWith(NEUTRALISATION_MARKER)) {
+    try {
+      const result = await retryNeutralization(toSnapshot(sale), comptaClient(), guardFor(tenantId, saleId));
+      if (result.neutralized || result.failure) {
+        log.error("caisse.repairNeutralization", new Error(result.failure ? formatFailure(result.failure) : "Facture neutralisée"), { saleId, tenantId });
+      }
+      return { ok: true, saleId, synced: result.neutralized, alreadySynced: false,
+        invoiceId: sale.invoiceId, invoiceNumber: sale.invoiceNumber, stockDecremented: 0,
+        syncError: result.failure ? `${NEUTRALISATION_MARKER} ${formatFailure(result.failure)}` : sale.creditNoteId || result.neutralized ? null : sale.syncError };
+    } catch (e) {
+      if (!(e instanceof SaleLockTimeoutError)) throw e;
+      log.warn("caisse.repairNeutralizationLocked", { saleId, tenantId });
+      return { ok: false, error: "SALE_LOCKED" };
+    }
+  }
   if (sale.status !== "PAID") return { ok: false, error: "NOT_PAID" };
 
   if (sale.comptaSyncedAt && sale.stockSyncedAt) {
@@ -834,6 +900,10 @@ export async function repairSale(tenantId: string, saleId: string): Promise<Repa
   }
 
   const outcome = await syncLoadedSale(sale);
+  if (outcome.stopped) {
+    const errors = { VOID: "NOT_PAID", NOT_FOUND: "SALE_NOT_FOUND", VOID_IN_PROGRESS: "VOID_IN_PROGRESS", LOCKED: "SALE_LOCKED", INVOICE_CONFLICT: "INVOICE_CONFLICT" } as const;
+    return { ok: false, error: errors[outcome.stopped] };
+  }
   return {
     ok: true,
     saleId,
