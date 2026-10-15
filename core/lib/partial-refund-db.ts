@@ -7,6 +7,7 @@ type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
 export async function partialRefundWithPorts(tenantId: string, saleId: string, input: RefundInput, deps: {
   transact<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+  lockTenant(tx: Tx): Promise<void>;
   lockSale(tx: Tx): Promise<boolean>;
   lockAction(tx: Tx): Promise<void>;
   compta: ComptaClient;
@@ -33,8 +34,10 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
     async prepare() {
       // Rejouer une réservation ne relit pas Compta et conserve exactement son plan.
       const existing = await deps.transact(async tx => {
+        await deps.lockTenant(tx);
         await deps.lockAction(tx);
         if (!await deps.lockSale(tx)) return refuse("SALE_NOT_FOUND", 404);
+        if (!input.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         return readExisting(tx);
       });
       if (existing) return existing;
@@ -46,12 +49,14 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
       try { invoice = await deps.compta.invoiceDetail(tenantId, sale.invoiceId); }
       catch { return refuse("INVOICE_READ_FAILED", 502); }
       return deps.transact(async tx => {
+        await deps.lockTenant(tx);
         await deps.lockAction(tx);
         if (!await deps.lockSale(tx)) return refuse("SALE_NOT_FOUND", 404);
         const replay = await readExisting(tx);
         if (replay) return replay;
         const current = await tx.sale.findFirst({ where: { id: saleId, tenantId }, include: { lines: true } });
         if (!current) return refuse("SALE_NOT_FOUND", 404);
+        if (!input.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         if (!input.cashDayId && (current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         const refunds = await tx.partialRefund.findMany({ where: { tenantId, saleId } });
         if (refunds.some(r => r.status === "PENDING")) return refuse("REFUND_IN_PROGRESS");
@@ -70,12 +75,14 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
     },
     async finalize(reservation, creditNoteId) {
       return deps.transact(async tx => {
+        await deps.lockTenant(tx);
         await deps.lockAction(tx);
         if (!await deps.lockSale(tx)) return refuse("SALE_NOT_FOUND", 404);
         const replay = await readExisting(tx);
         if (!replay) return refuse("REFUND_RESERVATION_MISSING");
         if ("ok" in replay) return replay;
         if (replay.outcome) return replay.outcome;
+        if (!input.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId } });
         if (!sale) return refuse("SALE_NOT_FOUND", 404);
         // L'avoir est déjà émis côté Compta: c'est un fait, on termine en DONE même si la vente a changé.

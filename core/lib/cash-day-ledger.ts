@@ -2,7 +2,8 @@ import type { Prisma } from "@prisma/client";
 import { businessDay, canonical, CashContractError, factDelta, jsonValue, requireCash, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
 import { lockCashTenant, type CashTx } from "./caisse-sync";
 
-// Day avant Sale : toute transaction prenant les deux verrous lit d'abord cashDayId
+// Tenant → Day → Sale : verrouiller le tenant avant toute recherche de CashDay.
+// Toute transaction prenant les deux verrous lit d'abord cashDayId
 // sans verrou, verrouille le Day, puis la Sale, et relit son rattachement. Un changement
 // impose un 409 et l'annulation, jamais l'acquisition d'un nouveau Day après la Sale.
 export async function lockDay(tx: CashTx, tenantId: string, cashDayId: string) {

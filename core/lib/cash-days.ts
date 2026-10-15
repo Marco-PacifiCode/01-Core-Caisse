@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
-import { date, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, lockCashTenant, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 
@@ -17,6 +17,7 @@ function dayOf(b: ActionInput) {
   return day;
 }
 export async function openCashDay(tx: CashTx, b: ActionInput) {
+  await lockCashTenant(tx, b.tenantId);
   const business = dayOf(b), tenantId = b.tenantId, author = sourceAuthor(b);
   const sourceKey = text(b.sourceKey, 300), localSessionKey = text(b.localSessionKey, 300);
   const openingFloatXpf = xpfInteger(b.openingFloatXpf);
@@ -56,6 +57,7 @@ export async function dayState(tx: CashTx, tenantId: string, id: string) {
 }
 export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput) {
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
+  requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
   const countedXpf = xpfInteger(b.countedXpf), occurredAt = date(b.occurredAt);
   requireCash(businessDay(occurredAt) === day.businessDay, "DAY_MISMATCH", 409);
   const closureMode = text(b.closureMode);

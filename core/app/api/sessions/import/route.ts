@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { importerCloture } from "@/lib/caisse";
 import { noterPosteHorsLigne } from "@/lib/postes";
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 /**
  * POST /api/sessions/import
@@ -51,19 +53,26 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
 
-  const result = await importerCloture(tenantId, {
-    sourceType: body.sourceType ?? null,
-    sourceId: body.sourceId ?? null,
-    posteId: body.posteId?.trim() || null,
-    openedBy,
-    openedByName: body.openedByName?.trim() || undefined,
-    openedAt: body.openedAt ?? null,
-    closedAt: body.closedAt ?? null,
-    openingFloatXpf: body.openingFloatXpf ?? null,
-    closingCountedXpf: body.closingCountedXpf ?? null,
-    expectedXpf: body.expectedXpf ?? null,
-    note: body.note ?? null,
-  });
+  if (await cashDayGuard(tenantId, {})) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+  let result;
+  try {
+    result = await importerCloture(tenantId, {
+      sourceType: body.sourceType ?? null,
+      sourceId: body.sourceId ?? null,
+      posteId: body.posteId?.trim() || null,
+      openedBy,
+      openedByName: body.openedByName?.trim() || undefined,
+      openedAt: body.openedAt ?? null,
+      closedAt: body.closedAt ?? null,
+      openingFloatXpf: body.openingFloatXpf ?? null,
+      closingCountedXpf: body.closingCountedXpf ?? null,
+      expectedXpf: body.expectedXpf ?? null,
+      note: body.note ?? null,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) return NextResponse.json(result, { status: 400 });
 

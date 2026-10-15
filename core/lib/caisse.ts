@@ -77,7 +77,7 @@ import {
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 import { annulerInscription, inscrirePosteEnLigne } from "./postes";
 import { appendDayFact, consumePickupOrder, lockDay, lockSharedSale, prepareSharedCheckout, recordSharedGift, recordSharedSale } from "./cash-day-ledger";
-import { ackFinancial } from "./caisse-sync";
+import { ackFinancial, lockCashTenant } from "./caisse-sync";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
@@ -235,6 +235,13 @@ export async function closeSessionTx(
   tx: Prisma.TransactionClient, tenantId: string,
   input: { sessionId: string; closedBy: string; closedByName?: string; closingCountedXpf: bigint },
 ): Promise<{ ok: false; error: "SESSION_NOT_FOUND" } | { ok: true; report: ZReport; alreadyClosed: boolean }> {
+    await lockCashTenant(tx, tenantId);
+    const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId: input.sessionId } } });
+    const owner = alias ? { id: alias.cashDayId } : await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: input.sessionId } });
+    if (owner) {
+      await lockDay(tx, tenantId, owner.id);
+      if (await tx.partialRefund.findFirst({ where: { tenantId, cashDayId: owner.id, status: "PENDING" } })) throw new CashContractError("REFUND_IN_PROGRESS", 409);
+    }
     // Sérialise le Z avec la finalisation d'un REFUND: lecture après le verrou.
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${"3s"}, true)`;
     await tx.$queryRaw`SELECT "id" FROM "CashSession" WHERE "id" = ${input.sessionId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
@@ -397,6 +404,8 @@ export async function importerCloture(tenantId: string, input: ImporterClotureIn
   if (!prepared.ok) return prepared;
 
   return withTenant(tenantId, async (tx) => {
+    await lockCashTenant(tx, tenantId);
+    if (await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
     const existing = await tx.cashSession.findFirst({
       where: { tenantId, sourceType: prepared.sourceType, sourceId: prepared.sourceId },
       select: { id: true, varianceXpf: true },
@@ -1114,6 +1123,7 @@ export async function checkoutSale(
   // Persiste les nouveaux paiements (avec settleRef déterministe) s'il y en a.
   if (toPersist.length > 0) {
     await withTenant(tenantId, async (tx) => {
+      await lockCashTenant(tx, tenantId);
       const beforeLock = await lockSharedSale(tx, tenantId, saleId);
       if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
       const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
@@ -1190,6 +1200,7 @@ export async function checkoutSale(
   // base : c'est le lien non ambigu documenté dans loyalty.ts (`GiftCard.saleId`, pas une ligne).
   const giftCardSalesXpf = giftCardsToIssue.reduce((t, g) => t + g.amountXpf, 0n);
   const issued = await withTenant(tenantId, async (tx) => {
+    await lockCashTenant(tx, tenantId);
     const beforeLock = await lockSharedSale(tx, tenantId, saleId);
     if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
     const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
@@ -1452,6 +1463,7 @@ export async function annulerVente(
     const persist: VoidPersist = {
       async markVoid(creditNoteId, prepared) {
         return withTenant(safeTenantId, async (tx) => {
+          await lockCashTenant(tx, safeTenantId);
           const beforeLock = await lockSharedSale(tx, safeTenantId, saleId);
           if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
           const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
@@ -1491,6 +1503,7 @@ export async function annulerVente(
     return await runPreparedVoidSale({
       async prepare() {
         return withTenant(safeTenantId, async (tx) => {
+          await lockCashTenant(tx, safeTenantId);
           const beforeLock = await lockSharedSale(tx, safeTenantId, saleId);
           if (actionId) await lockVoidResource(tx, safeTenantId, 'action:' + actionId);
           if (!await lockSaleRow(tx, saleId, safeTenantId)) return { error: "SALE_NOT_FOUND" as const };
@@ -1534,11 +1547,17 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
     ...(input.createdBy ? { createdBy: input.createdBy.toLowerCase() } : {}) };
   return partialRefundWithPorts(safeTenantId, saleId, normalized, {
     transact: fn => withTenant(safeTenantId, fn),
+    lockTenant: tx => lockCashTenant(tx, safeTenantId),
     lockAction: tx => lockVoidResource(tx, safeTenantId, "partial-action:" + normalized.actionId),
     lockSale: async tx => {
       if (normalized.cashDayId) {
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
-        if (day.currentSession.status !== "OPEN") throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+        if (day.currentSession.status !== "OPEN") {
+          const reserved = await tx.partialRefund.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId: normalized.actionId } } });
+          if (reserved?.cashDayId === day.id && reserved.status === "PENDING") throw new CashContractError("REFUND_DAY_CLOSED_REOPEN_REQUIRED", 409,
+            { message: "Le jour réservé est clos : rouvrir cette caisse puis rejouer le même avoir." });
+          throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+        }
         if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
         // Refuse la collision avant la réservation de l'avoir et tout appel Compta.
         await ackFinancial(tx, safeTenantId, normalized.actionId,
@@ -1722,12 +1741,15 @@ export async function corrigerMoyenPaiement(
 ): Promise<CorrectionResult> {
   const deps: PaymentCorrectionDeps = {
     async loadSale(saleId): Promise<SaleSnapshotForCorrection | null> {
-      const sale = await withTenant(tenantId, (tx) =>
-        tx.sale.findFirst({
+      const sale = await withTenant(tenantId, async (tx) => {
+        await lockCashTenant(tx, tenantId);
+        const current = await tx.sale.findFirst({
           where: { id: saleId, tenantId },
           include: { payments: true, session: true },
-        }),
-      );
+        });
+        if (current && !current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+        return current;
+      });
       if (!sale) return null;
       return {
         id: sale.id,
@@ -1752,6 +1774,7 @@ export async function corrigerMoyenPaiement(
 
     async insertCorrectionPayments(args) {
       return withTenant(tenantId, async (tx) => {
+        await lockCashTenant(tx, tenantId);
         // Day avant Sale ; verrou de vente AVANT le `count` (cf. lib/sale-lock.ts).
         // `SalePayment` n'a aucune contrainte d'unicité sur `settleRef` : sans ce verrou,
         // deux transactions concurrentes lisent le même `count = 0` en READ COMMITTED et
@@ -1766,6 +1789,7 @@ export async function corrigerMoyenPaiement(
         await lockSaleRow(tx, args.saleId, tenantId);
         const current = await tx.sale.findFirst({ where: { tenantId, id: args.saleId } });
         if (current?.cashDayId !== shared?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+        if (!current?.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
 
         const already = await tx.salePayment.count({
           where: { tenantId, saleId: args.saleId, settleRef: args.sortie },
@@ -1846,6 +1870,7 @@ export async function recordCashMovement(
   input: RecordMovementInput,
 ): Promise<RecordMovementResult> {
   return withTenant(tenantId, async (tx) => {
+    await lockCashTenant(tx, tenantId);
     const openDay = await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN" } } });
     const lockedDay = openDay ? await lockDay(tx, tenantId, openDay.id) : null;
     if (lockedDay ? lockedDay.currentSession.status !== "OPEN"

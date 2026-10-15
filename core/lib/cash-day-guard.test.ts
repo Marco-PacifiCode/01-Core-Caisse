@@ -36,12 +36,13 @@ function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "oth
   };
   const guard = load("cash-day-guard.ts", { "./tenant": { withTenant: async (_tenant: string, fn: (tx: unknown) => unknown) => fn(tx) } });
   const writes: string[] = [];
-  const native = Object.fromEntries(["openSession", "closeSession", "createSale", "checkoutSale", "annulerVente", "rembourserPartiellement"].map(name =>
+  const native = Object.fromEntries(["openSession", "closeSession", "createSale", "checkoutSale", "annulerVente", "rembourserPartiellement", "corrigerMoyenPaiement", "importerCloture"].map(name =>
     [name, async () => { writes.push(name); return { ok: true, session: { id: sessionId, openingFloatXpf: 25000n }, report: {}, saleId }; }]));
   const imports = {
     "@/lib/cash-day-guard": guard,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
+    "@/lib/log": { log: { info() {} } }, "@/lib/postes": { noterPosteHorsLigne: async () => {} },
     "@/lib/tenant": {}, "@/lib/serialize": { xpf: Number }, "@/lib/partial-refund": refundPolicy,
     "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
     "next/cache": { revalidatePath: () => {} }, "@/lib/guards": { requireStaff: async () => ({ user: { id: actionId }, tenant: { id: tenant } }) },
@@ -49,6 +50,8 @@ function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "oth
   return { guard, writes, imports };
 }
 const cases: [string, Row][] = [
+  ["sessions/import/route.ts", { openedBy: actionId, openingFloatXpf: 25000, expectedXpf: 25000, closingCountedXpf: 25000 }],
+  ["sales/[id]/payment-correction/route.ts", { fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 }],
   ["sessions/route.ts", { openedBy: actionId }],
   ["sessions/[id]/close/route.ts", { closedBy: actionId, closingCountedXpf: 25000 }],
   ["sales/route.ts", { sessionId, lines: [{ kind: "OTHER", label: "Synthétique", qty: 1, unitXpf: 1000 }] }],
@@ -106,6 +109,24 @@ test("void HTTP : CashContractError pendant la transaction renvoie 409", async (
   const response = await route.POST({ json: async () => ({ tenantId: tenant }), headers: new Headers() }, { params: Promise.resolve({ id: saleId }) });
   assert.equal(response.status, 409);
   assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+});
+
+test("correction HTTP : vente rattachée au journal autorisée, même après clôture", async () => {
+  for (const open of [true, false]) {
+    const f = fixture("sale-only", open);
+    const route = load("../app/api/sales/[id]/payment-correction/route.ts", f.imports);
+    const response = await route.POST({ json: async () => ({ tenantId: tenant, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 }) },
+      { params: Promise.resolve({ id: saleId }) });
+    assert.equal(response.status, 200); assert.equal(f.writes.length, 1);
+  }
+});
+
+test("import Z HTTP : CashContractError après la garde renvoie 409", async () => {
+  const f = fixture("standalone");
+  f.imports["@/lib/caisse"].importerCloture = async () => { throw new projection.CashContractError("CASHDAY_ROUTE_REQUIRED", 409); };
+  const route = load("../app/api/sessions/import/route.ts", f.imports);
+  const response = await route.POST({ json: async () => ({ tenantId: tenant, openedBy: actionId }) });
+  assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
 });
 test("actions serveur : refus avant toute écriture CashDay, comportement natif conservé", async () => {
   for (const mode of ["canonical", "alias", "standalone"] as const) {

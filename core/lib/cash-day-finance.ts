@@ -16,6 +16,8 @@ export async function dayFinancial(cashDayId: string, saleId: string, operation:
     return await applyDayFinancial(cashDayId, saleId, operation, b);
   } catch (e) {
     if (e instanceof CashContractError) {
+      // Ancienne réservation sur jour clos : refus explicite, clé conservée rejouable.
+      if (e.message === "REFUND_DAY_CLOSED_REOPEN_REQUIRED") return { ok: false, error: e.message, status: e.status, data: e.data };
       const completed = await withTenant(b.tenantId, async tx => {
         // Un appel concurrent de la même clé peut avoir terminé entre-temps.
         const action = await tx.caisseSyncAction.findUnique({ where: { tenantId_actionId: { tenantId: b.tenantId, actionId: b.actionId } } });

@@ -33,6 +33,7 @@ function fixture(original = sale()) {
   const matches = (row: any, where: any) => Object.entries(where).every(([k, v]) => row[k] === v);
   const refundFor = (where: any) => state.refunds.find(r => matches(r, where.tenantId_actionId ?? where)) ?? null;
   const tx = {
+    cashDay: { findFirst: async () => null },
     sale: { findFirst: async ({ where }: any) => matches(state.sale, where) ? structuredClone(state.sale) : null,
       update: async ({ data }: any) => Object.assign(state.sale, data) },
     partialRefund: {
@@ -89,7 +90,7 @@ function fixture(original = sale()) {
     failCompta(value: boolean) { fail = value; }, onCredit(value: () => void) { afterCredit = value; }, failNextCommit() { failCommit = true; },
     run(value = input(), tenantId = TENANT, saleId = SALE) {
       return partialRefundWithPorts(tenantId, saleId, value, { transact, compta,
-        async lockAction() {}, async lockSale() { return state.sale.tenantId === tenantId && state.sale.id === saleId; } });
+        async lockTenant() {}, async lockAction() {}, async lockSale() { return state.sale.tenantId === tenantId && state.sale.id === saleId; } });
     },
   };
 }

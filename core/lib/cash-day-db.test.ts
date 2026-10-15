@@ -16,6 +16,7 @@ import * as gifts from "./gift-card.ts";
 import * as reports from "./z-report.ts";
 import * as corrections from "./payment-correction.ts";
 import * as voidPolicy from "./void-sale.ts";
+import * as importsPolicy from "./import-cloture.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "10000000-0000-0000-0000-000000000001", tenantB = "10000000-0000-0000-0000-000000000002";
@@ -29,6 +30,7 @@ function load(file: string, imports: Record<string, unknown>) {
   run((name: string) => name in imports ? imports[name] : require(name), module, module.exports);
   return module.exports;
 }
+const tenantLock = load("caisse-sync.ts", { "./tenant": {}, "./cash-day-projection": projection }).lockCashTenant;
 function caisseFunction(name: string, globals: Row) {
   const source = readFileSync(new URL("caisse.ts", import.meta.url), "utf8");
   const start = source.indexOf(`export async function ${name}(`);
@@ -36,7 +38,7 @@ function caisseFunction(name: string, globals: Row) {
   const end = source.indexOf("\nexport ", start + 10);
   const js = ts.transpileModule(source.slice(start, end < 0 ? undefined : end).replace("export ", ""),
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...globals });
+  return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, lockCashTenant: tenantLock, ...globals });
 }
 type Row = Record<string, any>;
 function fixture(enforceDayBeforeSale = false) {
@@ -127,6 +129,7 @@ function fixture(enforceDayBeforeSale = false) {
       saleLock(String(values[0]));
       return state.sale.filter(r => r.id === values[0] && r.tenantId === values[1]).map(r => ({ id: r.id }));
     }
+    if (sql.includes("pg_advisory_xact_lock") && String(values[0]).startsWith("cash-l4:")) trace.push(`Tenant:${values[0]}`);
     return [];
   };
   tx.$executeRawUnsafe = async (sql: string) => { queries.push(sql); if (sql.startsWith("SAVEPOINT")) saved = structuredClone(state); if (sql.startsWith("ROLLBACK TO")) state = structuredClone(saved!); };
@@ -146,7 +149,7 @@ function fixture(enforceDayBeforeSale = false) {
       if (old) return { ok: false, sessionId: old.id };
       return { ok: true, session: await tx.cashSession.create({ data: { tenantId, ...b, openedAt: b.occurredAt } }) };
     },
-    closeSessionTx: caisseFunction("closeSessionTx", { ...movements, ...gifts, ...reports }),
+    closeSessionTx: caisseFunction("closeSessionTx", { ...movements, ...gifts, ...reports, ...ledger }),
   };
   const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection, "./sale-lock": locks });
   const shared = load("cash-shared-data.ts", { "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
@@ -186,6 +189,7 @@ function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant } }),
     "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
     "@/lib/tenant": { withTenant: f.withTenant }, "@/lib/serialize": { xpf: Number },
+    "@/lib/log": { log: { info() {} } }, "@/lib/postes": { noterPosteHorsLigne: async () => {} },
   });
 }
 async function expected(f: ReturnType<typeof fixture>, id: string) {
@@ -194,6 +198,155 @@ async function expected(f: ReturnType<typeof fixture>, id: string) {
 }
 const routeRequired = (e: Row) => e.status === 409 && e.message === "CASHDAY_ROUTE_REQUIRED";
 const thousandLine = () => ({ id: tenantB, kind: "OTHER", label: "Article synthétique", qty: 1, unitXpf: 1000n, lineXpf: 1000n, tgcRatePpm: 0 });
+
+test("huitième relecture : clôture refusée pendant Compta, rejeu de l'avoir 1000 DONE puis Z 24000", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", invoiceId: "synthetic-invoice", totalXpf: 1000n, lines: [thousandLine()] } });
+  const closeInput = input({ sourceKey: "close-pending", cycle: 0, closureMode: "ONLINE", countedXpf: "24000", localExpectedXpf: "24000", localVarianceXpf: "0" });
+  let first = true;
+  const native = financialPorts(f, { afterCredit: async () => {
+    if (!first) return;
+    first = false;
+    assert.equal(f.rows("partialRefund")[0].status, "PENDING");
+    for (const close of [
+      () => f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, closeInput)),
+      () => f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, { ...closeInput, closureMode: "IMPORT", legacySnapshot: { knownSourceRefs: [] } })),
+      () => f.withTenant(tenant, (tx: Row) => f.native.closeSessionTx(tx, tenant, { sessionId: day.currentSessionId, closingCountedXpf: 24000n })),
+    ]) await assert.rejects(close(), (e: Row) => e.status === 409 && e.message === "REFUND_IN_PROGRESS");
+    assert.equal(f.rows("cashSession")[0].status, "OPEN");
+    assert.equal(f.rows("cashDayClosure").length, 0);
+    throw new Error("Réponse Compta perdue après émission");
+  } });
+  const finance = load("cash-day-finance.ts", { "./caisse": native, "./tenant": { withTenant: f.withTenant },
+    "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger, "./cash-day-projection": projection, "./partial-refund": refundPolicy });
+  const b = input({ actionId: actor, entityKey: sale.id, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH" });
+  assert.equal((await finance.dayFinancial(day.id, sale.id, "partial-refund", b)).ok, false);
+  assert.equal(f.rows("partialRefund")[0].status, "PENDING");
+  assert.equal(f.rows("caisseSyncAction")[0].state, "PENDING");
+  assert.equal(await expected(f, day.id), 25000n);
+  const replay = await finance.dayFinancial(day.id, sale.id, "partial-refund", b);
+  assert.equal(replay.ok, true); assert.equal(f.rows("partialRefund")[0].status, "DONE");
+  assert.equal(f.rows("caisseSyncAction")[0].state, "ACK");
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 1);
+  assert.equal(await expected(f, day.id), 24000n);
+  const closed = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, closeInput));
+  assert.equal(closed.report.expectedXpf, 24000); assert.equal(closed.report.varianceXpf, 0);
+  assert.equal((await finance.dayFinancial(day.id, sale.id, "partial-refund", b)).alreadyApplied, true);
+});
+
+test("huitième relecture : ancienne réservation sur jour clos, refus explicite sans CONFLICT", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", invoiceId: "synthetic-invoice", totalXpf: 1000n, lines: [thousandLine()] } });
+  const native = financialPorts(f, { afterCredit: () => { throw new Error("Réponse perdue"); } });
+  const finance = load("cash-day-finance.ts", { "./caisse": native, "./tenant": { withTenant: f.withTenant },
+    "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger, "./cash-day-projection": projection, "./partial-refund": refundPolicy });
+  const b = input({ actionId: actor, entityKey: sale.id, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH" });
+  await finance.dayFinancial(day.id, sale.id, "partial-refund", b);
+  await f.tx.cashSession.update({ where: { id: day.currentSessionId }, data: { status: "CLOSED" } });
+  for (let i = 0; i < 2; i++) {
+    const result = await finance.dayFinancial(day.id, sale.id, "partial-refund", b);
+    assert.equal(result.status, 409); assert.equal(result.error, "REFUND_DAY_CLOSED_REOPEN_REQUIRED");
+    assert.match(result.data.message, /rouvrir/);
+    assert.equal(f.rows("caisseSyncAction")[0].state, "PENDING");
+  }
+  assert.equal(f.rows("partialRefund")[0].status, "PENDING"); assert.equal(await expected(f, day.id), 25000n);
+});
+
+test("huitième relecture : première ouverture concurrente et retrait 500, fait MOVEMENT et T 24500", async () => {
+  const f = fixture();
+  await f.tx.cashSession.create({ data: { tenantId: tenant, openingFloatXpf: 25000n, openedAt: now } });
+  let lockTail = Promise.resolve();
+  // Seul le verrou consultatif réel sérialise ces deux transactions simulées.
+  async function transact(fn: (tx: Row) => Promise<any>, opening = false) {
+    let held = false, release: (() => void) | undefined;
+    const tx = { ...f.tx, $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      if (strings.join("?").includes("pg_advisory_xact_lock") && !held) {
+        const previous = lockTail; lockTail = new Promise<void>(resolve => { release = resolve; });
+        await previous; held = true;
+      }
+      return f.tx.$queryRaw(strings, ...values);
+    } };
+    if (opening) tx.cashDay = { ...f.tx.cashDay, create: async (args: Row) => { reached(); await creationGate; return f.tx.cashDay.create(args); } };
+    try { return await fn(tx); } finally { release?.(); }
+  }
+  let reached!: () => void, resume!: () => void;
+  const atCreation = new Promise<void>(resolve => { reached = resolve; });
+  const creationGate = new Promise<void>(resolve => { resume = resolve; });
+  const opening = transact(tx => f.days.openCashDay(tx, input()), true);
+  await atCreation;
+  assert.equal(f.rows("cashDay").length, 0, "le premier jour n'existe pas encore");
+  const record = caisseFunction("recordCashMovement", { ...f.ledger, withTenant: (_tenant: string, fn: (tx: Row) => Promise<any>) => transact(fn) });
+  const withdrawal = record(tenant, { kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique" });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  resume();
+  const [, result] = await Promise.all([opening, withdrawal]);
+  assert.equal(result.ok, true);
+  assert.equal(f.rows("cashMovement").length, 1);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "MOVEMENT" && e.cashDeltaXpf === -500n).length, 1);
+  assert.equal(await expected(f, f.rows("cashDay")[0].id), 24500n);
+});
+
+test("huitième relecture : correction vente sans cashDayId, HTTP et transaction 409 ; tenant natif conservé", async () => {
+  for (const hasDay of [true, false]) {
+    const f = fixture();
+    if (hasDay) await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", totalXpf: 1000n,
+      paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now, payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
+    let external = 0;
+    const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+      comptaClient: () => ({ paymentCorrection: async () => { external++; return { ok: true }; } }),
+      runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
+    });
+    const b = { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 };
+    if (hasDay) await assert.rejects(correct(tenant, b), routeRequired);
+    else assert.equal((await correct(tenant, b)).ok, true);
+    const route = api(f, "sales/[id]/payment-correction/route.ts", { corrigerMoyenPaiement: correct });
+    const response = await route.POST({ json: async () => ({ tenantId: tenant, ...b,
+      ...(hasDay ? {} : { fromMethod: "CARD", toMethod: "CASH" }) }) }, { params: Promise.resolve({ id: sale.id }) });
+    assert.equal(response.status, hasDay ? 409 : 200);
+    assert.equal(f.rows("sale")[0].payments.length, hasDay ? 1 : 5);
+    assert.equal(external, hasDay ? 0 : 2);
+    if (hasDay) { assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED"); assert.equal(await expected(f, f.rows("cashDay")[0].id), 25000n); }
+  }
+});
+
+test("huitième relecture : premier CashDay créé pendant Compta, correction refusée dans la transaction d'écriture", async () => {
+  const f = fixture();
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", totalXpf: 1000n,
+    paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now, payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
+  const correct = caisseFunction("corrigerMoyenPaiement", { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    comptaClient: () => ({ paymentCorrection: async () => { await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())); return { ok: true }; } }),
+    runPaymentCorrection: (deps: corrections.PaymentCorrectionDeps, b: corrections.PaymentCorrectionInput) => corrections.runPaymentCorrection(deps, { ...b, maintenant: now }),
+  });
+  const response = await api(f, "sales/[id]/payment-correction/route.ts", { corrigerMoyenPaiement: correct }).POST(
+    { json: async () => ({ tenantId: tenant, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 }) }, { params: Promise.resolve({ id: sale.id }) });
+  assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+  assert.equal(f.rows("sale")[0].payments.length, 1);
+  assert.equal(await expected(f, f.rows("cashDay")[0].id), 25000n);
+  const locks = f.lockTraces.find(t => t.includes(`Sale:${sale.id}`))!;
+  assert.ok(locks.indexOf(`Tenant:cash-l4:${tenant}`) < locks.indexOf(`Sale:${sale.id}`));
+});
+
+test("huitième relecture : import Z historique, HTTP et transaction 409 ; tenant natif conservé", async () => {
+  for (const hasDay of [true, false]) {
+    const f = fixture();
+    if (hasDay) await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const importer = caisseFunction("importerCloture", { ...importsPolicy, withTenant: f.withTenant,
+      Prisma: { PrismaClientKnownRequestError: class extends Error {} } });
+    const b = { sourceType: "synthetic", sourceId: "z-legacy", openedBy: actor, openedAt: now.toISOString(), closedAt: now.toISOString(),
+      openingFloatXpf: 25000, closingCountedXpf: 25000, expectedXpf: 25000 };
+    const before = f.rows("cashSession");
+    if (hasDay) await assert.rejects(importer(tenant, b), routeRequired);
+    else { const result = await importer(tenant, b); assert.equal(result.ok, true); assert.equal(result.varianceXpf, 0); }
+    const route = api(f, "sessions/import/route.ts", { importerCloture: importer });
+    const response = await route.POST({ json: async () => ({ tenantId: tenant, ...b }) });
+    assert.equal(response.status, hasDay ? 409 : 200);
+    if (hasDay) { assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED"); assert.deepEqual(f.rows("cashSession"), before); }
+    else { assert.equal(f.rows("cashSession").length, 1); assert.equal(f.rows("cashSession")[0].status, "CLOSED"); assert.equal(response.body.alreadyExisted, true); }
+  }
+});
 
 test("septième relecture : CashDay fermé et session historique OPEN, retrait 500 refusé sans écriture", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
@@ -225,7 +378,11 @@ for (const operation of ["checkout", "void"] as const) {
     assert.equal(result.ok, true);
     const transactions = f.lockTraces.slice(start).filter(t => t.includes(`Sale:${sale.id}`));
     assert.equal(transactions.length, 2, "les deux transactions prennent le verrou Sale");
-    for (const locks of transactions) assert.ok(locks.indexOf(`Day:${day.id}`) < locks.indexOf(`Sale:${sale.id}`));
+    for (const locks of transactions) {
+      assert.ok(locks.indexOf(`Tenant:cash-l4:${tenant}`) >= 0);
+      assert.ok(locks.indexOf(`Tenant:cash-l4:${tenant}`) < locks.indexOf(`Day:${day.id}`));
+      assert.ok(locks.indexOf(`Day:${day.id}`) < locks.indexOf(`Sale:${sale.id}`));
+    }
     assert.equal(f.rows("sale")[0].status, operation === "checkout" ? "PAID" : "VOID");
     assert.equal(f.rows("cashDayEvent").filter(e => e.kind === (operation === "checkout" ? "SALE_PAID" : "SALE_VOID")).length, 1);
   });
@@ -286,6 +443,7 @@ test("sixième relecture (b) : avoir CASH 1000 sur vente ancienne sans CashDay r
   const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy });
   const blocked = await refundDb.partialRefundWithPorts(tenant, sale.id, b, {
     transact: (fn: (tx: Row) => Promise<unknown>) => f.withTenant(tenant, fn),
+    lockTenant: (tx: Row) => f.sync.lockCashTenant(tx, tenant),
     lockAction: async () => {}, lockSale: (tx: Row) => f.locks.lockSaleRow(tx, sale.id, tenant),
     compta: { invoiceDetail: async () => ({ id: "old-invoice", sourceType: "caisse", sourceId: sale.id, totalXpf: 1000, paidXpf: 1000, tgcRatePpm: 0,
       lines: [{ ...thousandLine(), id: "invoice-line", unitXpf: 1000 }] }), creditNote: async () => assert.fail("aucun avoir émis") },
@@ -369,13 +527,14 @@ test("void HTTP : rattachement après préparation, relecture finale refuse en 4
   assert.equal(await expected(f, f.rows("cashDay")[0].id), 25000n);
 });
 
-test("avoir : fermeture pendant Compta, relecture verrouillée refuse la finalisation, T 25000", async () => {
+test("ancien avoir PENDING sur jour clos : refus explicite de réouverture, T 25000", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
   const day = f.rows("cashDay")[0];
   const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", invoiceId: "old-invoice", totalXpf: 1000n, lines: [thousandLine()] } });
   const native = financialPorts(f, { afterCredit: () => f.withTenant(tenant, (tx: Row) => tx.cashSession.update({ where: { id: day.currentSessionId }, data: { status: "CLOSED" } })) });
   await assert.rejects(native.rembourserPartiellement(tenant, sale.id, { actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH", cashDrawer: "EXTERNAL",
-    cashDayId: day.id, drawerBusinessDay: day.businessDay, deviceId: "A", occurredAt: now.toISOString() }), routeRequired);
+    cashDayId: day.id, drawerBusinessDay: day.businessDay, deviceId: "A", occurredAt: now.toISOString() }),
+    (e: Row) => e.status === 409 && e.message === "REFUND_DAY_CLOSED_REOPEN_REQUIRED" && e.data.message.includes("rouvrir"));
   assert.equal(f.rows("partialRefund")[0].status, "PENDING"); assert.equal(f.rows("cashMovement").length, 0);
   assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 0);
   assert.equal(await expected(f, day.id), 25000n);
@@ -595,8 +754,9 @@ test("clôture CashDay : ledger 25800 avec avoir 200, théorique persisté et é
 
 test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000, rejeu sans doublon", async () => {
   for (const beforeImport of [false, true]) {
-    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
-    const id = f.rows("cashDay")[0].id;
+    const f = fixture();
+    if (!beforeImport) await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    let id = f.rows("cashDay")[0]?.id;
     const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: beforeImport ? null : id,
       sourceType: "synthetic", sourceId: "corrected", status: "PAID", paidAt: now, invoiceId: "synthetic-invoice", comptaSyncedAt: now,
       totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n, settleRef: "initial" }] } });
@@ -608,6 +768,10 @@ test("correction CASH vers CARD pendant OPEN et avant import : théorique 25000,
     const b = { saleId: sale.id, fromMethod: "CASH", toMethod: "CARD", amountXpf: 1000 };
     const results = await Promise.all([correct(tenant, b), correct(tenant, b)]);
     assert.ok(results.every(r => r.ok)); assert.ok(results.some(r => r.alreadyCorrected));
+    if (beforeImport) {
+      await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+      id = f.rows("cashDay")[0].id;
+    }
     const attach = input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "corrected" }] });
     for (let i = 0; i < 2; i++) await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, attach));
     const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
