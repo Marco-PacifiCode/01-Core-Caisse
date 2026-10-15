@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import type { ComptaClient } from "./clients";
 import { partialRefundMovementRef } from "./cash-movement.ts";
 import { planPartialRefund, refundFingerprint, refuse, runPartialRefund, type RefundInput, type RefundPlan, type RefundResult, type RefundSuccess, type RefundReservation } from "./partial-refund.ts";
-import { normalizeActionId, uuid } from "./caisse-sync.ts";
+import { normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync.ts";
 
 type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
@@ -16,14 +16,15 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
   recordDrawer?(tx: Tx, action: { id: string }, plan: RefundPlan): Promise<void>;
 }): Promise<RefundResult> {
   tenantId = uuid(tenantId); saleId = uuid(saleId);
-  input = { ...input, actionId: normalizeActionId(input.actionId),
+  input = { ...normalizeActionInput(input), actionId: normalizeActionId(input.actionId),
     ...(input.cashDayId ? { cashDayId: uuid(input.cashDayId) } : {}),
     lines: input.lines.map(line => ({ ...line, lineId: uuid(line.lineId) })) };
-  const key = { tenantId_actionId: { tenantId, actionId: input.actionId } };
+  let key = { tenantId_actionId: { tenantId, actionId: input.actionId } };
   const readExisting = async (tx: Tx): Promise<RefundReservation | ReturnType<typeof refuse> | null> => {
-    const r = await tx.partialRefund.findUnique({ where: key });
+    const r = await tx.partialRefund.findFirst({ where: { tenantId, actionId: { equals: input.actionId, mode: "insensitive" } } });
     if (!r) return null;
-    if (r.saleId !== saleId || refundFingerprint(r.input as unknown as RefundInput) !== refundFingerprint(input)) return refuse("ACTION_ID_CONFLICT");
+    key = { tenantId_actionId: { tenantId, actionId: r.actionId } };
+    if (r.saleId.toLowerCase() !== saleId || refundFingerprint(normalizeActionInput(r.input as unknown as RefundInput)) !== refundFingerprint(input)) return refuse("ACTION_ID_CONFLICT");
     return { input: r.input as unknown as RefundInput, plan: r.plan as unknown as RefundPlan,
       ...(r.status === "DONE" ? { outcome: r.outcome as unknown as RefundSuccess } : {}) };
   };

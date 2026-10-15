@@ -41,7 +41,6 @@ import {
 import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, shouldWriteSyncError, formatFailure, CAISSE_SOURCE_TYPE, type SyncGuard, type SyncOutcome, type SyncPersist, type SyncSaleSnapshot } from "./sync";
 import { checkVoidSnapshot, runPreparedVoidSale, type VoidRetry, type VoidPersist } from "./void-sale";
 import {
-  runPaymentCorrection,
   type PaymentCorrectionDeps,
   type CorrectionResult,
   type SaleSnapshotForCorrection,
@@ -79,7 +78,7 @@ import { annulerInscription, inscrirePosteEnLigne } from "./postes";
 import { appendDayFact, consumePickupOrder, lockDay, lockSharedSale, prepareSharedCheckout, recordSharedGift, recordSharedSale } from "./cash-day-ledger";
 import { ackFinancial, lockCashTenant, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync";
 import { assertLegacyWriteAllowed } from "./cash-day-guard";
-import { generationCorrection, correctionKeyPour, verifierCorrection, refsDeLaCorrection } from "./payment-correction";
+import { verifierCorrection } from "./payment-correction";
 
 // Ré-export du helper pur (rendu monnaie) — testé unitairement via lib/money.ts.
 export { computeChange } from "./money";
@@ -1563,6 +1562,8 @@ export async function annulerVente(
   if (opts) opts = normalizeActionInput(opts);
   const safeTenantId = assertTenantId(tenantId);
   const actionId = opts?.actionId?.toLowerCase();
+  let savedOutcome: AnnulerVenteResult | undefined;
+  let voidCreditKey: string | undefined;
   let preparedLink: { cashDayId: string | null; sessionId: string | null } | undefined;
   // Locale à l'adaptateur : le banc de tests extrait cette fonction seule.
   const checkRoute = async (tx: Prisma.TransactionClient, current: { cashDayId: string | null; sessionId: string | null }, previous?: typeof preparedLink) => {
@@ -1595,9 +1596,9 @@ export async function annulerVente(
           const sale = current;
           if (current.status === "VOID") {
             if (actionId) {
-              const action = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
-              if (action && action.saleId.toLowerCase() === saleId.toLowerCase()) await tx.voidAction.update({
-                where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
+              const action = await tx.voidAction.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } } });
+              if (action && action.saleId.toLowerCase() === saleId.toLowerCase()) await tx.voidAction.updateMany({
+                where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } },
                 data: { status: "DONE", outcome: { ok: true, alreadyVoid: true, creditNoteId: current.creditNoteId ?? null } },
               });
             }
@@ -1611,15 +1612,15 @@ export async function annulerVente(
           if (sale.status === "PAID") {
             await reverseSaleLoyalty(tx, { tenantId, saleId });
           }
-          if (actionId) await tx.voidAction.update({
-            where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
+          if (actionId) await tx.voidAction.updateMany({
+            where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } },
             data: { status: "DONE", outcome: { ok: true, alreadyVoid: false, creditNoteId } },
           });
           return { alreadyVoid: false, creditNoteId };
         });
       },
     };
-    return await runPreparedVoidSale({
+    const result = await runPreparedVoidSale({
       async prepare() {
         return withTenant(safeTenantId, async (tx) => {
           if (!opts?.sharedActionId) await assertLegacyWriteAllowed(tx, safeTenantId);
@@ -1629,10 +1630,19 @@ export async function annulerVente(
           if (!await lockSaleRow(tx, saleId, safeTenantId)) return { error: "SALE_NOT_FOUND" as const };
           const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
           if (!sale) return { error: "SALE_NOT_FOUND" as const };
+          if (actionId) {
+            const registered = await tx.voidAction.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } } });
+            if (registered && registered.saleId.toLowerCase() !== saleId) return { error: "ACTION_ID_CONFLICT" as const };
+            if (registered?.status === "DONE" && registered.outcome) {
+              savedOutcome = registered.outcome as unknown as AnnulerVenteResult;
+              return { ...sale, status: "VOID" };
+            }
+            voidCreditKey = (registered?.outcome as any)?.creditKey;
+          }
           if (sale.status === "VOID" && actionId) {
-            const pending = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
-            if (pending?.saleId.toLowerCase() === saleId.toLowerCase()) await tx.voidAction.update({
-              where: { tenantId_actionId: { tenantId: safeTenantId, actionId } },
+            const pending = await tx.voidAction.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } } });
+            if (pending?.saleId.toLowerCase() === saleId.toLowerCase()) await tx.voidAction.updateMany({
+              where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } },
               data: { status: "DONE", outcome: { ok: true, alreadyVoid: true, creditNoteId: sale.creditNoteId ?? null } },
             });
           }
@@ -1642,9 +1652,12 @@ export async function annulerVente(
           if (sale.status === "VOID") return sale;
           if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) return { error: "PARTIAL_REFUND_EXISTS" as const };
           if (actionId && !(sale.status === "PAID" && sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId))) {
-            const existing = await tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } });
+            const existing = await tx.voidAction.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } } });
             if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { error: "ACTION_ID_CONFLICT" as const };
-            if (!existing) await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId, actionId, status: "PENDING" } });
+            if (!existing) {
+              voidCreditKey = 'caisse:' + saleId + ':void:' + actionId;
+              await tx.voidAction.create({ data: { tenantId: safeTenantId, saleId, actionId, status: "PENDING", outcome: { creditKey: voidCreditKey } } });
+            }
           }
           if (sale.status === "PAID" && sale.invoiceId && !(sale.stockSyncedAt && sale.lines.some(l => l.kind === "PRODUCT" && l.productId))) {
             await tx.sale.update({ where: { id: saleId }, data: { voidPreparedAt: sale.voidPreparedAt ?? new Date() } });
@@ -1652,12 +1665,13 @@ export async function annulerVente(
           return sale;
         });
       },
-      compta: comptaClient(), tenantId: safeTenantId, persist, reason: opts?.reason,
+      compta: { ...comptaClient(), creditNote: value => comptaClient().creditNote({ ...value, ...(voidCreditKey ? { creditKey: voidCreditKey } : {}) }) }, tenantId: safeTenantId, persist, reason: opts?.reason,
     });
+    return savedOutcome ?? result;
   } catch (error) {
     // Defense supplementaire : la cle est verifiee sous verrou avant Compta.
     if (actionId && error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      const existing = await withTenant(safeTenantId, (tx) => tx.voidAction.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId } } }));
+      const existing = await withTenant(safeTenantId, (tx) => tx.voidAction.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: actionId, mode: "insensitive" } } }));
       if (existing && existing.saleId.toLowerCase() !== saleId.toLowerCase()) return { ok: false, error: "ACTION_ID_CONFLICT" };
     }
     throw error;
@@ -1679,7 +1693,7 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
       if (normalized.cashDayId) {
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
         if (day.currentSession.status !== "OPEN") {
-          const reserved = await tx.partialRefund.findUnique({ where: { tenantId_actionId: { tenantId: safeTenantId, actionId: normalized.actionId } } });
+          const reserved = await tx.partialRefund.findFirst({ where: { tenantId: safeTenantId, actionId: { equals: normalized.actionId, mode: "insensitive" } } });
           if (reserved?.cashDayId === day.id && reserved.status === "PENDING") throw new CashContractError("REFUND_DAY_CLOSED_REOPEN_REQUIRED", 409,
             { message: "Le jour réservé est clos : rouvrir cette caisse puis rejouer le même avoir." });
           throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
@@ -1868,167 +1882,93 @@ export async function adjustLoyaltyAccount(tenantId: string, input: AdjustLoyalt
  */
 export async function corrigerMoyenPaiement(
   tenantId: string,
-  input: { saleId: string; fromMethod: string; toMethod: string; amountXpf: number },
+  input: { saleId: string; fromMethod: string; toMethod: string; amountXpf: number; actionId?: string },
 ): Promise<CorrectionResult> {
   tenantId = uuid(tenantId);
-  input = { ...input, saleId: uuid(input.saleId) };
-  const correctionRequestHash = canonical({ saleId: input.saleId, fromMethod: input.fromMethod, toMethod: input.toMethod, amountXpf: input.amountXpf });
-  let correctionActionId = `legacy-correction:${correctionRequestHash}`;
-  let correctionSnapshot: SaleSnapshotForCorrection | null = null;
-  let correctionRefusal: CorrectionResult | null = null;
-  let correctionValidatedAt = new Date();
-  let correctionReplay = false;
-  const deps: PaymentCorrectionDeps = {
-    async loadSale(saleId): Promise<SaleSnapshotForCorrection | null> {
-      const sale = await withTenant(tenantId, async (tx) => {
-        await lockCashTenant(tx, tenantId);
-        const current = await tx.sale.findFirst({
-          where: { id: saleId, tenantId },
-          include: { payments: true, session: true },
-        });
-        if (!current) return null;
-        if (current.cashDayId) {
-          const prefix = `corr:caisse:${saleId}:${input.fromMethod}-${input.toMethod}:${input.amountXpf}:g`;
-          const previousOut = [...current.payments].reverse().find(p => p.settleRef?.startsWith(prefix) && p.settleRef.endsWith(":out"));
-          if (previousOut?.settleRef) {
-            const baseRef = previousOut.settleRef.slice(0, -4);
-            const previousIn = current.payments.find(p => p.settleRef === `${baseRef}:in`);
-            if (previousIn) {
-              correctionReplay = true;
-              correctionActionId = `legacy-correction:${correctionRequestHash}`;
-              return { id: current.id, status: current.status, sessionId: current.sessionId,
-                sessionStatus: current.session?.status ?? null, comptaSyncedAt: current.comptaSyncedAt, invoiceId: current.invoiceId,
-                paidAt: current.paidAt, createdAt: current.createdAt,
-                payments: current.payments.filter(p => p !== previousOut && p !== previousIn)
-                  .map(p => ({ method: p.method, amountXpf: p.amountXpf, settleRef: p.settleRef })) };
-            }
-          }
-        }
-        if (current.cashDayId) return current;
-        await assertLegacyWriteAllowed(tx, tenantId);
-        const prior = await tx.caisseSyncAction.findFirst({ where: { tenantId, kind: "legacy-payment-correction", entityKey: saleId,
-          requestHash: correctionRequestHash, state: "PENDING" } });
-        if (prior) {
-          const saved = prior.payload as any;
-          correctionActionId = prior.actionId;
-          correctionValidatedAt = new Date(saved.validatedAt);
-          const s = saved.snapshot;
-          correctionSnapshot = { ...s, paidAt: s.paidAt ? new Date(s.paidAt) : null, comptaSyncedAt: s.comptaSyncedAt ? new Date(s.comptaSyncedAt) : null, createdAt: new Date(s.createdAt),
-            payments: s.payments.map((p: any) => ({ ...p, amountXpf: BigInt(p.amountXpf) })) };
-          return correctionSnapshot;
-        }
-        const snapshot: SaleSnapshotForCorrection = { id: current.id, status: current.status, sessionId: current.sessionId,
-          sessionStatus: current.session?.status ?? null, comptaSyncedAt: current.comptaSyncedAt, invoiceId: current.invoiceId,
-          paidAt: current.paidAt, createdAt: current.createdAt,
-          payments: current.payments.map(p => ({ method: p.method, amountXpf: p.amountXpf, settleRef: p.settleRef })) };
-        const validatedAt = new Date();
-        const checked = verifierCorrection(snapshot, input, validatedAt);
-        if (!checked.ok) { correctionRefusal = checked; return null; }
-        const generation = generationCorrection(snapshot.payments);
-        correctionActionId = `legacy-correction:${correctionKeyPour(saleId, input.fromMethod, input.toMethod, input.amountXpf, generation)}`;
-        const serial = { ...snapshot, paidAt: snapshot.paidAt?.toISOString() ?? null, comptaSyncedAt: snapshot.comptaSyncedAt?.toISOString() ?? null,
-          createdAt: snapshot.createdAt.toISOString(),
-          payments: snapshot.payments.map(p => ({ ...p, amountXpf: String(p.amountXpf) })) };
-        const refs = refsDeLaCorrection(correctionKeyPour(saleId, input.fromMethod, input.toMethod, input.amountXpf, generation));
-        await tx.caisseSyncAction.create({ data: { tenantId, actionId: correctionActionId, deviceId: "legacy", kind: "legacy-payment-correction",
-          entityKey: saleId, requestHash: correctionRequestHash, payload: { snapshot: serial, validatedAt: validatedAt.toISOString(), ...refs }, state: "PENDING" } });
-        correctionSnapshot = snapshot;
-        correctionValidatedAt = validatedAt;
-        return current;
-      });
-      if (!sale) return null;
-      return {
-        id: sale.id,
-        status: sale.status,
-        sessionId: sale.sessionId,
-        sessionStatus: (sale as any).session?.status ?? null,
-        comptaSyncedAt: sale.comptaSyncedAt,
-        invoiceId: sale.invoiceId,
-        paidAt: sale.paidAt,
-        createdAt: sale.createdAt,
-        payments: sale.payments.map((p) => ({
-          method: p.method,
-          amountXpf: p.amountXpf,
-          settleRef: p.settleRef,
-        })),
-      };
-    },
-
-    async comptaCorrection(args) {
-      if (correctionReplay) return { ok: true };
-      return comptaClient().paymentCorrection(args);
-    },
-
-    async insertCorrectionPayments(args) {
-      return withTenant(tenantId, async (tx) => {
-        await lockCashTenant(tx, tenantId);
-        // Day avant Sale ; verrou de vente AVANT le `count` (cf. lib/sale-lock.ts).
-        // `SalePayment` n'a aucune contrainte d'unicité sur `settleRef` : sans ce verrou,
-        // deux transactions concurrentes lisent le même `count = 0` en READ COMMITTED et
-        // écrivent chacune son couple, doublant la correction sur le ticket. `FOR UPDATE`
-        // fait attendre la seconde transaction jusqu'au COMMIT de la première, qui relit
-        // alors un `count` à jour au lieu d'un instantané périmé. Verrouiller APRÈS avoir
-        // compté ne fermerait rien : le compte lu serait déjà obsolète.
-        // Le verrou ne porte que sur cette transaction d'écriture — la comptabilité a déjà
-        // été appelée par `runPaymentCorrection` AVANT, hors de toute transaction (cf.
-        // l'avertissement en tête de lib/sale-lock.ts).
-        const shared = await lockSharedSale(tx, tenantId, args.saleId);
-        await lockSaleRow(tx, args.saleId, tenantId);
-        const current = await tx.sale.findFirst({ where: { tenantId, id: args.saleId } });
-        if (current?.cashDayId !== shared?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-        if (!current?.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
-
-        const reservation = await tx.caisseSyncAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId: correctionActionId } } });
-        if (!shared?.cashDayId && reservation?.state === "PENDING" && (reservation.payload as any).sortie !== args.sortie) {
-          throw new CashContractError("CORRECTION_RESERVATION_MISMATCH", 409);
-        }
-        const already = await tx.salePayment.count({
-          where: { tenantId, saleId: args.saleId, settleRef: args.sortie },
-        });
-        if (already > 0) {
-          if (shared?.cashDayId) await recordSharedSale(tx, tenantId, args.saleId);
-          if (!shared?.cashDayId) await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId: correctionActionId, state: "PENDING" }, data: { state: "ACK", response: { ok: true } } });
-          return { inserted: false };
-        }
-
-        await tx.salePayment.create({
-          data: {
-            tenantId,
-            saleId: args.saleId,
-            method: args.fromMethod as PayMethod, // sûr : estMoyenAdmis (verifierCorrection)
-            amountXpf: -BigInt(args.amountXpf),
-            tenderedXpf: null,
-            settleRef: args.sortie,
-          },
-        });
-        await tx.salePayment.create({
-          data: {
-            tenantId,
-            saleId: args.saleId,
-            method: args.toMethod as PayMethod, // sûr : estMoyenAdmis (verifierCorrection)
-            amountXpf: BigInt(args.amountXpf),
-            tenderedXpf: null,
-            settleRef: args.entree,
-          },
-        });
-        if (shared?.cashDayId) await recordSharedSale(tx, tenantId, args.saleId);
-        if (!shared?.cashDayId) await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId: correctionActionId, state: "PENDING" }, data: { state: "ACK", response: { ok: true } } });
-        return { inserted: true };
-      });
-    },
+  input = { ...input, saleId: uuid(input.saleId), ...(input.actionId == null ? {} : { actionId: uuid(input.actionId) }) };
+  const { saleId } = input;
+  const requestHash = canonical({ saleId, fromMethod: input.fromMethod, toMethod: input.toMethod, amountXpf: input.amountXpf });
+  // Auxiliaires locaux : cette fonction est aussi extraite par caisseFunction.
+  const normalizedHash = (hash: string) => {
+    try { return canonical(normalizeActionInput(JSON.parse(hash))); } catch { return hash; }
   };
-
-  // La réservation et sa date de validation précèdent tout appel Compta. Le rejeu
-  // réutilise cette photo, donc les mêmes références, même après la fenêtre d'un mois.
-  const loaded = await deps.loadSale(input.saleId);
-  if (correctionRefusal) return correctionRefusal;
-  deps.loadSale = async () => loaded;
-  return runPaymentCorrection(deps, { saleId: input.saleId, tenantId, fromMethod: input.fromMethod,
-    toMethod: input.toMethod, amountXpf: input.amountXpf, maintenant: correctionValidatedAt });
+  const actionWhere = (actionId: string) => ({ tenantId, actionId: { equals: actionId, mode: "insensitive" as const } });
+  const prepared = await withTenant(tenantId, async tx => {
+    await lockCashTenant(tx, tenantId);
+    const shared = await lockSharedSale(tx, tenantId, saleId);
+    await lockSaleRow(tx, saleId, tenantId);
+    const current = await tx.sale.findFirst({ where: { tenantId, id: saleId }, include: { payments: true, session: true } });
+    if (!current) return { result: { ok: false, error: "SALE_NOT_FOUND" } as CorrectionResult };
+    if (current.cashDayId !== shared?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    if (!current.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
+    let prior = input.actionId
+      ? await tx.caisseSyncAction.findFirst({ where: actionWhere(input.actionId) })
+      : (await tx.caisseSyncAction.findMany({ where: { tenantId, kind: "legacy-payment-correction", entityKey: { equals: saleId, mode: "insensitive" }, state: "PENDING" } })).find(row => normalizedHash(row.requestHash) === requestHash);
+    const priorHash = prior ? normalizedHash(prior.requestHash) : undefined;
+    if (prior && (prior.kind !== "legacy-payment-correction" || prior.entityKey.toLowerCase() !== saleId || priorHash !== requestHash)) {
+      throw new CashContractError("ACTION_ID_CONFLICT", 409);
+    }
+    if (prior?.state === "ACK") return { result: prior.response as unknown as CorrectionResult };
+    const snapshot: SaleSnapshotForCorrection = { id: current.id, status: current.status, sessionId: current.sessionId,
+      sessionStatus: current.session?.status ?? null, invoiceId: current.invoiceId, comptaSyncedAt: current.comptaSyncedAt,
+      paidAt: current.paidAt, createdAt: current.createdAt,
+      payments: current.payments.map(p => ({ method: p.method, amountXpf: p.amountXpf, settleRef: p.settleRef })) };
+    const checked = verifierCorrection(snapshot, input, new Date());
+    if (!prior && !checked.ok) {
+      // Compatibilit? des appelants historiques sans identit? : dernier r?sultat enregistr?.
+      if (!input.actionId && checked.error === "NOTHING_TO_CORRECT") {
+        const actions = await tx.caisseSyncAction.findMany({ where: { tenantId, kind: "legacy-payment-correction", entityKey: { equals: saleId, mode: "insensitive" }, state: "ACK" }, orderBy: { createdAt: "desc" } });
+        const saved = actions.find(row => normalizedHash(row.requestHash) === requestHash)?.response as unknown as CorrectionResult | undefined;
+        if (saved?.ok) return { result: { ...saved, alreadyCorrected: true } as CorrectionResult };
+      }
+      return { result: checked as CorrectionResult };
+    }
+    if (!prior) {
+      const pending = await tx.caisseSyncAction.findFirst({ where: { tenantId, kind: "legacy-payment-correction", entityKey: { equals: saleId, mode: "insensitive" }, state: "PENDING" } });
+      if (pending) throw new CashContractError("CORRECTION_IN_PROGRESS", 409);
+      const actionId = input.actionId ?? randomUUID();
+      const correctionKey = 'corr:caisse:' + saleId + ':action:' + actionId;
+      const payload = { correctionKey, sortie: correctionKey + ':out', entree: correctionKey + ':in',
+        invoiceId: current.invoiceId, fromMethod: input.fromMethod, toMethod: input.toMethod, amountXpf: input.amountXpf };
+      prior = await tx.caisseSyncAction.create({ data: { tenantId, actionId, kind: "legacy-payment-correction", entityKey: saleId,
+        deviceId: "legacy", requestHash, payload, state: "PENDING" } });
+    }
+    const payload = prior.payload as any;
+    // Une r?servation ancienne garde ses r?f?rences sortantes originales pendant sa reprise.
+    return { action: prior, payload: { ...payload, correctionKey: payload.correctionKey ?? payload.sortie.slice(0, -4), invoiceId: payload.invoiceId ?? payload.snapshot.invoiceId } };
+  });
+  if (prepared.result) return prepared.result;
+  const { action, payload } = prepared;
+  try {
+    await comptaClient().paymentCorrection({ tenantId, invoiceId: payload.invoiceId, fromMethod: input.fromMethod,
+      toMethod: input.toMethod, amountXpf: input.amountXpf, correctionKey: payload.correctionKey });
+  } catch (e) {
+    return { ok: false, error: "COMPTA_CORRECTION_FAILED", detail: e instanceof Error ? e.message : String(e) };
+  }
+  return withTenant(tenantId, async tx => {
+    await lockCashTenant(tx, tenantId);
+    const shared = await lockSharedSale(tx, tenantId, saleId);
+    await lockSaleRow(tx, saleId, tenantId);
+    const current = await tx.sale.findFirst({ where: { tenantId, id: saleId }, include: { payments: true } });
+    if (!current || current.cashDayId !== shared?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    if (!current.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
+    const reserved = await tx.caisseSyncAction.findFirstOrThrow({ where: actionWhere(action!.actionId) });
+    if (reserved.state === "ACK") return input.actionId ? reserved.response as unknown as CorrectionResult : { ...(reserved.response as any), alreadyCorrected: true };
+    const already = await tx.salePayment.count({ where: { tenantId, saleId, settleRef: payload.sortie } });
+    if (!already) {
+      await tx.salePayment.create({ data: { tenantId, saleId, method: input.fromMethod as PayMethod, amountXpf: -BigInt(input.amountXpf), tenderedXpf: null, settleRef: payload.sortie } });
+      await tx.salePayment.create({ data: { tenantId, saleId, method: input.toMethod as PayMethod, amountXpf: BigInt(input.amountXpf), tenderedXpf: null, settleRef: payload.entree } });
+    }
+    if (current.cashDayId) await recordSharedSale(tx, tenantId, saleId);
+    const payments = [...current.payments, ...(!already ? [{ method: input.fromMethod, amountXpf: -BigInt(input.amountXpf) }, { method: input.toMethod, amountXpf: BigInt(input.amountXpf) }] : [])];
+    const net = new Map<string, bigint>();
+    for (const p of payments) net.set(p.method, (net.get(p.method) ?? 0n) + p.amountXpf);
+    const result: CorrectionResult = { ok: true, alreadyCorrected: !!already, payments: [...net].map(([method, amount]) => ({ method, amountXpf: Number(amount) })) };
+    await tx.caisseSyncAction.update({ where: { tenantId_actionId: { tenantId, actionId: reserved.actionId } }, data: { state: "ACK", response: result } });
+    return result;
+  });
 }
 
-// ── MOUVEMENTS DE TIROIR ─────────────────────────────────────────────────────────────────────
-// Chantier « écart de caisse » (décision Marco 2026-08-05) : rendre le Z juste TOUT SEUL quand
 // un salon rembourse un avoir en espèces, sans toucher au chiffre d'affaires.
 
 export type RecordMovementInput = {
@@ -2101,10 +2041,10 @@ export async function recordCashMovement(
         occurredAt: movement.createdAt, snapshot: { kind: movement.kind, amountXpf: movement.amountXpf, reason: movement.reason } });
     };
 
-    const ref = input.ref ?? null;
+    const ref = input.ref == null ? null : normalizeActionId(input.ref);
     if (ref) {
       const existing = await tx.cashMovement.findFirst({
-        where: { tenantId, ref },
+        where: { tenantId, ref: { equals: ref, mode: "insensitive" } },
         select: { id: true, sessionId: true, amountXpf: true, kind: true, reason: true, createdAt: true },
       });
       if (existing) {

@@ -22,10 +22,18 @@ export function normalizeActionId(value: unknown): string {
 const UUID_FIELDS = ["tenantId", "saleId", "cashDayId", "refundId", "partialRefundId", "voidActionId", "sessionId", "legacySessionId", "actorId", "receivedById", "createdBy", "cancelledBy", "openedBy", "closedBy", "cashierId", "giftCardId", "posteId", "by", "updatedBy", "clientFicheId", "appointmentId", "redeemedBy", "redeemedAppointmentId", "serviceId", "orderId"];
 export function normalizeActionInput<T extends Record<string, any>>(input: T): T {
   const out: Record<string, any> = { ...input };
+  // Les identifiants des origines/imports et des snapshots suivent la même règle.
+  for (const [key, value] of Object.entries(out)) {
+    if (Array.isArray(value)) out[key] = value.map(item => item && typeof item === "object" ? normalizeActionInput(item) : item);
+    else if (value && typeof value === "object" && !(value instanceof Date)) out[key] = normalizeActionInput(value);
+  }
   for (const key of UUID_FIELDS) if (out[key] != null) out[key] = uuid(out[key]);
   if (out.actionId != null) out.actionId = normalizeActionId(out.actionId);
   for (const key of ["sharedActionId", "idempotencyKey"]) if (out[key] != null) out[key] = normalizeActionId(out[key]);
   if (typeof out.entityKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(out.entityKey)) out.entityKey = uuid(out.entityKey);
+  for (const key of ["id", "sourceKey", "localSessionKey", "sourceRef", "ref"]) {
+    if (typeof out[key] === "string") out[key] = normalizeActionId(out[key]);
+  }
   for (const key of ["lines", "redeemGiftCards", "giftCards"]) if (Array.isArray(out[key])) out[key] = out[key].map((item: Record<string, any>) => ({
     ...item,
     ...(key === "lines" && item.lineId != null ? { lineId: uuid(item.lineId) } : {}),
@@ -52,20 +60,33 @@ export async function lockCashTenant(tx: CashTx, tenantId: string) {
   await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-l4:' + normalized}, 0))`;
 }
 export type ActionResponse = { status: number; body: JsonRecord };
+/** Les UUID intégrés dans les noms de route font partie du contenu canonique. */
+export function normalizeActionKind(kind: string): string {
+  return kind.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, id => id.toLowerCase());
+}
+function sameRequest(old: { kind: string; requestHash: string; payload: unknown }, kind: string, b: ActionInput, hash: string) {
+  if (old.requestHash === hash) return true;
+  // Le payload durable permet de retrouver la casse ORIGINALE, même si le rejeu en utilise une autre.
+  const raw = object(old.payload);
+  const originalHash = createHash("sha256").update(canonical({ kind: old.kind, b: raw })).digest("hex");
+  return old.requestHash === originalHash && normalizeActionKind(old.kind) === kind
+    && canonical(normalizeActionInput(raw)) === canonical(b);
+}
 /** L'accusé et la mutation métier commitent ensemble, y compris les candidats refusés. */
 export async function cashAction(kind: string, b: ActionInput, mutate: (tx: CashTx) => Promise<unknown>): Promise<ActionResponse> {
+  kind = normalizeActionKind(kind);
   b = normalizeActionInput(b);
   b.tenantId = uuid(b.tenantId); b.actionId = normalizeActionId(b.actionId);
   const requestHash = createHash("sha256").update(canonical({ kind, b })).digest("hex");
   return withTenant(b.tenantId, async tx => {
     await lockCashTenant(tx, b.tenantId);
-    const key = { tenantId_actionId: { tenantId: b.tenantId, actionId: b.actionId } };
-    const previous = await tx.caisseSyncAction.findUnique({ where: key });
+    const previous = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
+    const key = { tenantId_actionId: { tenantId: b.tenantId, actionId: previous?.actionId ?? b.actionId } };
     if (previous) {
-      if (previous.requestHash !== requestHash) return { status: 409, body: { ok: false, error: "ACTION_ID_CONFLICT" } };
+      if (!sameRequest(previous, kind, b, requestHash)) return { status: 409, body: { ok: false, error: "ACTION_ID_CONFLICT" } };
       if (previous.state !== "PENDING") {
         const saved = object(previous.response);
-        return { status: Number(saved.status), body: { ...object(saved.body), alreadyApplied: previous.state === "ACK" } };
+        return { status: Number(saved.status), body: object(saved.body) };
       }
     }
     if (!previous) await tx.caisseSyncAction.create({ data: { tenantId: b.tenantId, actionId: b.actionId, deviceId: b.deviceId,
@@ -103,15 +124,15 @@ export function page<T extends { id: string; revision: number }>(rows: T[]) {
 // Pour checkout/void/refund : réservation durable avant l'appel externe, ACK financier
 // DANS la transaction de finalisation ; une coupure rejoue les primitives natives.
 export async function financialReservation(kind: string, b: ActionInput) {
+  kind = normalizeActionKind(kind);
   b = normalizeActionInput(b);
   b.tenantId = uuid(b.tenantId); b.actionId = normalizeActionId(b.actionId);
   const requestHash = createHash("sha256").update(canonical({ kind, b })).digest("hex");
   return withTenant(b.tenantId, async tx => {
     await lockCashTenant(tx, b.tenantId);
-    const key = { tenantId_actionId: { tenantId: b.tenantId, actionId: b.actionId } };
-    const old = await tx.caisseSyncAction.findUnique({ where: key });
+    const old = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
     if (old) {
-      requireCash(old.requestHash === requestHash, "ACTION_ID_CONFLICT", 409);
+      requireCash(sameRequest(old, kind, b, requestHash), "ACTION_ID_CONFLICT", 409);
       return old.state !== "PENDING" ? old.response : null;
     }
     await tx.caisseSyncAction.create({ data: { tenantId: b.tenantId, actionId: b.actionId, deviceId: b.deviceId,
@@ -122,14 +143,14 @@ export async function financialReservation(kind: string, b: ActionInput) {
 export async function ackFinancial(tx: CashTx, tenantId: string, actionId: string, data: { id: string; [key: string]: unknown }, validateOnly = false) {
   tenantId = uuid(tenantId); actionId = normalizeActionId(actionId);
   data = { ...data, id: uuid(data.id), ...(data.saleId == null ? {} : { saleId: uuid(data.saleId) }), ...(data.cashDayId == null ? {} : { cashDayId: uuid(data.cashDayId) }) };
-  const action = await tx.caisseSyncAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId } } });
+  const action = await tx.caisseSyncAction.findFirst({ where: { tenantId, actionId: { equals: actionId, mode: "insensitive" } } });
   if (!action) return; // Le chemin historique peut être journalisé sans réservation de synchronisation.
   const operation = data.status === "PAID" ? "checkout" : data.status === "VOID" ? "void" : data.status === "DONE" ? "partial-refund" : null;
   const saleId = data.saleId ?? data.id;
-  const parts = action.kind.split(":");
+  const parts = normalizeActionKind(action.kind).split(":");
   requireCash(operation && parts.length === 5 && parts[0] === "cash-days" && parts[2] === "sales"
     && parts[3] === saleId && parts[4] === operation && (!data.cashDayId || parts[1] === data.cashDayId), "ACTION_ID_CONFLICT", 409);
   if (validateOnly) return;
   const response = jsonValue({ ok: true, id: data.id, revision: data.revision ?? 0, alreadyApplied: false, data }) as Prisma.InputJsonValue;
-  await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId, kind: action.kind, entityKey: action.entityKey, state: "PENDING" }, data: { state: "ACK", response } });
+  await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId: action.actionId, kind: action.kind, entityKey: action.entityKey, state: "PENDING" }, data: { state: "ACK", response } });
 }

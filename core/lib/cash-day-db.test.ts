@@ -43,7 +43,7 @@ function caisseFunction(name: string, globals: Row) {
   return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...corrections,
     assertLegacyWriteAllowed: globals.assertLegacyWriteAllowed, lockCashTenant: globals.lockCashTenant ?? tenantLock,
     uuid: activeSync.uuid, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
-    createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
+    randomUUID: require("node:crypto").randomUUID, createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
 }
 type Row = Record<string, any>;
 function fixture(enforceDayBeforeSale = false) {
@@ -64,6 +64,7 @@ function fixture(enforceDayBeforeSale = false) {
       if (k === "payments") return !!state.sale.find(s => s.id === row.id)?.payments?.length;
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
+      if (v && typeof v === "object" && v.mode === "insensitive") return typeof row[k] === "string" && row[k].toLowerCase() === v.equals.toLowerCase();
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
         op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : false);
       return row[k] === v;
@@ -191,7 +192,11 @@ function financialPorts(f: ReturnType<typeof fixture>, overrides: Row = {}) {
   return Object.fromEntries(["checkoutSale", "annulerVente", "rembourserPartiellement"].map(name => [name, caisseFunction(name, globals)]));
 }
 function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
+  const server = { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } };
+  const http = load("cash-shared-http.ts", { "next/server": server, "./service-auth": { hasServiceKey: () => true },
+    "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection });
   return load(`../app/api/${path}`, {
+    "@/lib/cash-shared-http": http, "@/lib/caisse-sync": f.sync, "@/lib/cash-day-sales": f.sales,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
@@ -242,7 +247,7 @@ test("huitième relecture : clôture refusée pendant Compta, rejeu de l'avoir 1
   assert.equal(await expected(f, day.id), 24000n);
   const closed = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, closeInput));
   assert.equal(closed.report.expectedXpf, 24000); assert.equal(closed.report.varianceXpf, 0);
-  assert.equal((await finance.dayFinancial(day.id, sale.id, "partial-refund", b)).alreadyApplied, true);
+  assert.deepEqual(await finance.dayFinancial(day.id, sale.id, "partial-refund", b), replay);
 });
 
 test("huitième relecture : ancienne réservation sur jour clos, refus explicite sans CONFLICT", async () => {
@@ -970,7 +975,7 @@ test("checkouts CASH/CARD concurrents : un succès, un 409 avec le paiement rete
   assert.equal(refused.reason.status, 409); assert.equal(refused.reason.message, "SALE_ALREADY_PAID");
   assert.equal(refused.reason.data.payments[0].method, "CASH"); assert.ok(locked >= 1);
   const replay = await finance.dayFinancial(id, sale.id, "checkout", a);
-  assert.equal(replay.ok, true); assert.equal(replay.alreadyApplied, true);
+  assert.equal(replay.ok, true); assert.deepEqual(replay, f.rows("caisseSyncAction").find(a => a.actionId === actor)!.response);
   assert.equal(f.rows("sale")[0].payments.length, 1);
   // Route historique : même paiement = rejeu idempotent ; autre moyen = 409, jamais un succès.
   const same = await checkout(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }]);
@@ -1020,7 +1025,7 @@ test("accusé perdu, action concurrente identique, contenu divergent et transact
   const f = fixture(); let applied = 0;
   const mutation = async (tx: Row) => { applied++; return f.days.openCashDay(tx, input()); };
   const out = await Promise.all([f.sync.cashAction("open", input(), mutation), f.sync.cashAction("open", input(), mutation)]);
-  assert.equal(applied, 1); assert.equal(out[1].body.alreadyApplied, true);
+  assert.equal(applied, 1); assert.equal(projection.canonical(out[1]), projection.canonical(out[0]));
   assert.equal((await f.sync.cashAction("open", input({ openingFloatXpf: "1" }), mutation)).body.error, "ACTION_ID_CONFLICT");
   const before = f.rows("cashDayEvent");
   await assert.rejects(f.sync.cashAction("crash", input({ actionId: "crash" }), async (tx: Row) => {
@@ -1205,7 +1210,111 @@ for (const operation of ["partial-refund", "void"] as const) {
     assert.equal(first.ok, true, JSON.stringify(first)); assert.equal(comptaCalls, 1);
     assert.equal(await expected(f, day.id), 25000n);
     const replay = await finance.dayFinancial(day.id, sale.id, operation, base);
-    assert.equal(replay.alreadyApplied, true); assert.equal(comptaCalls, 1);
+    assert.deepEqual(replay, first); assert.equal(comptaCalls, 1);
     assert.equal(await expected(f, day.id), 25000n);
   });
 }
+
+
+for (const financial of [false, true]) test('identite ancienne : cle et empreinte brutes en majuscules, contenu divergent refuse ' + financial, async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  const raw = input({ actionId: actor.toUpperCase(), tenantId: tenant.toUpperCase(), cashDayId: day.id.toUpperCase(),
+    kind: 'CASH_OUT', amountXpf: '1000', reason: 'Retrait synthetique' });
+  const kind = 'cash-days:' + day.id.toUpperCase() + ':movements';
+  const response = financial ? { ok: true, data: { payments: [{ method: 'CARD', amountXpf: '1000' }] } }
+    : { status: 200, body: { ok: true, alreadyApplied: false, data: { id: actor } } };
+  if (!financial) await f.withTenant(tenant, (tx: Row) => f.sales.dayMovement(tx, day.id, f.sync.normalizeActionInput(raw)));
+  await f.tx.caisseSyncAction.create({ data: { tenantId: tenant, actionId: raw.actionId, deviceId: 'A', kind, entityKey: raw.entityKey,
+    payload: raw, requestHash: require('node:crypto').createHash('sha256').update(projection.canonical({ kind, b: raw })).digest('hex'), state: 'ACK', response } });
+  const lower = f.sync.normalizeActionInput(raw);
+  for (const b of [lower, raw]) {
+    const replay = financial ? await f.sync.financialReservation(kind.toLowerCase(), b)
+      : await f.sync.cashAction(kind.toLowerCase(), b, async () => { assert.fail('aucune seconde execution'); });
+    sameResponse(replay, response);
+  }
+  if (financial) await assert.rejects(f.sync.financialReservation(kind, { ...lower, amountXpf: '2000' }), (e: Row) => e.status === 409 && e.message === 'ACTION_ID_CONFLICT');
+  else {
+    assert.equal((await f.sync.cashAction(kind, { ...lower, amountXpf: '2000' }, async () => null)).status, 409);
+    assert.equal(f.rows('cashMovement').length, 1); assert.equal(await expected(f, day.id), 24000n);
+  }
+});
+
+test('mouvement HTTP : UUID du jour majuscule puis minuscule, reponse identique et conflit reel 409', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())); const day = f.rows('cashDay')[0];
+  const route = api(f, 'cash-days/[id]/movements/route.ts', {});
+  const b = input({ actionId: actor, kind: 'CASH_OUT', amountXpf: '1000', reason: 'Retrait synthetique' });
+  const send = (id: string, body = b) => route.POST({ json: async () => body, headers: new Headers({ 'Idempotency-Key': actor }) }, { params: Promise.resolve({ id }) });
+  const first = await send(day.id.toUpperCase()); assert.equal(first.status, 200);
+  sameResponse(await send(day.id), first); sameResponse(await send(day.id.toUpperCase()), first);
+  const conflict = await send(day.id, { ...b, amountXpf: '2000' });
+  assert.equal(conflict.status, 409); assert.equal(conflict.body.error, 'ACTION_ID_CONFLICT');
+  assert.equal(f.rows('cashMovement').length, 1); assert.equal(await expected(f, day.id), 24000n);
+});
+
+test('trois corrections distinctes CASH CARD CASH CARD : Compta converge, rejeux figes et Z 25000', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())); const day = f.rows('cashDay')[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, status: 'DRAFT', paidAt: null,
+    invoiceId: 'synthetic-invoice', comptaSyncedAt: now, totalXpf: 1000n, lines: [thousandLine()], payments: [] } });
+  const compta = new Map<string, number>([['CASH', 0], ['CARD', 0]]), keys = new Set<string>();
+  let calls = 0;
+  const native = financialPorts(f, { comptaClient: () => ({ receiptUrl: () => 'https://synthetic.invalid/receipt' }), syncLoadedSale: async () => {
+    calls++; keys.add('checkout:' + sale.id); compta.set('CASH', 1000);
+    return { synced: true, invoiceId: 'synthetic-invoice', stockDecremented: 0 };
+  } });
+  assert.equal((await native.checkoutSale(tenant, sale.id, [{ method: 'CASH', amountXpf: 1000n }], { sharedActionId: tenant })).ok, true);
+  const correct = caisseFunction('corrigerMoyenPaiement', { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
+    comptaClient: () => ({ paymentCorrection: async (args: Row) => {
+      calls++; assert.ok(!keys.has(args.correctionKey)); keys.add(args.correctionKey);
+      compta.set(args.fromMethod, compta.get(args.fromMethod)! - args.amountXpf);
+      compta.set(args.toMethod, compta.get(args.toMethod)! + args.amountXpf); return { ok: true };
+    } }) });
+  const actions = [actor, tenantB, 'ab000000-0000-0000-0000-000000000009'].map((actionId, i) => ({ actionId, saleId: sale.id,
+    fromMethod: i === 1 ? 'CARD' : 'CASH', toMethod: i === 1 ? 'CASH' : 'CARD', amountXpf: 1000 }));
+  const results: Row[] = [];
+  for (const action of actions) results.push(await correct(tenant, action));
+  assert.ok(results.every(r => r.ok)); assert.equal(calls, 4); assert.equal(keys.size, 4);
+  assert.equal(compta.get('CASH'), 0); assert.equal(compta.get('CARD'), 1000);
+  assert.equal(results[2].payments.find((p: Row) => p.method === 'CARD').amountXpf, 1000);
+  // Simulation d'une ancienne cle stockee en majuscules.
+  await f.tx.caisseSyncAction.updateMany({ where: { actionId: actor }, data: { actionId: actor.toUpperCase(), entityKey: sale.id.toUpperCase(), requestHash: projection.canonical({ saleId: sale.id.toUpperCase(), fromMethod: 'CASH', toMethod: 'CARD', amountXpf: 1000 }) } });
+  for (const i of [0, 1, 2, 0]) {
+    const action = actions[i]; sameResponse(await correct(tenant.toUpperCase(), { ...action, actionId: action.actionId.toUpperCase() }), results[i]);
+    sameResponse(await correct(tenant, action), results[i]);
+  }
+  await assert.rejects(correct(tenant, { ...actions[0], amountXpf: 999 }), (e: Row) => e.status === 409 && e.message === 'ACTION_ID_CONFLICT');
+  assert.equal(calls, 4); assert.equal(f.rows('sale')[0].payments.length, 7);
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'PAYMENT_CORRECTION').length, 3);
+  assert.equal(await expected(f, day.id), 25000n);
+  const close = input({ cycle: 0, sourceKey: 'close-corrections', closureMode: 'ONLINE', countedXpf: '25000', localExpectedXpf: '25000', localVarianceXpf: '0' });
+  assert.equal((await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, close))).report.expectedXpf, 25000);
+});
+
+for (const operation of ['partial-refund', 'void']) test('ancienne cle ' + operation + ' en majuscules : aucun second avoir, reponse enregistree', async () => {
+  const f = fixture(); let calls = 0;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: 'PAID', paidAt: now, invoiceId: 'synthetic-invoice', totalXpf: 1000n, lines: [thousandLine()], payments: [] } });
+  const native = financialPorts(f, { afterCredit: () => { calls++; } });
+  const b = { actionId: actor, reason: 'Retour synthetique', refundMethod: 'CARD', lines: [{ lineId: tenantB, qty: 1 }] };
+  const run = (body: Row) => operation === 'void' ? native.annulerVente(tenant, sale.id, body) : native.rembourserPartiellement(tenant, sale.id, body);
+  const first = await run(b); assert.equal(first.ok, true); assert.equal(calls, 1);
+  const model = operation === 'void' ? 'voidAction' : 'partialRefund';
+  const old = f.rows(model)[0];
+  await f.tx[model].update({ where: { id: old.id }, data: { actionId: actor.toUpperCase(),
+    ...(operation === 'partial-refund' ? { input: { ...old.input, actionId: actor.toUpperCase(), lines: [{ lineId: tenantB.toUpperCase(), qty: 1 }] } } : {}) } });
+  sameResponse(await run(b), first); sameResponse(await run({ ...b, actionId: actor.toUpperCase() }), first);
+  assert.equal(calls, 1); assert.equal(f.rows(model).length, 1);
+  if (operation === 'partial-refund') assert.equal((await run({ ...b, reason: 'Contenu different' })).error, 'ACTION_ID_CONFLICT');
+});
+
+test('journal : source UUID ancienne en majuscules et snapshot normalise ne doublent aucun fait', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())); const day = f.rows('cashDay')[0];
+  const fact = { kind: 'MOVEMENT', sourceRef: actor.toUpperCase(), deviceId: 'A', occurredAt: now, snapshot: { kind: 'CASH_OUT', amountXpf: '1000', actorId: actor.toUpperCase() } };
+  await f.ledger.appendDayFact(f.tx, tenant, day.id, fact);
+  const old = f.rows('cashDayEvent').find(e => e.kind === 'MOVEMENT')!;
+  await f.tx.cashDayEvent.update({ where: { id: old.id }, data: { sourceRef: actor.toUpperCase(), snapshot: fact.snapshot } });
+  await f.ledger.appendDayFact(f.tx, tenant, day.id, { ...fact, sourceRef: actor, snapshot: { ...fact.snapshot, actorId: actor } });
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 1); assert.equal(await expected(f, day.id), 24000n);
+});
+
+function sameResponse(actual: unknown, saved: unknown) { assert.equal(projection.canonical(actual), projection.canonical(saved)); }

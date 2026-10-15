@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
-import { date, lockCashTenant, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, lockCashTenant, normalizeActionId, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
@@ -22,7 +22,7 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
   await lockCashTenant(tx, b.tenantId);
   await assertNoLegacyOperationInProgress(tx, b.tenantId);
   const business = dayOf(b), tenantId = b.tenantId, author = sourceAuthor(b);
-  const sourceKey = text(b.sourceKey, 300), localSessionKey = text(b.localSessionKey, 300);
+  const sourceKey = normalizeActionId(text(b.sourceKey, 300)), localSessionKey = normalizeActionId(text(b.localSessionKey, 300));
   const openingFloatXpf = xpfInteger(b.openingFloatXpf);
   const deviceName = text(b.deviceName);
   let day = await tx.cashDay.findUnique({ where: { tenantId_scope_businessDay: { tenantId, scope: "rotisserie-caisse", businessDay: business } } });
@@ -35,9 +35,9 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
     await tx.cashDaySession.create({ data: { tenantId, cashDayId: day.id, sessionId: session.id, cycle: 0 } });
   }
   const locked = await lockDay(tx, tenantId, day.id);
-  const prior = await tx.cashDayOpening.findUnique({ where: { tenantId_sourceKey: { tenantId, sourceKey } } });
+  const prior = await tx.cashDayOpening.findFirst({ where: { tenantId, sourceKey: { equals: sourceKey, mode: "insensitive" } } });
   if (prior) {
-    requireCash(prior.cashDayId === day.id && prior.openingFloatXpf === openingFloatXpf && prior.localSessionKey === localSessionKey,
+    requireCash(prior.cashDayId === day.id && prior.openingFloatXpf === openingFloatXpf && normalizeActionId(prior.localSessionKey) === localSessionKey,
       "SOURCE_CONFLICT", 409);
     requireCash(prior.deviceId === b.deviceId && prior.deviceName === deviceName && prior.actorId === author.actorId
       && prior.actorName === author.actorName && prior.occurredAt.getTime() === date(b.occurredAt).getTime(), "SOURCE_CONFLICT", 409);
@@ -77,15 +77,14 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     requireCash(Array.isArray(snapshot.knownSourceRefs) && snapshot.knownSourceRefs.every((s: unknown) => typeof s === "string"));
   }
   const sourceKey = text(b.sourceKey, 300);
-  const previous = await tx.cashDayClosure.findUnique({ where: { tenantId_sourceKey: { tenantId: b.tenantId, sourceKey } } });
+  const previous = await tx.cashDayClosure.findFirst({ where: { tenantId: b.tenantId, sourceKey: { equals: sourceKey, mode: "insensitive" } } });
   if (previous) {
     requireCash(previous.cashDayId === day.id && previous.countedXpf === countedXpf && previous.cycle === cycle
       && previous.localExpectedXpf === localExpectedXpf && previous.localVarianceXpf === localVarianceXpf
       && previous.closureMode === closureMode && previous.deviceId === b.deviceId && previous.deviceName === b.deviceName
       && previous.actorId === author.actorId && previous.actorName === author.actorName && previous.occurredAt.getTime() === occurredAt.getTime()
       && canonical(previous.legacySnapshot) === canonical(b.legacySnapshot ?? null), "SOURCE_CONFLICT", 409);
-    const event = await tx.cashDayEvent.findUnique({ where: { tenantId_cashDayId_kind_sourceRef: {
-      tenantId: b.tenantId, cashDayId, kind: "CLOSURE", sourceRef: sourceKey } } });
+    const event = await tx.cashDayEvent.findFirst({ where: { tenantId: b.tenantId, cashDayId, kind: "CLOSURE", sourceRef: { equals: sourceKey, mode: "insensitive" } } });
     return { id: previous.id, alreadyClosed: true, recount: !previous.authoritative, cutoffRevision: previous.cutoffRevision,
       report: event ? object(event.snapshot).report ?? null : null };
   }
