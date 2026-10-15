@@ -5,7 +5,7 @@ import { cashAction, envelope, uuid, type ActionInput, type CashTx } from "./cai
 import { CashContractError, jsonValue } from "./cash-day-projection";
 
 function response(body: unknown, status = 200) { return NextResponse.json(jsonValue(body), { status, headers: { "Cache-Control": "no-store" } }); }
-export async function cashHttp(req: NextRequest, fn: () => Promise<unknown>) {
+export async function cashHttp(req: NextRequest, fn: () => Promise<Response>): Promise<Response> {
   if (!hasServiceKey(req)) return response({ ok: false, error: "Unauthorized" }, 401);
   try { return await fn(); }
   catch (e) {
