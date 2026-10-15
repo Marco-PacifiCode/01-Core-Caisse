@@ -2,6 +2,7 @@
 
 ## En cours
 
+- **Caisse journalière unique de la Rôtisserie (chantier « caisse unique », lot L4, 15/10) — NON fusionné, migrations `20261016093000_donnees_caisse_partagees` et `20261016094000_caisse_journaliere_unique` NON jouées, NON déployé.** Décision Marco (QCM 15/10) : une seule caisse physique, tous les appareils écrivent sur la même caisse du jour ; fond par défaut, paniers en attente et commandes à retirer vivent ici. Règles : fonds différents → celui de la 1re ouverture, l'autre tracé « non retenu » ; deux comptages → le 1er arrivé au serveur fait le Z, le second est un recomptage informatif ; « Rouvrir la caisse du jour » (mode Administration) = même CashDay, même fond, nouvelle CashSession alias, Z suivant sur toute la journée. Formule du Z : `T = F + cash − refundCash + movementNet`. Acompte = métadonnée seule (aucun encaissement). Aucun nouveau chemin ne lit la table `Poste` (migration `20261005130000_postes` jamais jouée). Branche `claude/codex-caisse-unique-caisse2` (tête `9451a10`, sur `claude/codex-caisse-unique-caisse`), 626 tests, tsc 0. 1re relecture GPT : CHANGES (avoir espèces omis à l'import, remboursement partiel absent du journal du jour, faux succès d'un second encaissement concurrent), corrigé ; 2ᵉ relecture en cours. Plan : `Rotisserie-Pouembout`, `docs/plan-caisse-unique-donnees.md`.
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
 ## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ⛔ NON DÉPLOYÉ, migration NON JOUÉE, verrou NON BRANCHÉ
@@ -475,6 +476,7 @@ historique).
 
 ## Dernières actions
 
+- `2026-10-15` — Lot L4 « caisse journalière unique » (Rôtisserie) construit par GPT Sol, routes typées, puis corrigé après relecture (`9451a10`) : avoirs espèces repris à l'import (un avoir d'un autre jour n'entre pas dans ce Z), remboursement partiel écrit au journal du jour, second encaissement concurrent par un autre moyen refusé en 409 `SALE_ALREADY_PAID` (y compris route historique, plus de 500). Non fusionné.
 - `2026-10-15` — **PC-0212** : `GET`/`PUT /api/loyalty/program` partaient en 500 (« Do not know how to
   serialize a BigInt », ≈ 1 toutes les 10 min en prod) dès qu'un programme portait `rewardAmountXpf`.
   `lib/loyalty-serialize.ts` le rend en `number | null` (ce qu'attendent les surfaces) ; stockage
