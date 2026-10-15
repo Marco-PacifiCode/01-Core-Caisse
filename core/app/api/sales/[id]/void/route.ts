@@ -2,6 +2,7 @@ import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { annulerVente } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -51,7 +52,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   let result;
   try {
     result = await annulerVente(tenantId, saleId, { ...(reason ? { reason } : {}), ...(actionId ? { actionId } : {}) });
-  } catch {
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
     return NextResponse.json({ ok: false, error: "VOID_FAILED" }, { status: 502 });
   }
 

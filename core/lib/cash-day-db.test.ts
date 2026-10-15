@@ -15,6 +15,7 @@ import * as movements from "./cash-movement.ts";
 import * as gifts from "./gift-card.ts";
 import * as reports from "./z-report.ts";
 import * as corrections from "./payment-correction.ts";
+import * as voidPolicy from "./void-sale.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "10000000-0000-0000-0000-000000000001", tenantB = "10000000-0000-0000-0000-000000000002";
@@ -42,7 +43,7 @@ function fixture() {
   let state: Record<string, Row[]> = {}, saved: Record<string, Row[]> | null = null, serial = 0;
   let tail = Promise.resolve();
   const queries: string[] = [];
-  const names = ["partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement"];
+  const names = ["voidAction", "partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement"];
   names.forEach(n => state[n] = []);
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
@@ -50,7 +51,7 @@ function fixture() {
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
-        op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "in" ? (n as unknown[]).includes(row[k]) : false);
+        op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : false);
       return row[k] === v;
     });
   }
@@ -72,6 +73,7 @@ function fixture() {
   for (const name of names) {
     tx[name] = {
       async findFirst({ where, include }: Row = {}) { const row = state[name].find(r => match(r, where)); return row ? view(name, row, include) : null; },
+      async count({ where }: Row = {}) { return state[name].filter(r => match(r, where)).length; },
       async findUnique(args: Row) { return this.findFirst(args); },
       async findUniqueOrThrow(args: Row) { const row = await this.findFirst(args); assert.ok(row); return row; },
       async findFirstOrThrow(args: Row) { return this.findUniqueOrThrow(args); },
@@ -85,13 +87,14 @@ function fixture() {
         const id = `20000000-0000-0000-0000-${String(++serial).padStart(12, "0")}`;
         const row: Row = { id, revision: name === "cashDay" ? 0n : 0, cycle: 0, createdAt: now, updatedAt: now, receivedAt: now,
           claimedByDevice: null, claimActionId: null, actorId: null, legacySnapshot: null, cashDayId: null, paidAt: null, creditNoteId: null,
-          deviceId: null, deviceName: null, ticketNumber: null, sellerId: null, sellerName: null, saleId: null, ...structuredClone(data) };
+          sessionId: null, posteId: null, deviceId: null, deviceName: null, ticketNumber: null, sellerId: null, sellerName: null, saleId: null, ...structuredClone(data) };
         if (name === "cashSession") Object.assign(row, { status: "OPEN", openedAt: data.openedAt ?? now, posteId: data.posteId ?? null, ...data });
         if (name === "cashDay") Object.assign(row, { scope: "rotisserie-caisse", ...data });
         if (name === "parkedBasket") row.status = data.status ?? "WAITING";
         if (name === "pickupOrder") row.status = data.status ?? "A_PREPARER";
         if (name === "caisseSyncAction") row.state = data.state ?? "PENDING";
         if (name === "sale") { row.status = data.status ?? "DRAFT"; row.payments ??= []; row.lines = data.lines?.create ?? data.lines ?? []; }
+        if (name === "partialRefund") row.status = data.status ?? "PENDING";
         state[name].push(row); return structuredClone(row);
       },
       async updateMany({ where, data }: Row) {
@@ -108,6 +111,7 @@ function fixture() {
   tx.$queryRaw = async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const sql = strings.join("?"); queries.push(sql);
     if (sql.includes('FROM "CashDay"')) return state.cashDay.filter(r => r.tenantId === values[0] && r.id === values[1]).map(r => ({ id: r.id }));
+    if (sql.includes('FROM "Sale"')) return state.sale.filter(r => r.id === values[0] && r.tenantId === values[1]).map(r => ({ id: r.id }));
     return [];
   };
   tx.$executeRawUnsafe = async (sql: string) => { queries.push(sql); if (sql.startsWith("SAVEPOINT")) saved = structuredClone(state); if (sql.startsWith("ROLLBACK TO")) state = structuredClone(saved!); };
@@ -119,6 +123,7 @@ function fixture() {
   }
   const sync = load("caisse-sync.ts", { "./tenant": { withTenant }, "./cash-day-projection": projection });
   const ledger = load("cash-day-ledger.ts", { "./cash-day-projection": projection, "./caisse-sync": sync });
+  const locks = load("sale-lock.ts", {});
   const native = {
     async openSessionTx(tx: Row, tenantId: string, b: Row) {
       const old = await tx.cashSession.findFirst({ where: { tenantId, posteId: null, status: "OPEN" } });
@@ -127,14 +132,179 @@ function fixture() {
     },
     closeSessionTx: caisseFunction("closeSessionTx", { ...movements, ...gifts, ...reports }),
   };
-  const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection, "./sale-lock": { lockSaleRow: async () => true } });
+  const days = load("cash-days.ts", { "./caisse": native, "./cash-day-ledger": ledger, "./caisse-sync": sync, "./cash-day-projection": projection, "./sale-lock": locks });
   const shared = load("cash-shared-data.ts", { "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
   const sales = load("cash-day-sales.ts", { "./cash-day-ledger": ledger, "./cash-day-projection": projection, "./cash-shared-policy": policy, "./caisse-sync": sync });
-  return { tx, sync, ledger, days, shared, sales, native, withTenant, rows: (name: string) => structuredClone(state[name]), queries };
+  return { tx, sync, ledger, locks, days, shared, sales, native, withTenant, rows: (name: string) => structuredClone(state[name]), queries };
 }
 function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open-a", entityKey: "day", deviceId: "A", deviceName: "Synthétique A", occurredAt: now.toISOString(),
   actorId: actor, actorName: "Opérateur synthétique", receivedById: actor, businessDay: "2026-10-15", localSessionKey: "local-A", sourceKey: "opening-A", openingFloatXpf: "25000", ...overrides }; }
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
+
+function financialPorts(f: ReturnType<typeof fixture>, overrides: Row = {}) {
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy });
+  const globals = {
+    ...refundPolicy, ...voidPolicy, ...f.ledger, ...f.locks, ackFinancial: f.sync.ackFinancial,
+    assertTenantId: (v: string) => v, withTenant: f.withTenant,
+    getSale: (tenantId: string, id: string) => f.tx.sale.findFirst({ where: { tenantId, id } }),
+    partialRefundWithPorts: refundDb.partialRefundWithPorts,
+    comptaClient: () => ({
+      invoiceDetail: async (_tenant: string, id: string) => {
+        const sale = f.rows("sale").find(s => s.invoiceId === id)!;
+        return { id, sourceType: "caisse", sourceId: sale.id, totalXpf: Number(sale.totalXpf), paidXpf: Number(sale.totalXpf), tgcRatePpm: 0,
+          lines: sale.lines.map((l: Row) => ({ ...l, id: `invoice-${l.id}`, unitXpf: Number(l.unitXpf) })) };
+      },
+      creditNote: async () => { await overrides.afterCredit?.(); return { creditNoteId: "synthetic-credit", totalXpf: -1000 }; },
+    }),
+    reverseSaleLoyalty: async () => {},
+    Prisma: { PrismaClientKnownRequestError: class extends Error {} },
+    CAISSE_SOURCE_TYPE: "caisse", syncLoadedSale: async () => ({ synced: true, invoiceId: null, stockDecremented: 0 }),
+    ...overrides,
+  };
+  return Object.fromEntries(["checkoutSale", "annulerVente", "rembourserPartiellement"].map(name => [name, caisseFunction(name, globals)]));
+}
+function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
+  return load(`../app/api/${path}`, {
+    "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
+    "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant } }),
+    "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
+    "@/lib/tenant": { withTenant: f.withTenant }, "@/lib/serialize": { xpf: Number },
+  });
+}
+async function expected(f: ReturnType<typeof fixture>, id: string) {
+  const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+  return page.projection.totauxCourants.expectedXpf;
+}
+const routeRequired = (e: Row) => e.status === 409 && e.message === "CASHDAY_ROUTE_REQUIRED";
+const thousandLine = () => ({ id: tenantB, kind: "OTHER", label: "Article synthétique", qty: 1, unitXpf: 1000n, lineXpf: 1000n, tgcRatePpm: 0 });
+
+test("sixième relecture (a) : POST sans session puis checkout historique CASH 1000 refusés, T 25000, aucun paiement", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const native = financialPorts(f);
+  const create = api(f, "sales/route.ts", { createSale: () => { assert.fail("aucune création historique autorisée"); } });
+  const created = await create.POST({ json: async () => ({ tenantId: tenant, lines: [{ ...thousandLine(), unitXpf: 1000 }] }) });
+  assert.equal(created.status, 409); assert.equal(created.body.error, "CASHDAY_ROUTE_REQUIRED");
+  assert.equal(f.rows("sale").length, 0);
+  // Ticket historique déjà présent avant le passage du commerce à CashDay.
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, totalXpf: 1000n, lines: [thousandLine()] } });
+  const checkout = api(f, "sales/[id]/checkout/route.ts", native);
+  const paid = await checkout.POST({ json: async () => ({ tenantId: tenant, payments: [{ method: "CASH", amountXpf: 1000 }] }) }, { params: Promise.resolve({ id: sale.id }) });
+  assert.equal(paid.status, 409); assert.equal(paid.body.error, "CASHDAY_ROUTE_REQUIRED");
+  // Même contrôle dans la transaction si la garde HTTP a lu avant l'ouverture du jour.
+  await assert.rejects(native.checkoutSale(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }]), routeRequired);
+  assert.equal(f.rows("sale")[0].status, "DRAFT"); assert.equal(f.rows("sale")[0].payments.length, 0);
+  assert.equal(await expected(f, day.id), 25000n);
+});
+
+test("sixième relecture (b) : avoir CASH 1000 sur vente ancienne sans CashDay refusé, avec CashDay T 24000", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", paidAt: new Date("2026-10-14T01:00:00Z"),
+    invoiceId: "old-invoice", totalXpf: 1000n, lines: [thousandLine()], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  const native = financialPorts(f), route = api(f, "sales/[id]/partial-refund/route.ts", native);
+  const b = { tenantId: tenant, actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH" };
+  const response = await route.POST({ json: async () => b }, { params: Promise.resolve({ id: sale.id }) });
+  assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+  // Vérifie aussi le refus propre à l'adaptateur si la session choisie appartient à CashDay.
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy });
+  const blocked = await refundDb.partialRefundWithPorts(tenant, sale.id, b, {
+    transact: (fn: (tx: Row) => Promise<unknown>) => f.withTenant(tenant, fn),
+    lockAction: async () => {}, lockSale: (tx: Row) => f.locks.lockSaleRow(tx, sale.id, tenant),
+    compta: { invoiceDetail: async () => ({ id: "old-invoice", sourceType: "caisse", sourceId: sale.id, totalXpf: 1000, paidXpf: 1000, tgcRatePpm: 0,
+      lines: [{ ...thousandLine(), id: "invoice-line", unitXpf: 1000 }] }), creditNote: async () => assert.fail("aucun avoir émis") },
+  });
+  assert.equal(blocked.error, "CASHDAY_ROUTE_REQUIRED"); assert.equal(blocked.status, 409);
+  assert.equal(f.rows("cashMovement").length, 0); assert.equal(f.rows("partialRefund").length, 0);
+  assert.equal(await expected(f, day.id), 25000n);
+  const valid = { ...b, cashDrawer: "EXTERNAL", cashDayId: day.id, drawerBusinessDay: day.businessDay, deviceId: "A", occurredAt: now.toISOString() };
+  for (let i = 0; i < 2; i++) {
+    const done = await route.POST({ json: async () => valid }, { params: Promise.resolve({ id: sale.id }) });
+    assert.equal(done.status, 200, JSON.stringify(done.body)); assert.equal(done.body.ok, true);
+  }
+  assert.equal(f.rows("cashMovement").filter(m => m.kind === "REFUND").length, 0);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 1);
+  assert.equal(await expected(f, day.id), 24000n);
+  assert.equal(f.rows("sale")[0].cashDayId, null);
+});
+
+for (const operation of ["checkout", "void"] as const) {
+  test(`sixième relecture (${operation === "checkout" ? "c" : "d"}) : attachLegacy entre lecture et transaction ${operation}, refus historique ou journal CashDay`, async () => {
+    for (const shared of [false, true]) {
+      const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+      const day = f.rows("cashDay")[0];
+      const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "racing", totalXpf: 1000n, lines: [thousandLine()] } });
+      if (shared) await f.sync.financialReservation(`cash-days:${day.id}:sales:${sale.id}:${operation}`, input({ actionId: actor }));
+      let first = true;
+      const native = financialPorts(f, { getSale: async () => {
+        const before = await f.tx.sale.findFirst({ where: { id: sale.id } });
+        if (first) {
+          first = false;
+          await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "racing" }] })));
+        }
+        return before;
+      } });
+      const run = () => operation === "checkout"
+        ? native.checkoutSale(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }], shared ? { sharedActionId: actor } : undefined)
+        : native.annulerVente(tenant, sale.id, shared ? { actionId: actor, sharedActionId: actor } : undefined);
+      if (shared) assert.equal((await run()).ok, true);
+      else await assert.rejects(run(), routeRequired);
+      const current = f.rows("sale")[0], facts = f.rows("cashDayEvent");
+      assert.equal(current.cashDayId, day.id);
+      assert.equal(current.status, shared ? operation === "checkout" ? "PAID" : "VOID" : "DRAFT");
+      assert.equal(facts.filter(e => e.kind === (operation === "checkout" ? "SALE_PAID" : "LOCAL_VOID")).length, shared ? 1 : 0);
+      assert.equal(current.payments.length, shared && operation === "checkout" ? 1 : 0);
+      assert.equal(await expected(f, day.id), shared && operation === "checkout" ? 26000n : 25000n);
+      assert.ok(f.queries.some(q => q.includes('FROM "Sale"') && q.includes("FOR UPDATE")));
+    }
+  });
+}
+
+test("avoir avec cashDayId : fermeture après garde HTTP refusée sous lockDay avant Compta et écriture", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", invoiceId: "old-invoice", totalXpf: 1000n, lines: [thousandLine()] } });
+  await f.tx.cashSession.update({ where: { id: day.currentSessionId }, data: { status: "CLOSED" } });
+  const native = financialPorts(f, { comptaClient: () => ({ invoiceDetail: () => assert.fail("aucune lecture Compta"), creditNote: () => assert.fail("aucun avoir") }) });
+  await assert.rejects(native.rembourserPartiellement(tenant, sale.id, { actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH", cashDrawer: "EXTERNAL",
+    cashDayId: day.id, drawerBusinessDay: day.businessDay, deviceId: "A", occurredAt: now.toISOString() }), routeRequired);
+  assert.equal(f.rows("partialRefund").length, 0); assert.equal(f.rows("cashMovement").length, 0);
+  assert.equal(await expected(f, day.id), 25000n);
+  assert.ok(f.queries.some(q => q.includes('FROM "CashDay"') && q.includes("FOR UPDATE")));
+});
+
+test("void HTTP : rattachement après préparation, relecture finale refuse en 409 et T reste 25000", async () => {
+  const f = fixture();
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "late-void", totalXpf: 1000n, lines: [thousandLine()] } });
+  let calls = 0;
+  const native = financialPorts(f, { withTenant: async (t: string, fn: (tx: Row) => Promise<unknown>) => {
+    if (++calls === 2) {
+      await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+      const day = f.rows("cashDay")[0];
+      await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "late-void" }] })));
+    }
+    return f.withTenant(t, fn);
+  } });
+  const route = api(f, "sales/[id]/void/route.ts", native);
+  const response = await route.POST({ json: async () => ({ tenantId: tenant }), headers: new Headers() }, { params: Promise.resolve({ id: sale.id }) });
+  assert.equal(response.status, 409); assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
+  assert.equal(f.rows("sale")[0].status, "DRAFT"); assert.ok(f.rows("sale")[0].cashDayId);
+  assert.equal(f.rows("cashDayEvent").filter(e => ["SALE_VOID", "LOCAL_VOID"].includes(e.kind)).length, 0);
+  assert.equal(await expected(f, f.rows("cashDay")[0].id), 25000n);
+});
+
+test("avoir : fermeture pendant Compta, relecture verrouillée refuse la finalisation, T 25000", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", invoiceId: "old-invoice", totalXpf: 1000n, lines: [thousandLine()] } });
+  const native = financialPorts(f, { afterCredit: () => f.withTenant(tenant, (tx: Row) => tx.cashSession.update({ where: { id: day.currentSessionId }, data: { status: "CLOSED" } })) });
+  await assert.rejects(native.rembourserPartiellement(tenant, sale.id, { actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }], refundMethod: "CASH", cashDrawer: "EXTERNAL",
+    cashDayId: day.id, drawerBusinessDay: day.businessDay, deviceId: "A", occurredAt: now.toISOString() }), routeRequired);
+  assert.equal(f.rows("partialRefund")[0].status, "PENDING"); assert.equal(f.rows("cashMovement").length, 0);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 0);
+  assert.equal(await expected(f, day.id), 25000n);
+});
 
 test("CashDay ouvert prioritaire sur une session native plus récente : retrait 500 et T 24500", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));

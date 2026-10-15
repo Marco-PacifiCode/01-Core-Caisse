@@ -23,7 +23,7 @@ function load(path: string, imports: Row) {
 }
 function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "other-tenant", open = true) {
   const owner = mode === "other-tenant" ? "autre-tenant" : tenant;
-  const days = mode === "standalone" || mode === "sale-only" ? [] : [{ id: dayId, tenantId: owner,
+  const days = mode === "standalone" ? [] : [{ id: dayId, tenantId: owner,
     canonicalSessionId: mode === "alias" ? "canonique" : sessionId, currentSession: { status: open ? "OPEN" : "CLOSED" } }];
   const aliases = mode === "alias" ? [{ tenantId: tenant, sessionId, cashDayId: dayId }] : [];
   const sales = [{ id: saleId, tenantId: tenant, sessionId, cashDayId: mode === "sale-only" ? dayId : null }];
@@ -52,6 +52,7 @@ const cases: [string, Row][] = [
   ["sessions/route.ts", { openedBy: actionId }],
   ["sessions/[id]/close/route.ts", { closedBy: actionId, closingCountedXpf: 25000 }],
   ["sales/route.ts", { sessionId, lines: [{ kind: "OTHER", label: "Synthétique", qty: 1, unitXpf: 1000 }] }],
+  ["sales/route.ts", { lines: [{ kind: "OTHER", label: "Synthétique", qty: 1, unitXpf: 1000 }] }],
   ["sales/[id]/checkout/route.ts", { payments: [{ method: "CASH", amountXpf: 1000 }] }],
   ["sales/[id]/void/route.ts", {}],
   ["sales/[id]/partial-refund/route.ts", { actionId, reason: "Retour synthétique", lines: [{ lineId: actionId, qty: 1 }], refundMethod: "CARD" }],
@@ -69,17 +70,42 @@ for (const [path, body] of cases) {
     }
   });
 }
-test("garde : vente liée directement, jour fermé, et exception d'avoir strictement du même CashDay", async () => {
+test("garde : tenant avec CashDay fermé, toute écriture historique et tout avoir refusés", async () => {
   for (const mode of ["canonical", "alias", "sale-only"] as const) {
     const { guard } = fixture(mode, false);
-    assert.equal(await guard.cashDayGuard(tenant, { saleId }), mode !== "sale-only");
-    assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: dayId }), false);
+    assert.equal(await guard.cashDayGuard(tenant, { saleId }), true);
+    assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: dayId }), true);
     assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: actionId }), true);
     if (mode !== "sale-only") {
       assert.equal(await guard.cashDayGuard(tenant, { sessionId }), true);
       assert.equal(await guard.cashDayGuard(tenant, { openSession: true }), true);
     }
   }
+});
+test("garde : seul un avoir vers un CashDay du tenant avec session courante OPEN passe", async () => {
+  for (const mode of ["canonical", "alias", "sale-only"] as const) {
+    const { guard } = fixture(mode);
+    assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: dayId }), false);
+    assert.equal(await guard.cashDayGuard(tenant, { saleId, refundCashDayId: actionId }), true);
+    assert.equal(await guard.cashDayGuard(tenant, { sessionId: null }), true);
+  }
+});
+test("garde : tenant sans aucun CashDay, false partout et comportement historique conservé", async () => {
+  for (const mode of ["standalone", "other-tenant"] as const) {
+    const { guard } = fixture(mode);
+    for (const target of [{ saleId }, { sessionId }, { sessionId: null }, {}, { openSession: true },
+      { saleId, refundCashDayId: dayId }, { saleId, refundCashDayId: actionId }]) {
+      assert.equal(await guard.cashDayGuard(tenant, target), false);
+    }
+  }
+});
+test("void HTTP : CashContractError pendant la transaction renvoie 409", async () => {
+  const f = fixture("standalone");
+  f.imports["@/lib/caisse"].annulerVente = async () => { throw new projection.CashContractError("CASHDAY_ROUTE_REQUIRED", 409); };
+  const route = load("../app/api/sales/[id]/void/route.ts", f.imports);
+  const response = await route.POST({ json: async () => ({ tenantId: tenant }), headers: new Headers() }, { params: Promise.resolve({ id: saleId }) });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.error, "CASHDAY_ROUTE_REQUIRED");
 });
 test("actions serveur : refus avant toute écriture CashDay, comportement natif conservé", async () => {
   for (const mode of ["canonical", "alias", "standalone"] as const) {

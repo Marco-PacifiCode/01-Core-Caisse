@@ -52,6 +52,7 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (replay) return replay;
         const current = await tx.sale.findFirst({ where: { id: saleId, tenantId }, include: { lines: true } });
         if (!current) return refuse("SALE_NOT_FOUND", 404);
+        if (!input.cashDayId && (current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         const refunds = await tx.partialRefund.findMany({ where: { tenantId, saleId } });
         if (refunds.some(r => r.status === "PENDING")) return refuse("REFUND_IN_PROGRESS");
         const plan = planPartialRefund(current, invoice, input, refunds.map(r => r.plan as unknown as RefundPlan));

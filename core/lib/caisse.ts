@@ -1433,7 +1433,17 @@ export async function annulerVente(
 ): Promise<AnnulerVenteResult> {
   const safeTenantId = assertTenantId(tenantId);
   const actionId = opts?.actionId?.toLowerCase();
+  let preparedLink: { cashDayId: string | null; sessionId: string | null } | undefined;
+  // Locale à l'adaptateur : le banc de tests extrait cette fonction seule.
+  const checkRoute = async (tx: Prisma.TransactionClient, current: { cashDayId: string | null; sessionId: string | null }, previous?: typeof preparedLink) => {
+    if (opts?.sharedActionId) return;
+    if (previous && (current.cashDayId !== previous.cashDayId || current.sessionId !== previous.sessionId)
+      || !current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId: safeTenantId }, select: { id: true } })) {
+      throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    }
+  };
   try {
+    const initialSale = await getSale(safeTenantId, saleId);
     // TODO fidélité : reprise auto sur avoir Compta (décision Marco 15/09 : plus tard,
     // Core-Compta verrouillé).
     // Préparation : le verrou de clé arbitre les clés inter-ventes ; le verrou de vente
@@ -1445,6 +1455,7 @@ export async function annulerVente(
           if (!await lockSaleRow(tx, saleId, safeTenantId)) throw new Error("SALE_NOT_FOUND");
           const current = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId } });
           if (!current) throw new Error("SALE_NOT_FOUND");
+          await checkRoute(tx, current, preparedLink);
           if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) {
             return { ok: false as const, error: "PARTIAL_REFUND_EXISTS" as const, message: "Une réservation ou un avoir partiel interdit le void total." };
           }
@@ -1483,6 +1494,8 @@ export async function annulerVente(
           if (!await lockSaleRow(tx, saleId, safeTenantId)) return { error: "SALE_NOT_FOUND" as const };
           const sale = await tx.sale.findFirst({ where: { id: saleId, tenantId: safeTenantId }, include: { lines: true } });
           if (!sale) return { error: "SALE_NOT_FOUND" as const };
+          await checkRoute(tx, sale, initialSale ?? undefined);
+          preparedLink = { cashDayId: sale.cashDayId, sessionId: sale.sessionId };
           if (sale.status === "VOID") return sale;
           if (await tx.partialRefund.count({ where: { tenantId: safeTenantId, saleId } })) return { error: "PARTIAL_REFUND_EXISTS" as const };
           if (actionId) {
@@ -1522,17 +1535,26 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
     lockSale: async tx => {
       if (normalized.cashDayId) {
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
+        if (day.currentSession.status !== "OPEN") throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
         if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
         // Refuse la collision avant la réservation de l'avoir et tout appel Compta.
         await ackFinancial(tx, safeTenantId, normalized.actionId,
           { id: saleId, saleId, cashDayId: normalized.cashDayId, status: "DONE" }, true);
       }
-      await lockSharedSale(tx, safeTenantId, saleId);
-      return lockSaleRow(tx, saleId, safeTenantId);
+      const beforeLock = await lockSharedSale(tx, safeTenantId, saleId);
+      if (!await lockSaleRow(tx, saleId, safeTenantId)) return false;
+      const current = await tx.sale.findFirst({ where: { tenantId: safeTenantId, id: saleId } });
+      if (!current) return false;
+      if (!normalized.cashDayId && (beforeLock && (current.cashDayId !== beforeLock.cashDayId || current.sessionId !== beforeLock.sessionId)
+        || await tx.cashDay.findFirst({ where: { tenantId: safeTenantId }, select: { id: true } }))) {
+        throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+      }
+      return true;
     },
     recordDrawer: async (tx, action, plan) => {
       if (!normalized.cashDayId) return;
       const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
+      if (day.currentSession.status !== "OPEN") throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
       if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
       await appendDayFact(tx, safeTenantId, day.id, { kind: "PARTIAL_REFUND_DONE", sourceRef: normalized.actionId,
         refundActionId: action.id, deviceId: normalized.deviceId!, occurredAt: new Date(normalized.occurredAt!),
