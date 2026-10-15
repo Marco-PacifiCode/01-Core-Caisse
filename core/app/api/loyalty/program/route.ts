@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { getLoyaltyProgram, upsertLoyaltyProgram } from "@/lib/caisse";
+import { serializeProgram } from "@/lib/loyalty-serialize";
 
 export const runtime = "nodejs";
 
@@ -18,7 +19,7 @@ export async function GET(req: NextRequest) {
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
   const program = await getLoyaltyProgram(tenantId);
-  return NextResponse.json({ ok: true, program });
+  return NextResponse.json({ ok: true, program: serializeProgram(program) });
 }
 
 /**
@@ -71,5 +72,5 @@ export async function PUT(req: NextRequest) {
     updatedBy,
   );
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
-  return NextResponse.json({ ok: true, program: result.data });
+  return NextResponse.json({ ok: true, program: serializeProgram(result.data) });
 }
