@@ -35,7 +35,7 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
     await tx.cashDaySession.create({ data: { tenantId, cashDayId: day.id, sessionId: session.id, cycle: 0 } });
   }
   const locked = await lockDay(tx, tenantId, day.id);
-  const prior = await tx.cashDayOpening.findFirst({ where: { tenantId, sourceKey: { equals: sourceKey, mode: "insensitive" } } });
+  const prior = await tx.cashDayOpening.findFirst({ where: { tenantId, sourceKey: sourceKey } });
   if (prior) {
     requireCash(prior.cashDayId === day.id && prior.openingFloatXpf === openingFloatXpf && normalizeActionId(prior.localSessionKey) === localSessionKey,
       "SOURCE_CONFLICT", 409);
@@ -77,14 +77,14 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     requireCash(Array.isArray(snapshot.knownSourceRefs) && snapshot.knownSourceRefs.every((s: unknown) => typeof s === "string"));
   }
   const sourceKey = text(b.sourceKey, 300);
-  const previous = await tx.cashDayClosure.findFirst({ where: { tenantId: b.tenantId, sourceKey: { equals: sourceKey, mode: "insensitive" } } });
+  const previous = await tx.cashDayClosure.findFirst({ where: { tenantId: b.tenantId, sourceKey: sourceKey } });
   if (previous) {
     requireCash(previous.cashDayId === day.id && previous.countedXpf === countedXpf && previous.cycle === cycle
       && previous.localExpectedXpf === localExpectedXpf && previous.localVarianceXpf === localVarianceXpf
       && previous.closureMode === closureMode && previous.deviceId === b.deviceId && previous.deviceName === b.deviceName
       && previous.actorId === author.actorId && previous.actorName === author.actorName && previous.occurredAt.getTime() === occurredAt.getTime()
-      && canonical(previous.legacySnapshot) === canonical(b.legacySnapshot ?? null), "SOURCE_CONFLICT", 409);
-    const event = await tx.cashDayEvent.findFirst({ where: { tenantId: b.tenantId, cashDayId, kind: "CLOSURE", sourceRef: { equals: sourceKey, mode: "insensitive" } } });
+      && canonical(normalizeActionInput(previous.legacySnapshot)) === canonical(b.legacySnapshot ?? null), "SOURCE_CONFLICT", 409);
+    const event = await tx.cashDayEvent.findFirst({ where: { tenantId: b.tenantId, cashDayId, kind: "CLOSURE", sourceRef: sourceKey } });
     return { id: previous.id, alreadyClosed: true, recount: !previous.authoritative, cutoffRevision: previous.cutoffRevision,
       report: event ? object(event.snapshot).report ?? null : null };
   }

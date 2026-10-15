@@ -1,6 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import { businessDay, canonical, CashContractError, factDelta, jsonValue, requireCash, taxes, type FrozenLine, type DayFact } from "./cash-day-projection";
-import { lockCashTenant, normalizeActionKind, normalizeActionInput, uuid, type CashTx } from "./caisse-sync";
+import { lockCashTenant, normalizeActionId, normalizeActionInput, uuid, type CashTx } from "./caisse-sync";
 
 // Tenant → Day → Sale : verrouiller le tenant avant toute recherche de CashDay.
 // Toute transaction prenant les deux verrous lit d'abord cashDayId
@@ -17,13 +17,13 @@ export async function appendDayFact(tx: CashTx, tenantId: string, cashDayId: str
   kind: string; sourceRef: string; deviceId: string; occurredAt: Date; snapshot: unknown; saleId?: string; refundActionId?: string;
 }) {
   tenantId = uuid(tenantId); cashDayId = uuid(cashDayId);
-  input = { ...input, sourceRef: normalizeActionKind(input.sourceRef) };
+  input = { ...input, sourceRef: normalizeActionId(input.sourceRef) };
   if (input.saleId) input = { ...input, saleId: uuid(input.saleId) };
   if (input.refundActionId) input = { ...input, refundActionId: uuid(input.refundActionId) };
   await lockDay(tx, tenantId, cashDayId);
   const snapshot = jsonValue(normalizeActionInput(input.snapshot as Record<string, unknown>)) as Prisma.InputJsonValue;
   const cashDeltaXpf = factDelta(input.kind, snapshot);
-  const old = await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId, kind: input.kind, sourceRef: { equals: input.sourceRef, mode: "insensitive" } } });
+  const old = await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId, kind: input.kind, sourceRef: input.sourceRef } });
   if (old) {
     if (canonical(normalizeActionInput(old.snapshot as Record<string, unknown>)) !== canonical(snapshot)) throw new CashContractError("SOURCE_CONFLICT", 409);
     return old;

@@ -41,7 +41,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (normalizedHeaderActionId && normalizedBodyActionId && normalizedHeaderActionId !== normalizedBodyActionId) {
     return NextResponse.json({ error: "ACTION_ID_CONFLICT" }, { status: 400 });
   }
-  const rawActionId = normalizedHeaderActionId ?? normalizedBodyActionId;
+  const rawActionId = headerActionId ?? body.actionId;
   if (rawActionId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawActionId)) {
     return NextResponse.json({ error: "actionId doit être un UUID" }, { status: 400 });
   }

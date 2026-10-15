@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import type { ComptaClient } from "./clients";
 import { partialRefundMovementRef } from "./cash-movement.ts";
 import { planPartialRefund, refundFingerprint, refuse, runPartialRefund, type RefundInput, type RefundPlan, type RefundResult, type RefundSuccess, type RefundReservation } from "./partial-refund.ts";
-import { normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync.ts";
+import { findHistoricalKey, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync.ts";
 
 type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
@@ -15,13 +15,15 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
   compta: ComptaClient;
   recordDrawer?(tx: Tx, action: { id: string }, plan: RefundPlan): Promise<void>;
 }): Promise<RefundResult> {
+  const receivedActionId = input.actionId;
   tenantId = uuid(tenantId); saleId = uuid(saleId);
   input = { ...normalizeActionInput(input), actionId: normalizeActionId(input.actionId),
     ...(input.cashDayId ? { cashDayId: uuid(input.cashDayId) } : {}),
     lines: input.lines.map(line => ({ ...line, lineId: uuid(line.lineId) })) };
   let key = { tenantId_actionId: { tenantId, actionId: input.actionId } };
   const readExisting = async (tx: Tx): Promise<RefundReservation | ReturnType<typeof refuse> | null> => {
-    const r = await tx.partialRefund.findFirst({ where: { tenantId, actionId: { equals: input.actionId, mode: "insensitive" } } });
+    const read = (actionId: string) => tx.partialRefund.findUnique({ where: { tenantId_actionId: { tenantId, actionId } } });
+    const r = input.cashDayId ? await read(input.actionId) : await findHistoricalKey(receivedActionId, read);
     if (!r) return null;
     key = { tenantId_actionId: { tenantId, actionId: r.actionId } };
     if (r.saleId.toLowerCase() !== saleId || refundFingerprint(normalizeActionInput(r.input as unknown as RefundInput)) !== refundFingerprint(input)) return refuse("ACTION_ID_CONFLICT");
@@ -104,13 +106,13 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
           const locked = await tx.cashSession.updateMany({ where: { id: session.id, tenantId, status: "OPEN" }, data: { status: "OPEN" } });
           if (locked.count !== 1) return refuse("SESSION_CLOSED");
           if (!input.cashDayId && await isCashDaySession(tx, session.id)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
-          const movement = await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(input.actionId) } });
+          const movement = await tx.cashMovement.findFirst({ where: { tenantId, ref: partialRefundMovementRef(reservation.input.actionId) } });
           if (movement) return refuse("REFUND_REF_CONFLICT");
-          if (!movement) await tx.cashMovement.create({ data: { tenantId, sessionId: session.id, kind: "REFUND", ref: partialRefundMovementRef(input.actionId),
+          if (!movement) await tx.cashMovement.create({ data: { tenantId, sessionId: session.id, kind: "REFUND", ref: partialRefundMovementRef(reservation.input.actionId),
             amountXpf: BigInt(reservation.plan.amountXpf), reason: input.reason, createdBy: input.createdBy, createdByName: input.createdByName } });
           await tx.partialRefund.update({ where: { id: action.id }, data: { sessionId: session.id } });
         }
-        const outcome: RefundSuccess = { ok: true, actionId: input.actionId, creditNoteId, refundMethod: input.refundMethod,
+        const outcome: RefundSuccess = { ok: true, actionId: reservation.input.actionId, creditNoteId, refundMethod: input.refundMethod,
           ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}), plan: reservation.plan,
           doneAt: new Date().toISOString(), ...(saleChanged ? { saleChanged: true as const } : {}) };
         await tx.partialRefund.update({ where: key, data: { status: "DONE", creditNoteId, outcome: outcome as unknown as Prisma.InputJsonValue } });

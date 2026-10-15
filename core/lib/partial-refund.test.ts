@@ -30,7 +30,7 @@ function fixture(original = sale()) {
   const transactionContext = new AsyncLocalStorage<boolean>();
   const emitted = new Map<string, any>(), calls: CreditNoteInput[] = [];
   let fail = false, afterCredit: (() => void) | undefined, failCommit = false;
-  const matches = (row: any, where: any) => Object.entries(where).every(([k, v]) => v && typeof v === "object" && (v as any).mode === "insensitive" ? typeof row[k] === "string" && row[k].toLowerCase() === (v as any).equals.toLowerCase() : row[k] === v);
+  const matches = (row: any, where: any) => Object.entries(where).every(([k, v]) => row[k] === v);
   const refundFor = (where: any) => state.refunds.find(r => matches(r, where.tenantId_actionId ?? where)) ?? null;
   const tx = {
     cashDay: { findFirst: async () => null },

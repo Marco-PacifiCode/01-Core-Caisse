@@ -42,7 +42,7 @@ function caisseFunction(name: string, globals: Row) {
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...corrections,
     assertLegacyWriteAllowed: globals.assertLegacyWriteAllowed, lockCashTenant: globals.lockCashTenant ?? tenantLock,
-    uuid: activeSync.uuid, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
+    uuid: activeSync.uuid, findHistoricalKey: activeSync.findHistoricalKey, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
     randomUUID: require("node:crypto").randomUUID, createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
 }
 type Row = Record<string, any>;
@@ -64,7 +64,6 @@ function fixture(enforceDayBeforeSale = false) {
       if (k === "payments") return !!state.sale.find(s => s.id === row.id)?.payments?.length;
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
-      if (v && typeof v === "object" && v.mode === "insensitive") return typeof row[k] === "string" && row[k].toLowerCase() === v.equals.toLowerCase();
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
         op === "lte" ? row[k] <= n! : op === "gte" ? row[k] >= n! : op === "gt" ? row[k] > n! : op === "not" ? row[k] !== n : op === "in" ? (n as unknown[]).includes(row[k]) : false);
       return row[k] === v;
@@ -1216,7 +1215,7 @@ for (const operation of ["partial-refund", "void"] as const) {
 }
 
 
-for (const financial of [false, true]) test('identite ancienne : cle et empreinte brutes en majuscules, contenu divergent refuse ' + financial, async () => {
+for (const financial of [false, true]) test('empreinte brute : UUID normalises, contenu divergent refuse ' + financial, async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
   const day = f.rows('cashDay')[0];
   const raw = input({ actionId: actor.toUpperCase(), tenantId: tenant.toUpperCase(), cashDayId: day.id.toUpperCase(),
@@ -1225,7 +1224,7 @@ for (const financial of [false, true]) test('identite ancienne : cle et empreint
   const response = financial ? { ok: true, data: { payments: [{ method: 'CARD', amountXpf: '1000' }] } }
     : { status: 200, body: { ok: true, alreadyApplied: false, data: { id: actor } } };
   if (!financial) await f.withTenant(tenant, (tx: Row) => f.sales.dayMovement(tx, day.id, f.sync.normalizeActionInput(raw)));
-  await f.tx.caisseSyncAction.create({ data: { tenantId: tenant, actionId: raw.actionId, deviceId: 'A', kind, entityKey: raw.entityKey,
+  await f.tx.caisseSyncAction.create({ data: { tenantId: tenant, actionId: actor, deviceId: 'A', kind, entityKey: raw.entityKey,
     payload: raw, requestHash: require('node:crypto').createHash('sha256').update(projection.canonical({ kind, b: raw })).digest('hex'), state: 'ACK', response } });
   const lower = f.sync.normalizeActionInput(raw);
   for (const b of [lower, raw]) {
@@ -1307,14 +1306,130 @@ for (const operation of ['partial-refund', 'void']) test('ancienne cle ' + opera
   if (operation === 'partial-refund') assert.equal((await run({ ...b, reason: 'Contenu different' })).error, 'ACTION_ID_CONFLICT');
 });
 
-test('journal : source UUID ancienne en majuscules et snapshot normalise ne doublent aucun fait', async () => {
+test('journal : UUID normalises des la creation et snapshots rejoues sans doublon', async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input())); const day = f.rows('cashDay')[0];
   const fact = { kind: 'MOVEMENT', sourceRef: actor.toUpperCase(), deviceId: 'A', occurredAt: now, snapshot: { kind: 'CASH_OUT', amountXpf: '1000', actorId: actor.toUpperCase() } };
   await f.ledger.appendDayFact(f.tx, tenant, day.id, fact);
   const old = f.rows('cashDayEvent').find(e => e.kind === 'MOVEMENT')!;
-  await f.tx.cashDayEvent.update({ where: { id: old.id }, data: { sourceRef: actor.toUpperCase(), snapshot: fact.snapshot } });
+  assert.equal(old.sourceRef, actor);
+  assert.equal(old.snapshot.actorId, actor);
   await f.ledger.appendDayFact(f.tx, tenant, day.id, { ...fact, sourceRef: actor, snapshot: { ...fact.snapshot, actorId: actor } });
   assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 1); assert.equal(await expected(f, day.id), 24000n);
 });
 
 function sameResponse(actual: unknown, saved: unknown) { assert.equal(projection.canonical(actual), projection.canonical(saved)); }
+
+test('normalisation recursive : UUID sous toute cle et dans les tableaux, autres valeurs exactes', () => {
+  const f = fixture();
+  const value = { sellerId: actor.toUpperCase(), pickupOrderId: tenantB.toUpperCase(),
+    inconnu: [{ profond: [actor.toUpperCase(), { encore: tenantB.toUpperCase() }] }],
+    ref: 'ABC', sourceRef: 'prefix:' + actor.toUpperCase(), nom: 'Nom Mixte', ticket: 'TICKET-ABC', date: now, montant: 1000n };
+  const normalized = f.sync.normalizeActionInput(value);
+  assert.equal(normalized.sellerId, actor); assert.equal(normalized.pickupOrderId, tenantB);
+  assert.equal(normalized.inconnu[0].profond[0], actor);
+  assert.equal(normalized.inconnu[0].profond[1].encore, tenantB);
+  for (const key of ['ref', 'sourceRef', 'nom', 'ticket', 'date', 'montant']) assert.equal(normalized[key], value[key as keyof typeof value]);
+  assert.equal(value.sellerId, actor.toUpperCase(), 'entree non mutee');
+});
+
+test('recherches historiques : variantes exactes bornees, cle libre preservee et casse mixte acceptee en rejeu identique', async () => {
+  const f = fixture(), mixed = 'aB000000-0000-0000-0000-000000000001';
+  for (const received of [mixed, tenant, tenant.toUpperCase(), 'ABC', 'abc']) {
+    const seen: string[] = [];
+    await f.sync.findHistoricalKey(received, async (key: string) => { seen.push(key); return null; });
+    assert.deepEqual(seen, received === 'ABC' || received === 'abc' ? [received] : [...new Set([received, received.toLowerCase(), received.toUpperCase()])]);
+    assert.ok(seen.length <= 3);
+  }
+  const found = await f.sync.findHistoricalKey(mixed, async (key: string) => key === mixed ? { key } : null);
+  assert.equal(found.key, mixed);
+  assert.equal(await f.sync.findHistoricalKey(tenant, async (key: string) => key === mixed ? { key } : null), null);
+});
+
+test('vente rejouee : sellerId, pickupOrderId et UUID imbriques en majuscules restent idempotents', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  const order = await f.tx.pickupOrder.create({ data: { tenantId: tenant, totalXpf: 1000n, claimedByDevice: 'A' } });
+  const b = input({ actionId: actor, sourceType: 'synthetic', sourceId: 'SALE-ABC', ticketNumber: 'TICKET-ABC',
+    sellerId: actor, sellerName: 'Nom Mixte', pickupOrderId: order.id, lines: [{ ...thousandLine(), unitXpf: '1000', lineXpf: '1000' }],
+    autre: [{ nouveauChamp: [actor, { libre: 'ABC', uuidSansNomConnu: tenantB }] }] });
+  const run = (body: Row) => f.sync.cashAction('cash-days:' + day.id + ':sales', body as any,
+    (tx: Row) => f.sales.createDaySale(tx, day.id, f.sync.normalizeActionInput(body)));
+  const first = await run(b); assert.equal(first.status, 200);
+  sameResponse(await run({ ...b, sellerId: actor.toUpperCase(), pickupOrderId: order.id.toUpperCase(),
+    autre: [{ nouveauChamp: [actor.toUpperCase(), { libre: 'ABC', uuidSansNomConnu: tenantB.toUpperCase() }] }] }), first);
+  assert.equal(f.rows('sale').length, 1);
+  assert.equal((await run({ ...b, sellerName: 'nom mixte' })).status, 409);
+  assert.equal((await run({ ...b, autre: [{ nouveauChamp: [actor, { libre: 'abc', uuidSansNomConnu: tenantB }] }] })).status, 409);
+});
+
+test('retraits ABC 500 et abc 700 : deux mouvements et faits distincts, T 23800', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  const record = caisseFunction('recordCashMovement', { withTenant: f.withTenant, ...f.ledger,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed });
+  for (const [ref, amountXpf] of [['ABC', 500n], ['abc', 700n]] as const) {
+    const b = { ref, amountXpf, kind: 'CASH_OUT', reason: 'Retrait synthetique' };
+    assert.equal((await record(tenant, b)).alreadyExisted, false);
+    assert.equal((await record(tenant, b)).alreadyExisted, true);
+  }
+  assert.deepEqual(f.rows('cashMovement').map(m => m.ref), ['ABC', 'abc']);
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 2);
+  assert.equal(await expected(f, day.id), 23800n);
+});
+
+test('journal : sourceRef non UUID et UUID incorpore restent exacts', async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  for (const sourceRef of ['ABC', 'abc', 'prefix:' + actor, 'prefix:' + actor.toUpperCase()]) {
+    await f.ledger.appendDayFact(f.tx, tenant, day.id, { kind: 'MOVEMENT', sourceRef, deviceId: 'A', occurredAt: now,
+      snapshot: { kind: 'CASH_OUT', amountXpf: '100' } });
+  }
+  assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'MOVEMENT').length, 4);
+});
+
+test('correction PENDING avant 5d9e72c : cle Compta ancienne conservee, nouveau format par action', async () => {
+  const f = fixture();
+  const session = await f.tx.cashSession.create({ data: { tenantId: tenant, openingFloatXpf: 25000n } });
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sessionId: session.id, status: 'PAID', paidAt: now,
+    createdAt: now, invoiceId: 'synthetic-invoice', comptaSyncedAt: now, totalXpf: 1000n, lines: [thousandLine()],
+    sourceType: 'synthetic', sourceId: 'old-correction', payments: [{ method: 'CASH', amountXpf: 1000n, settleRef: 'initial' }] } });
+  const request = { saleId: sale.id, fromMethod: 'CASH', toMethod: 'CARD', amountXpf: 1000 };
+  const oldKey = corrections.correctionKeyPour(sale.id, 'CASH', 'CARD', 1000, 0);
+  const refs = corrections.refsDeLaCorrection(oldKey);
+  const hash = projection.canonical(request);
+  const reservation = await f.tx.caisseSyncAction.create({ data: { tenantId: tenant, actionId: 'legacy-correction:' + oldKey,
+    deviceId: 'legacy', kind: 'legacy-payment-correction', entityKey: sale.id, requestHash: hash, state: 'PENDING',
+    payload: { snapshot: { ...sale, payments: sale.payments.map((p: Row) => ({ ...p, amountXpf: String(p.amountXpf) })) },
+      validatedAt: now.toISOString(), ...refs } } });
+  const calls: string[] = [], emitted = new Set<string>([oldKey]);
+  const net = new Map([['CASH', 0], ['CARD', 1000]]);
+  const correct = caisseFunction('corrigerMoyenPaiement', { withTenant: f.withTenant, ...f.ledger, ...f.locks,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed,
+    comptaClient: () => ({ paymentCorrection: async (args: Row) => {
+      calls.push(args.correctionKey);
+      if (!emitted.has(args.correctionKey)) {
+        emitted.add(args.correctionKey); net.set(args.fromMethod, net.get(args.fromMethod)! - args.amountXpf);
+        net.set(args.toMethod, net.get(args.toMethod)! + args.amountXpf);
+      }
+      return { ok: true };
+    } }) });
+  assert.equal((await correct(tenant, request)).ok, true);
+  assert.deepEqual(calls, [oldKey]); assert.equal(emitted.size, 1);
+  assert.equal((await correct(tenant, request)).ok, true); assert.equal(calls.length, 1);
+  const saved = f.rows('caisseSyncAction').find(a => a.id === reservation.id)!;
+  assert.equal(saved.requestHash, hash); sameResponse(saved.payload, reservation.payload);
+  assert.equal(f.rows('sale')[0].payments[1].settleRef, refs.sortie);
+  assert.equal(f.rows('sale')[0].payments[2].settleRef, refs.entree);
+  const back = await correct(tenant, { ...request, actionId: actor, fromMethod: 'CARD', toMethod: 'CASH' });
+  assert.equal(back.ok, true);
+  const forward = await correct(tenant, { ...request, actionId: tenantB }); assert.equal(forward.ok, true);
+  assert.equal(calls.length, 3); assert.equal(emitted.size, 3);
+  assert.equal(calls[1], 'corr:caisse:' + sale.id + ':action:' + actor);
+  assert.equal(calls[2], 'corr:caisse:' + sale.id + ':action:' + tenantB);
+  for (const p of forward.payments) assert.equal(p.amountXpf, net.get(p.method));
+  await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows('cashDay')[0];
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ cycle: 0, sessionIds: [session.id],
+    origins: [{ sourceType: 'synthetic', sourceId: 'old-correction' }] })));
+  assert.equal(await expected(f, day.id), 25000n);
+});

@@ -17,33 +17,24 @@ export function uuid(value: unknown): string {
 /** Normalise un actionId UUID tout en préservant les clés métier historiques non-UUID. */
 export function normalizeActionId(value: unknown): string {
   const v = text(value, 200);
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? uuid(v) : v;
+  return normalizeActionInput(v);
 }
-const UUID_FIELDS = ["tenantId", "saleId", "cashDayId", "refundId", "partialRefundId", "voidActionId", "sessionId", "legacySessionId", "actorId", "receivedById", "createdBy", "cancelledBy", "openedBy", "closedBy", "cashierId", "giftCardId", "posteId", "by", "updatedBy", "clientFicheId", "appointmentId", "redeemedBy", "redeemedAppointmentId", "serviceId", "orderId"];
-export function normalizeActionInput<T extends Record<string, any>>(input: T): T {
-  const out: Record<string, any> = { ...input };
-  // Les identifiants des origines/imports et des snapshots suivent la même règle.
-  for (const [key, value] of Object.entries(out)) {
-    if (Array.isArray(value)) out[key] = value.map(item => item && typeof item === "object" ? normalizeActionInput(item) : item);
-    else if (value && typeof value === "object" && !(value instanceof Date)) out[key] = normalizeActionInput(value);
+/** Parcourt toutes les valeurs ; seules les chaînes UUID complètes sont canonisées. */
+export function normalizeActionInput<T>(input: T): T {
+  if (typeof input === "string") return (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input) ? input.toLowerCase() : input) as T;
+  if (Array.isArray(input)) return input.map(value => normalizeActionInput(value)) as T;
+  if (input && Object.prototype.toString.call(input) === "[object Object]") {
+    return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, normalizeActionInput(value)])) as T;
   }
-  for (const key of UUID_FIELDS) if (out[key] != null) out[key] = uuid(out[key]);
-  if (out.actionId != null) out.actionId = normalizeActionId(out.actionId);
-  for (const key of ["sharedActionId", "idempotencyKey"]) if (out[key] != null) out[key] = normalizeActionId(out[key]);
-  if (typeof out.entityKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(out.entityKey)) out.entityKey = uuid(out.entityKey);
-  for (const key of ["id", "sourceKey", "localSessionKey", "sourceRef", "ref"]) {
-    if (typeof out[key] === "string") out[key] = normalizeActionId(out[key]);
-  }
-  for (const key of ["lines", "redeemGiftCards", "giftCards"]) if (Array.isArray(out[key])) out[key] = out[key].map((item: Record<string, any>) => ({
-    ...item,
-    ...(key === "lines" && item.lineId != null ? { lineId: uuid(item.lineId) } : {}),
-    ...(key === "lines" && item.productId != null ? { productId: uuid(item.productId) } : {}),
-    ...(key === "redeemGiftCards" && item.id != null ? { id: uuid(item.id) } : {}),
-    ...(key === "giftCards" && item.serviceId != null ? { serviceId: uuid(item.serviceId) } : {}),
-    ...(key === "giftCards" && item.orderId != null ? { orderId: uuid(item.orderId) } : {}),
-  }));
-  if (Array.isArray(out.sessionIds)) out.sessionIds = out.sessionIds.map((id: unknown) => uuid(id));
-  return out as T;
+  return input;
+}
+/** Tables historiques : au plus trois égalités indexées, sans réécrire la clé stockée. */
+export async function findHistoricalKey<T>(received: string, read: (key: string) => Promise<T | null>): Promise<T | null> {
+  const normalized = normalizeActionId(received);
+  const keys = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(received)
+    ? [...new Set([received, normalized, received.toUpperCase()])] : [received];
+  for (const key of keys) { const row = await read(key); if (row) return row; }
+  return null;
 }
 export function date(value: unknown): Date {
   const v = text(value, 40); requireCash(/T.*(?:Z|[+-]\d\d:\d\d)$/.test(v)); const d = new Date(v); requireCash(Number.isFinite(d.getTime())); return d;
@@ -62,7 +53,7 @@ export async function lockCashTenant(tx: CashTx, tenantId: string) {
 export type ActionResponse = { status: number; body: JsonRecord };
 /** Les UUID intégrés dans les noms de route font partie du contenu canonique. */
 export function normalizeActionKind(kind: string): string {
-  return kind.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, id => id.toLowerCase());
+  return kind.split(":").map(part => normalizeActionInput(part)).join(":");
 }
 function sameRequest(old: { kind: string; requestHash: string; payload: unknown }, kind: string, b: ActionInput, hash: string) {
   if (old.requestHash === hash) return true;
@@ -80,7 +71,7 @@ export async function cashAction(kind: string, b: ActionInput, mutate: (tx: Cash
   const requestHash = createHash("sha256").update(canonical({ kind, b })).digest("hex");
   return withTenant(b.tenantId, async tx => {
     await lockCashTenant(tx, b.tenantId);
-    const previous = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
+    const previous = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: b.actionId } });
     const key = { tenantId_actionId: { tenantId: b.tenantId, actionId: previous?.actionId ?? b.actionId } };
     if (previous) {
       if (!sameRequest(previous, kind, b, requestHash)) return { status: 409, body: { ok: false, error: "ACTION_ID_CONFLICT" } };
@@ -130,7 +121,7 @@ export async function financialReservation(kind: string, b: ActionInput) {
   const requestHash = createHash("sha256").update(canonical({ kind, b })).digest("hex");
   return withTenant(b.tenantId, async tx => {
     await lockCashTenant(tx, b.tenantId);
-    const old = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
+    const old = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: b.actionId } });
     if (old) {
       requireCash(sameRequest(old, kind, b, requestHash), "ACTION_ID_CONFLICT", 409);
       return old.state !== "PENDING" ? old.response : null;
@@ -143,7 +134,7 @@ export async function financialReservation(kind: string, b: ActionInput) {
 export async function ackFinancial(tx: CashTx, tenantId: string, actionId: string, data: { id: string; [key: string]: unknown }, validateOnly = false) {
   tenantId = uuid(tenantId); actionId = normalizeActionId(actionId);
   data = { ...data, id: uuid(data.id), ...(data.saleId == null ? {} : { saleId: uuid(data.saleId) }), ...(data.cashDayId == null ? {} : { cashDayId: uuid(data.cashDayId) }) };
-  const action = await tx.caisseSyncAction.findFirst({ where: { tenantId, actionId: { equals: actionId, mode: "insensitive" } } });
+  const action = await tx.caisseSyncAction.findFirst({ where: { tenantId, actionId: actionId } });
   if (!action) return; // Le chemin historique peut être journalisé sans réservation de synchronisation.
   const operation = data.status === "PAID" ? "checkout" : data.status === "VOID" ? "void" : data.status === "DONE" ? "partial-refund" : null;
   const saleId = data.saleId ?? data.id;

@@ -14,6 +14,10 @@ export async function dayFinancial(cashDayId: string, saleId: string, operation:
   b.tenantId = uuid(b.tenantId); b.actionId = normalizeActionId(b.actionId);
   requireCash(["checkout", "void", "partial-refund"].includes(operation));
   uuid(b.actionId);
+  if (operation === "partial-refund") {
+    requireCash(Array.isArray(b.lines));
+    for (const line of b.lines) uuid(object(line).lineId);
+  }
   const replay = await financialReservation(`cash-days:${cashDayId}:sales:${saleId}:${operation}`, b);
   if (replay) return replay;
   try {
@@ -24,9 +28,9 @@ export async function dayFinancial(cashDayId: string, saleId: string, operation:
       if (e.message === "REFUND_DAY_CLOSED_REOPEN_REQUIRED") return { ok: false, error: e.message, status: e.status, data: e.data };
       const completed = await withTenant(b.tenantId, async tx => {
         // Un appel concurrent de la même clé peut avoir terminé entre-temps.
-        const action = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
+        const action = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: b.actionId } });
         if (action?.state === "ACK") return action.response;
-        await tx.caisseSyncAction.updateMany({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" }, state: "PENDING" },
+        await tx.caisseSyncAction.updateMany({ where: { tenantId: b.tenantId, actionId: b.actionId, state: "PENDING" },
           data: { state: e.status === 409 ? "CONFLICT" : "REJECTED", response: jsonValue({ ok: false, error: e.message, status: e.status, data: e.data }) as Prisma.InputJsonValue } });
         return null;
       });
@@ -92,7 +96,7 @@ async function applyDayFinancial(cashDayId: string, saleId: string, operation: s
   return withTenant(b.tenantId, async tx => {
     await lockDay(tx, b.tenantId, cashDayId);
     await ackFinancial(tx, b.tenantId, b.actionId, { id: saleId, saleId, status: operation === "checkout" ? "PAID" : operation === "void" ? "VOID" : "DONE" });
-    const action = await tx.caisseSyncAction.findFirstOrThrow({ where: { tenantId: b.tenantId, actionId: { equals: b.actionId, mode: "insensitive" } } });
+    const action = await tx.caisseSyncAction.findFirstOrThrow({ where: { tenantId: b.tenantId, actionId: b.actionId } });
     return action.response;
   });
 }
