@@ -1,3 +1,4 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { checkoutSale, type PaymentInput } from "@/lib/caisse";
@@ -79,6 +80,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { tenantId, payments } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+
+  if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
 
   const parsed: PaymentInput[] = [];
   for (const p of payments ?? []) {

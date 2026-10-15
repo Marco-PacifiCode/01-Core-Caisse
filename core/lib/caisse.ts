@@ -1209,7 +1209,7 @@ export async function checkoutSale(
     if (sale.cashDayId) {
       await consumePickupOrder(tx, tenantId, saleId);
       await recordSharedSale(tx, tenantId, saleId);
-      if (options?.sharedActionId) await ackFinancial(tx, tenantId, options.sharedActionId, { id: saleId, saleId, status: "PAID" });
+      if (options?.sharedActionId) await ackFinancial(tx, tenantId, options.sharedActionId, { id: saleId, saleId, cashDayId: sale.cashDayId, status: "PAID" });
     }
     // 🔴 LES BONS SE CONSOMMENT ICI, dans la MÊME transaction que le passage à PAID — pour la
     //    raison exactement symétrique de leur création : zéro fenêtre entre « le bon est brûlé »
@@ -1454,7 +1454,7 @@ export async function annulerVente(
           if (retry) return retry;
           await tx.sale.update({ where: { id: saleId }, data: { status: "VOID", creditNoteId } });
           if (current.cashDayId) await recordSharedSale(tx, safeTenantId, saleId);
-          if (current.cashDayId && opts?.sharedActionId) await ackFinancial(tx, safeTenantId, opts.sharedActionId, { id: saleId, saleId, status: "VOID", creditNoteId });
+          if (current.cashDayId && opts?.sharedActionId) await ackFinancial(tx, safeTenantId, opts.sharedActionId, { id: saleId, saleId, cashDayId: current.cashDayId, status: "VOID", creditNoteId });
           if (sale.status === "PAID") {
             await reverseSaleLoyalty(tx, { tenantId, saleId });
           }
@@ -1514,6 +1514,9 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
       if (normalized.cashDayId) {
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
         if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
+        // Refuse la collision avant la réservation de l'avoir et tout appel Compta.
+        await ackFinancial(tx, safeTenantId, normalized.actionId,
+          { id: saleId, saleId, cashDayId: normalized.cashDayId, status: "DONE" }, true);
       }
       await lockSharedSale(tx, safeTenantId, saleId);
       return lockSaleRow(tx, saleId, safeTenantId);
@@ -1526,7 +1529,7 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
         refundActionId: action.id, deviceId: normalized.deviceId!, occurredAt: new Date(normalized.occurredAt!),
         snapshot: { payments: [{ method: normalized.refundMethod, amountXpf: String(plan.amountXpf) }],
           parTaux: plan.parTaux.map(t => ({ tgcRatePpm: t.tgcRatePpm, htXpf: String(t.htXpf), tgcXpf: String(t.tgcXpf), ttcXpf: String(t.ttcXpf) })) } });
-      await ackFinancial(tx, safeTenantId, normalized.actionId, { id: action.id, actionId: normalized.actionId, amountXpf: String(plan.amountXpf) });
+      await ackFinancial(tx, safeTenantId, normalized.actionId, { id: action.id, saleId, cashDayId: normalized.cashDayId, status: "DONE", actionId: normalized.actionId, amountXpf: String(plan.amountXpf) });
     },
     compta: comptaClient(),
   });
@@ -1806,8 +1809,11 @@ export async function recordCashMovement(
   input: RecordMovementInput,
 ): Promise<RecordMovementResult> {
   return withTenant(tenantId, async (tx) => {
+    const openDay = await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN" } } });
+    const lockedDay = openDay ? await lockDay(tx, tenantId, openDay.id) : null;
+    if (lockedDay && lockedDay.currentSession.status !== "OPEN") return { ok: false as const, error: "SESSION_CLOSED" as const };
     const session = await tx.cashSession.findFirst({
-      where: { tenantId, status: "OPEN" },
+      where: { tenantId, status: "OPEN", ...(lockedDay ? { id: lockedDay.currentSessionId } : {}) },
       orderBy: { openedAt: "desc" },
     });
     if (!session) return { ok: false as const, error: "NO_OPEN_SESSION" as const };

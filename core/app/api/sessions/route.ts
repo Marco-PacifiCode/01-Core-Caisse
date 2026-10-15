@@ -1,3 +1,4 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { withTenant } from "@/lib/tenant";
@@ -27,6 +28,8 @@ export async function POST(req: NextRequest) {
   if (!tenantId || !openedBy) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
+
+  if (await cashDayGuard(tenantId, { openSession: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
 
   const result = await openSession(tenantId, {
     openedBy,

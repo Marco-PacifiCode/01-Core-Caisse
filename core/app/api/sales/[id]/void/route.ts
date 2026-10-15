@@ -1,3 +1,4 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { annulerVente } from "@/lib/caisse";
@@ -29,6 +30,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { tenantId, reason } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+
+  if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
 
   const headerActionId = req.headers.get("Idempotency-Key") ?? undefined;
   if (body.actionId !== undefined && (typeof body.actionId !== "string" || body.actionId.length === 0)) {

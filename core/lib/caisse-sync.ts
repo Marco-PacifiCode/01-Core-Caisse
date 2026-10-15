@@ -83,7 +83,15 @@ export async function financialReservation(kind: string, b: ActionInput) {
     return null;
   });
 }
-export async function ackFinancial(tx: CashTx, tenantId: string, actionId: string, data: { id: string; [key: string]: unknown }) {
+export async function ackFinancial(tx: CashTx, tenantId: string, actionId: string, data: { id: string; [key: string]: unknown }, validateOnly = false) {
+  const action = await tx.caisseSyncAction.findUnique({ where: { tenantId_actionId: { tenantId, actionId } } });
+  if (!action) return; // Le chemin historique peut être journalisé sans réservation de synchronisation.
+  const operation = data.status === "PAID" ? "checkout" : data.status === "VOID" ? "void" : data.status === "DONE" ? "partial-refund" : null;
+  const saleId = data.saleId ?? data.id;
+  const parts = action.kind.split(":");
+  requireCash(operation && parts.length === 5 && parts[0] === "cash-days" && parts[2] === "sales"
+    && parts[3] === saleId && parts[4] === operation && (!data.cashDayId || parts[1] === data.cashDayId), "ACTION_ID_CONFLICT", 409);
+  if (validateOnly) return;
   const response = jsonValue({ ok: true, id: data.id, revision: data.revision ?? 0, alreadyApplied: false, data }) as Prisma.InputJsonValue;
-  await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId, state: "PENDING" }, data: { state: "ACK", response } });
+  await tx.caisseSyncAction.updateMany({ where: { tenantId, actionId, kind: action.kind, entityKey: action.entityKey, state: "PENDING" }, data: { state: "ACK", response } });
 }

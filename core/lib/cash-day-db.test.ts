@@ -46,6 +46,7 @@ function fixture() {
   names.forEach(n => state[n] = []);
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
+      if (k === "currentSession") return match(state.cashSession.find(s => s.id === row.currentSessionId) ?? {}, v);
       if (k === "OR") return v.some((w: Row) => match(row, w));
       if (k.includes("_") && v && typeof v === "object") return match(row, v);
       if (v && typeof v === "object" && !(v instanceof Date)) return Object.entries(v).every(([op, n]) =>
@@ -134,6 +135,93 @@ function fixture() {
 function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open-a", entityKey: "day", deviceId: "A", deviceName: "Synthétique A", occurredAt: now.toISOString(),
   actorId: actor, actorName: "Opérateur synthétique", receivedById: actor, businessDay: "2026-10-15", localSessionKey: "local-A", sourceKey: "opening-A", openingFloatXpf: "25000", ...overrides }; }
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
+
+test("CashDay ouvert prioritaire sur une session native plus récente : retrait 500 et T 24500", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const other = await f.tx.cashSession.create({ data: { tenantId: tenant, posteId: actor,
+    openingFloatXpf: 999n, openedAt: new Date(now.getTime() + 1000) } });
+  const record = caisseFunction("recordCashMovement", { withTenant: f.withTenant, ...f.ledger });
+  const result = await record(tenant, { kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique", ref: "priority" });
+  assert.equal(result.movement.sessionId, day.currentSessionId);
+  assert.notEqual(result.movement.sessionId, other.id);
+  const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, day.id, new URLSearchParams()));
+  assert.equal(page.projection.totauxCourants.expectedXpf, 24500n);
+});
+
+test("import : mouvements canonique et alias du jour, avoir carte sans effet tiroir, rejeu unique", async () => {
+  for (const alias of [false, true]) {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const day = f.rows("cashDay")[0];
+    const sessionId = alias ? (await f.tx.cashSession.create({ data: { tenantId: tenant, openingFloatXpf: 0n, openedAt: now } })).id : day.canonicalSessionId;
+    const movement = await f.tx.cashMovement.create({ data: { tenantId: tenant, sessionId, kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique" } });
+    await f.tx.cashMovement.create({ data: { tenantId: tenant, sessionId, kind: "CASH_OUT", amountXpf: 900n,
+      reason: "Autre jour", createdAt: new Date("2026-10-14T01:00:00Z") } });
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, sessionId, status: "PAID", paidAt: now,
+      sourceType: "synthetic", sourceId: "card-import", totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CARD", amountXpf: 1000n }] } });
+    await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, actionId: actor, status: "DONE",
+      input: { refundMethod: "CARD" }, plan: { amountXpf: 300, parTaux: [] } } });
+    const b = input({ cycle: 0, sessionIds: [sessionId], origins: [{ sourceType: "synthetic", sourceId: "card-import" }] });
+    await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, b));
+    await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, b));
+    const facts = f.rows("cashDayEvent");
+    assert.equal(facts.filter(e => e.kind === "MOVEMENT").length, 1);
+    assert.equal(facts.find(e => e.kind === "MOVEMENT")!.sourceRef, movement.id);
+    const refunds = facts.filter(e => e.kind === "PARTIAL_REFUND_DONE");
+    assert.equal(refunds.length, 1); assert.equal(refunds[0].cashDeltaXpf, 0n);
+    assert.equal(refunds[0].snapshot.payments[0].method, "CARD");
+    assert.equal(refunds[0].snapshot.payments[0].amountXpf, "300");
+    const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, day.id, new URLSearchParams()));
+    assert.equal(page.projection.totauxCourants.expectedXpf, 24500n);
+    assert.ok(f.queries.every(q => !q.includes('"Poste"')));
+  }
+});
+
+test("ACK financier : nature, vente et CashDay doivent correspondre à la réservation", async () => {
+  const f = fixture(), kind = `cash-days:${actor}:sales:${tenantB}:checkout`;
+  await f.sync.financialReservation(kind, input({ actionId: actor }));
+  const before = f.rows("caisseSyncAction");
+  for (const data of [
+    { id: tenantB, saleId: tenantB, cashDayId: actor, status: "DONE" },
+    { id: tenant, saleId: tenant, cashDayId: actor, status: "PAID" },
+    { id: tenantB, saleId: tenantB, cashDayId: tenant, status: "PAID" },
+  ]) {
+    await assert.rejects(f.withTenant(tenant, (tx: Row) => f.sync.ackFinancial(tx, tenant, actor, data)),
+      (e: Row) => e.status === 409 && e.message === "ACTION_ID_CONFLICT");
+    assert.deepEqual(f.rows("caisseSyncAction"), before);
+  }
+  await f.withTenant(tenant, (tx: Row) => f.sync.ackFinancial(tx, tenant, actor, { id: tenantB, saleId: tenantB, cashDayId: actor, status: "PAID" }));
+  assert.equal(f.rows("caisseSyncAction")[0].state, "ACK");
+});
+
+test("avoir historique : collision checkout PENDING refusée en HTTP 409 avant Compta", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: day.currentSessionId } });
+  await f.sync.financialReservation(`cash-days:${day.id}:sales:${sale.id}:checkout`, input({ actionId: actor }));
+  let externalCalls = 0;
+  const refundDb = load("partial-refund-db.ts", { "./cash-movement.ts": movements, "./partial-refund.ts": refundPolicy });
+  const native = caisseFunction("rembourserPartiellement", {
+    ...refundPolicy, assertTenantId: (v: string) => v, withTenant: f.withTenant,
+    lockDay: f.ledger.lockDay, lockSharedSale: f.ledger.lockSharedSale, ackFinancial: f.sync.ackFinancial,
+    lockSaleRow: async () => true, lockVoidResource: async () => {},
+    comptaClient: () => ({ invoiceDetail: async () => { externalCalls++; }, creditNote: async () => { externalCalls++; } }),
+    partialRefundWithPorts: refundDb.partialRefundWithPorts,
+  });
+  const route = load("../app/api/sales/[id]/partial-refund/route.ts", {
+    "next/server": { NextResponse: { json: (body: unknown, options: Row) => ({ body, status: options.status }) } },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": { rembourserPartiellement: native },
+    "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant } }),
+    "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection,
+  });
+  const b = { tenantId: tenant, actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }],
+    refundMethod: "CARD", cashDayId: day.id, drawerBusinessDay: "2026-10-15", deviceId: "A", occurredAt: now.toISOString() };
+  const result = await route.POST({ json: async () => b }, { params: Promise.resolve({ id: sale.id }) });
+  assert.equal(result.status, 409); assert.equal(result.body.error, "ACTION_ID_CONFLICT");
+  assert.equal(externalCalls, 0); assert.equal(f.rows("caisseSyncAction")[0].state, "PENDING");
+  assert.equal(f.rows("partialRefund").length, 0);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 0);
+});
 
 test("mouvement historique CashDay canonique ou alias : retrait 500, Z 24500 et rejeu sans doublon", async () => {
   for (const alias of [false, true]) {
@@ -370,6 +458,8 @@ test("route remboursement partiel : métadonnées transmises au ledger et rejeu 
     "next/server": { NextResponse: { json: (body: unknown, options: Row) => ({ body, status: options.status }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": { rembourserPartiellement: native },
     "@/lib/partial-refund": refundPolicy,
+      "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant } }),
+      "@/lib/cash-day-projection": projection,
   });
   const b = { tenantId: tenant, actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }],
     refundMethod: "CASH", cashDrawer: "EXTERNAL", cashDayId: id, drawerBusinessDay: "2026-10-15", deviceId: "A", occurredAt: now.toISOString() };

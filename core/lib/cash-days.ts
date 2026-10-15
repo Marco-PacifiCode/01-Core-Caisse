@@ -173,13 +173,24 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
     requireCash(!alias || alias.cashDayId === id, "DAY_MISMATCH", 409);
     if (!alias) await tx.cashDaySession.create({ data: { tenantId: b.tenantId, cashDayId: id, sessionId, cycle: Number(b.cycle) } });
   }
+  // Inclut la canonique et tous les alias, même lors d'un nouvel import sans sessionIds.
+  const aliases = await tx.cashDaySession.findMany({ where: { tenantId: b.tenantId, cashDayId: id } });
+  const sessionIds = [...new Set([day.canonicalSessionId, ...aliases.map(alias => alias.sessionId)])];
+  const movements = await tx.cashMovement.findMany({ where: { tenantId: b.tenantId, sessionId: { in: sessionIds } } });
+  for (const movement of movements) {
+    if (businessDay(movement.createdAt) !== day.businessDay) continue;
+    // Les avoirs partiels ont leur propre fait financier.
+    if (movement.ref?.startsWith("avoir-partiel:")) continue;
+    await appendDayFact(tx, b.tenantId, id, { kind: "MOVEMENT", sourceRef: movement.id, deviceId: "legacy",
+      occurredAt: movement.createdAt, snapshot: { kind: movement.kind, amountXpf: movement.amountXpf, reason: movement.reason } });
+  }
   // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins.
   // Borne basse : un avoir est enregistré après avoir été rendu (createdAt ≥ occurredAt), marge d'un jour.
   const since = new Date(Date.parse(`${day.businessDay}T00:00:00Z`) - 35 * 3600000);
   const refunds = (await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
     createdAt: { gte: since }, OR: [{ cashDayId: null }, { cashDayId: id }] } })).filter(refund => {
     const input = object(refund.input);
-    return input.refundMethod === "CASH" && businessDay(input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
+    return businessDay(input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
   });
   const saleIds: string[] = [];
   for (const value of origins) {
@@ -202,7 +213,7 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
       const occurredAt = input.occurredAt ? date(input.occurredAt) : refund.createdAt;
       await appendDayFact(tx, b.tenantId, id, { kind: "PARTIAL_REFUND_DONE", sourceRef: refund.actionId,
         refundActionId: refund.id, deviceId: refund.deviceId ?? "legacy", occurredAt,
-        snapshot: { payments: [{ method: "CASH", amountXpf: String(xpfInteger(String(plan.amountXpf))) }],
+        snapshot: { payments: [{ method: input.refundMethod, amountXpf: String(xpfInteger(String(plan.amountXpf))) }],
           parTaux: (plan.parTaux as unknown[]).map(v => { const t = object(v); return { tgcRatePpm: t.tgcRatePpm,
             htXpf: String(t.htXpf), tgcXpf: String(t.tgcXpf), ttcXpf: String(t.ttcXpf) }; }) } });
   }

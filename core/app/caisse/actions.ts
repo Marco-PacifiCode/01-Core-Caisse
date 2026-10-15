@@ -1,5 +1,6 @@
 "use server";
 
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { revalidatePath } from "next/cache";
 import { requireStaff } from "@/lib/guards";
 import {
@@ -16,6 +17,7 @@ import type { LineKind, PayMethod } from "@prisma/client";
 
 export async function openSessionAction(openingFloatXpf: number, note?: string): Promise<string | undefined> {
   const { user, tenant } = await requireStaff("/caisse");
+  if (await cashDayGuard(tenant.id, { openSession: true })) return CASHDAY_ROUTE_REQUIRED.error;
   const res = await openSession(tenant.id, {
     openedBy: user.id,
     openingFloatXpf: BigInt(Math.round(openingFloatXpf || 0)),
@@ -42,6 +44,7 @@ export type ZReportResult = {
 
 export async function closeSessionAction(sessionId: string, closingCountedXpf: number): Promise<ZReportResult> {
   const { user, tenant } = await requireStaff("/caisse");
+  if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
   const res = await closeSession(tenant.id, {
     sessionId,
     closedBy: user.id,
@@ -105,6 +108,8 @@ export async function checkoutAction(
   clientName?: string,
 ): Promise<CheckoutActionResult> {
   const { user, tenant } = await requireStaff("/caisse");
+
+  if (await cashDayGuard(tenant.id, { sessionId })) return CASHDAY_ROUTE_REQUIRED;
 
   if (!lines || lines.length === 0) return { ok: false, error: "Le ticket est vide." };
   if (!payments || payments.length === 0) return { ok: false, error: "Aucun paiement saisi." };

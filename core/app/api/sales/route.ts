@@ -1,3 +1,4 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { withTenant } from "@/lib/tenant";
@@ -48,6 +49,8 @@ export async function POST(req: NextRequest) {
 
   const { tenantId, lines } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  if (await cashDayGuard(tenantId, { sessionId: body.sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+
   if (!lines || lines.length === 0) return NextResponse.json({ error: "lines ne peut pas être vide" }, { status: 400 });
 
   const parsed: SaleLineInput[] = [];

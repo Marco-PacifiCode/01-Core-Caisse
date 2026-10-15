@@ -1,3 +1,4 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { closeSession } from "@/lib/caisse";
@@ -26,6 +27,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!tenantId || !closedBy || closingCountedXpf === undefined || closingCountedXpf === null) {
     return NextResponse.json({ error: "tenantId, closedBy et closingCountedXpf sont requis" }, { status: 400 });
   }
+
+  if (await cashDayGuard(tenantId, { sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
 
   const result = await closeSession(tenantId, {
     sessionId,
