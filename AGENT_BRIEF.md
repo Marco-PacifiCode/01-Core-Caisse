@@ -478,7 +478,8 @@ historique).
 - `2026-10-15` — **PC-0212** : `GET`/`PUT /api/loyalty/program` partaient en 500 (« Do not know how to
   serialize a BigInt », ≈ 1 toutes les 10 min en prod) dès qu'un programme portait `rewardAmountXpf`.
   `lib/loyalty-serialize.ts` le rend en `number | null` (ce qu'attendent les surfaces) ; stockage
-  inchangé en bigint. Test `lib/loyalty-serialize.test.ts` (3 cas). **À déployer** (accord Marco).
+  inchangé en bigint. Test `lib/loyalty-serialize.test.ts` (3 cas). **Livré le 15/10** (PR 65, prod `7605cfe`, accord
+  Marco par QCM) : la route répond 200 avec `rewardAmountXpf: 2500`, plus d'erreur au journal ; PC-0212 clos.
 
 - `2026-10-02` — **PR 59, prod 9be4973** — avoir partiel : `finalize` passe DONE même si la vente a
   changé (`saleChanged:true`, plus de PENDING coincé ; `fullyRefundedAt` seulement si vente PAID même
