@@ -137,9 +137,11 @@ function createInvoice(sale: SyncSaleSnapshot, compta: ComptaClient) {
   return compta.createInvoice({
     tenantId: sale.tenantId, sourceType: CAISSE_SOURCE_TYPE, sourceId: sale.id,
     ticketRef: sale.sourceId, clientName: sale.clientName,
+    // Vente à crédit (lot A) : omis quand non renseigné — PAS de fallback à une date bidon.
     ...(sale.dueAt ? { dueAt: sale.dueAt } : {}),
     lines: sale.lines.map(l => ({
       label: l.label, qty: l.qty, unitXpf: Number(l.unitXpf),
+      // Omis quand non renseigné — PAS 0 (0 signifierait « hors champ TGC » côté Compta).
       ...(l.tgcRatePpm !== undefined && l.tgcRatePpm !== null ? { tgcRatePpm: l.tgcRatePpm } : {}),
     })),
   });

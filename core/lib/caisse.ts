@@ -825,9 +825,8 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
       log.warn("caisse.saleSyncLocked", { saleId: sale.id, tenantId: sale.tenantId });
       return { synced: false, failure: null, stopped: "LOCKED", invoiceId: sale.invoiceId, invoiceNumber: sale.invoiceNumber, stockDecremented: 0 };
     }
-    log.error("caisse.saleSyncUnexpected", e, { saleId: sale.id, tenantId: sale.tenantId });
-    // L'encaissement est déjà commité : la reprise traitera aussi les pannes DB inattendues.
-    return { synced: false, failure: null, stopped: "LOCKED", invoiceId: sale.invoiceId, invoiceNumber: sale.invoiceNumber, stockDecremented: 0 };
+    // Toute autre erreur (DB, bogue) remonte, comme avant le garde : jamais déguisée en attente.
+    throw e;
   }
   if (outcome.neutralized || (outcome.stopped === "VOID" && outcome.failure) || outcome.stopped === "INVOICE_CONFLICT") {
     log.error("caisse.saleSyncNeutralization", new Error(outcome.failure ? formatFailure(outcome.failure) : outcome.stopped ?? "neutralized"), {
