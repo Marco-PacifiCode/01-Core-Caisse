@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, syncClaimFor, syncInProgress, checkoutStatusAfterSync, shouldWriteSyncError, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
+import { runSaleSync, retryNeutralization, NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, syncClaimFor, claimState, syncBlocksVoid, SYNC_A_REPRENDRE_MARKER, checkoutStatusAfterSync, shouldWriteSyncError, type SyncGuard, type SyncPersist, type SyncSaleSnapshot } from "./sync.ts";
 import { CoreClientError } from "./clients.ts";
 import type { ComptaClient, StockClient } from "./clients.ts";
 
@@ -13,7 +13,7 @@ function fixture() {
     payments: [{ id: "payment-test", method: "CASH", amountXpf: 1000n, settleRef: null }],
   };
   const db = { sale: structuredClone(photo) as SyncSaleSnapshot | null, syncAttempts: 0 };
-  const calls = { createInvoice: 0, settle: 0, recordSale: 0, creditNote: 0, recordFailure: 0, clearError: 0, releaseSync: 0 };
+  const calls = { createInvoice: 0, settle: 0, recordSale: 0, creditNote: 0, recordFailure: 0, clearError: 0, completeSync: 0 };
   const hooks: { create?: () => void; saved?: () => void; claim?: () => void; settle?: () => void; recordSale?: () => void; creditFailure?: CoreClientError } = {};
   const credits: string[] = [];
   const guard: SyncGuard = {
@@ -21,12 +21,22 @@ function fixture() {
     async claimSync(claim) {
       hooks.claim?.();
       const s = db.sale;
-      if (s?.status === "PAID" && !s.voidPreparedAt) s.syncError = claim;
-      return s ? structuredClone(s) : null;
+      const fresh = s ? structuredClone(s) : null;
+      if (!s || s.status !== "PAID" || s.voidPreparedAt) return { claimed: false, busy: false, fresh };
+      if (claimState(s.syncError, new Date()) === "live" && s.syncError !== claim) return { claimed: false, busy: true, fresh };
+      s.syncError = claim;
+      return { claimed: true, fresh: structuredClone(s) };
     },
-    async releaseSync() {
-      calls.releaseSync++;
-      if (db.sale?.syncError?.startsWith(SYNC_EN_COURS_MARKER)) db.sale.syncError = null;
+    async completeSync(claim, phase) {
+      calls.completeSync++;
+      if (!db.sale) return;
+      db.sale[phase === "compta" ? "comptaSyncedAt" : "stockSyncedAt"] = new Date();
+      if (db.sale.syncError === claim) db.sale.syncError = null;
+    },
+    async failSync(claim, phase, detail) {
+      db.syncAttempts++;
+      const s = db.sale;
+      if (s?.syncError === claim) s.syncError = s[phase === "compta" ? "comptaSyncedAt" : "stockSyncedAt"] ? null : `${SYNC_A_REPRENDRE_MARKER} ${detail}`;
     },
     async saveInvoiceRefIfLive(invoiceId, invoiceNumber) {
       const s = db.sale;
@@ -289,11 +299,11 @@ test("n) la revendication couvre tous les règlements et est libérée après l'
   f.db.sale!.payments.push({ ...f.db.sale!.payments[0], id: "payment-2" });
   f.hooks.settle = () => {
     assert.ok(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER));
-    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1]);
+    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1].split(" #")[0]);
     assert.ok(due >= started + 2 * timeout);
   };
   f.hooks.claim = () => {
-    if (f.calls.settle > 0) assert.equal(f.calls.releaseSync, 1, "la revendication des règlements doit être libérée avant la revendication stock");
+    if (f.calls.settle > 0) assert.equal(f.calls.completeSync, 1, "la revendication des règlements doit être libérée avant la revendication stock");
   };
   await f.run(timeout);
   assert.equal(f.calls.settle, 2);
@@ -308,7 +318,7 @@ test("o) la revendication couvre toutes les sorties stock et est libérée aprè
   f.db.sale!.lines.push({ ...f.db.sale!.lines[0], id: "line-2" });
   f.hooks.recordSale = () => {
     assert.ok(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER));
-    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1]);
+    const due = Date.parse(f.db.sale!.syncError!.split("jusqu'au ")[1].split(" #")[0]);
     assert.ok(due >= started + 2 * timeout);
   };
   await f.run(timeout);
@@ -316,13 +326,16 @@ test("o) la revendication couvre toutes les sorties stock et est libérée aprè
   assert.equal(Boolean(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER)), false);
 });
 
-test("p) syncInProgress reconnaît seulement une échéance future valide", () => {
+test("p) claimState distingue echeance vivante, perimee et illisible", () => {
   const now = new Date("2026-10-15T00:00:00.000Z");
-  assert.equal(syncInProgress(syncClaimFor(1, now, 1000), now), true);
-  assert.equal(syncInProgress(`${SYNC_EN_COURS_MARKER} jusqu'au 2026-10-14T23:59:59.000Z`, now), false);
-  assert.equal(syncInProgress(`${SYNC_EN_COURS_MARKER} illisible`, now), false);
-  assert.equal(syncInProgress(null, now), false);
-  assert.equal(syncInProgress(`${NEUTRALISATION_MARKER} attente`, now), false);
+  const claim = syncClaimFor(2, now, 1000, "test-id");
+  assert.equal(claim, "SYNC_EN_COURS jusqu'au 2026-10-15T00:00:07.000Z #test-id");
+  assert.equal(claimState(claim, now), "live");
+  assert.equal(claimState(claim, new Date("2026-10-15T00:00:07.000Z")), "stale");
+  assert.equal(claimState(SYNC_EN_COURS_MARKER + " illisible", now), "stale");
+  assert.equal(claimState(SYNC_A_REPRENDRE_MARKER, now), "stale");
+  assert.equal(claimState(null, now), "none");
+  assert.equal(claimState(NEUTRALISATION_MARKER, now), "none");
 });
 
 test("q) un échec core pendant settle remplace la revendication", async () => {
@@ -331,7 +344,9 @@ test("q) un échec core pendant settle remplace la revendication", async () => {
   const out = await f.run();
   assert.equal(out.synced, false);
   assert.equal(f.db.sale!.syncError?.startsWith(SYNC_EN_COURS_MARKER), false);
-  assert.equal(syncInProgress(f.db.sale!.syncError, new Date()), false);
+  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  assert.equal(claimState(f.db.sale!.syncError, new Date()), "stale");
+  assert.equal(f.db.syncAttempts, 1);
   assert.match(f.db.sale!.syncError!, /compta:settle/);
 });
 
@@ -354,11 +369,147 @@ test("r) runSaleSync arrête au retour de claimSync si la vente devient VOID ou 
   }
 });
 
-test("s) checkoutStatusAfterSync ne renvoie VOID que pour l'arrêt VOID", () => {
+test("s) checkoutStatusAfterSync traduit les arrets sans effet concurrent", () => {
   assert.equal(checkoutStatusAfterSync({ stopped: "VOID" } as any), "VOID");
   assert.equal(checkoutStatusAfterSync(null), "PAID");
   assert.equal(checkoutStatusAfterSync({ synced: true } as any), "PAID");
   assert.equal(checkoutStatusAfterSync({ stopped: "NOT_FOUND" } as any), "PAID");
   assert.equal(checkoutStatusAfterSync({ stopped: "VOID_IN_PROGRESS" } as any), "PAID");
   assert.equal(checkoutStatusAfterSync({ stopped: "LOCKED" } as any), "PAID");
+});
+
+
+test("u) A vivant exclut B ; echec puis reprise de B", async () => {
+  const f = fixture();
+  f.db.sale!.invoiceId = "invoice-test";
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  f.compta.settle = async () => {
+    f.calls.settle++;
+    entered();
+    await waiting;
+    throw new CoreClientError("compta", "settle", 0, "timeout test", "timeout");
+  };
+  const a = f.run();
+  await started;
+  const claimA = f.db.sale!.syncError;
+  const b = await f.guard.claimSync(syncClaimFor(1, new Date(), 8000, "B"));
+  assert.equal(b.claimed, false);
+  assert.ok(!b.claimed && b.busy);
+  assert.equal((await f.run()).stopped, "LOCKED");
+  assert.equal(f.calls.settle, 1);
+  assert.equal(f.calls.recordSale, 0);
+  assert.equal(f.db.sale!.syncError, claimA);
+  release();
+  assert.equal((await a).synced, false);
+  assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
+  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  f.compta.settle = async () => ({ ok: true, invoiceId: "invoice-test", paid: 1000, remaining: 0 });
+  assert.equal((await f.run()).synced, true);
+  assert.equal(f.db.sale!.syncError, null);
+  assert.equal(syncBlocksVoid(f.db.sale!), false);
+});
+
+test("v) stock partiel puis timeout : blocage jusqua reprise confirmee", async () => {
+  const f = fixture();
+  f.db.sale!.comptaSyncedAt = new Date();
+  f.db.sale!.lines.push({ ...f.db.sale!.lines[0], id: "line-2" });
+  f.hooks.recordSale = () => {
+    if (f.calls.recordSale === 2) throw new CoreClientError("stock", "recordSale", 0, "timeout test", "timeout");
+  };
+  const out = await f.run();
+  assert.equal(out.synced, false);
+  assert.equal(out.stockDecremented, 1);
+  assert.equal(f.db.sale!.stockSyncedAt, null);
+  assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
+  assert.equal(syncBlocksVoid(f.db.sale!), true);
+  f.hooks.recordSale = undefined;
+  assert.equal((await f.run()).synced, true);
+  assert.ok(f.db.sale!.stockSyncedAt);
+  assert.equal(f.db.sale!.syncError, null);
+  assert.equal(syncBlocksVoid(f.db.sale!), false);
+});
+
+test("w) A echu termine apres reprise par B : le marqueur de B survit", async () => {
+  for (const phase of ["compta", "stock"] as const) {
+    const f = fixture();
+    const a = syncClaimFor(1, new Date(0), 1000, "A");
+    f.db.sale!.syncError = a;
+    const b = syncClaimFor(1, new Date(), 8000, "B");
+    assert.equal((await f.guard.claimSync(b)).claimed, true);
+    await f.guard.completeSync(a, phase);
+    assert.equal(f.db.sale!.syncError, b);
+    await f.guard.failSync(a, phase, "ancien echec");
+    assert.equal(f.db.sale!.syncError, b);
+    await f.persist.clearError();
+    assert.equal(f.db.sale!.syncError, b);
+    await f.guard.completeSync(b, phase);
+    assert.equal(f.db.sale!.syncError, null);
+  }
+});
+
+test("x) plantage : une revendication echue bloque toujours l'annulation", () => {
+  const f = fixture();
+  for (const marker of [syncClaimFor(1, new Date(0), 1000, "mort"), SYNC_EN_COURS_MARKER + " illisible"]) {
+    f.db.sale!.syncError = marker;
+    assert.equal(claimState(marker, new Date()), "stale");
+    assert.equal(syncBlocksVoid(f.db.sale!), true);
+  }
+});
+
+test("y) marqueur residuel entierement synchronise : annulation non bloquee", () => {
+  const f = fixture();
+  for (const marker of [SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER]) {
+    Object.assign(f.db.sale!, { syncError: marker, comptaSyncedAt: new Date(), stockSyncedAt: new Date() });
+    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    f.db.sale!.stockSyncedAt = null;
+    assert.equal(syncBlocksVoid(f.db.sale!), true);
+    f.db.sale!.status = "VOID";
+    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    f.db.sale!.status = "PAID";
+    f.db.sale!.lines = [];
+    assert.equal(syncBlocksVoid(f.db.sale!), false);
+    f.db.sale!.lines = structuredClone(f.photo.lines);
+  }
+});
+
+test("z) checkout : course reglements ou stock implique VOID", () => {
+  assert.equal(checkoutStatusAfterSync({ settledOnVoidingSale: true } as any), "VOID");
+  assert.equal(checkoutStatusAfterSync({ stockOnVoidingSale: true } as any), "VOID");
+});
+
+test("aa) les deux marqueurs protegent contre echec et effacement ordinaires", async () => {
+  for (const marker of [SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER]) {
+    const f = fixture();
+    f.db.sale!.syncError = marker;
+    assert.equal(shouldWriteSyncError(marker, "panne ordinaire"), false);
+    assert.equal(shouldWriteSyncError(marker, null), false);
+    for (const detail of [NEUTRALISATION_MARKER, SYNC_EN_COURS_MARKER, SYNC_A_REPRENDRE_MARKER]) {
+      assert.equal(shouldWriteSyncError(marker, detail), true);
+    }
+    await f.persist.recordFailure("panne ordinaire");
+    await f.persist.clearError();
+    assert.equal(f.db.sale!.syncError, marker);
+    assert.equal(f.db.syncAttempts, 1);
+  }
+});
+
+test("erreur inattendue : marqueur a reprendre et erreur originale preservee", async () => {
+  for (const phase of ["compta", "stock"] as const) {
+    for (const failPersistence of [false, true]) {
+      const f = fixture();
+      const original = new Error("plantage test");
+      if (phase === "stock") f.db.sale!.comptaSyncedAt = new Date();
+      f.hooks[phase === "compta" ? "settle" : "recordSale"] = () => { throw original; };
+      if (failPersistence) f.guard.failSync = async () => { throw new Error("persistance en panne"); };
+      await assert.rejects(f.run(), e => e === original);
+      if (!failPersistence) {
+        assert.match(f.db.sale!.syncError!, /^SYNC_A_REPRENDRE/);
+        assert.equal(f.db.syncAttempts, 1);
+      }
+      assert.equal(syncBlocksVoid(f.db.sale!), true);
+    }
+  }
 });

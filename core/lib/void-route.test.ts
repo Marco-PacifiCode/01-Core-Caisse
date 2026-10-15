@@ -114,6 +114,9 @@ test("t) une préparation SYNC_IN_PROGRESS s'arrête avant tout avoir", async ()
   });
   assert.deepEqual(out, { ok: false, error: "SYNC_IN_PROGRESS" });
   assert.equal(compta.calls.creditNote, 0);
+  assert.match(readCaisse(), /if \(syncBlocksVoid\(sale\)\) return \{ error: "SYNC_IN_PROGRESS"/);
+  assert.match(readRoute(), /SYNC_IN_PROGRESS:\s*409/);
+  assert.ok(readRoute().includes("Synchronisation comptable ou de stock en cours ou \u00e0 reprendre : r\u00e9essayez plus tard."));
 });
 
 test("une vente PAID avec facture émet un avoir PUIS passe à VOID", async () => {

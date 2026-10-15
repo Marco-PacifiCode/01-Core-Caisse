@@ -63,7 +63,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       VOID_RETRY_INVOICE_CHANGED: 409,
       VOID_RETRY_STATUS_CHANGED: 409,
     };
-    return NextResponse.json(result, { status: map[result.error] ?? 400 });
+    return NextResponse.json(result.error === "SYNC_IN_PROGRESS"
+      ? { ...result, message: "Synchronisation comptable ou de stock en cours ou à reprendre : réessayez plus tard." }
+      : result, { status: map[result.error] ?? 400 });
   }
   return NextResponse.json(result);
 }
