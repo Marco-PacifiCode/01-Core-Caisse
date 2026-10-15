@@ -19,22 +19,36 @@ export function normalizeActionId(value: unknown): string {
   const v = text(value, 200);
   return normalizeActionInput(v);
 }
+// La casse reçue reste disponible pour les recherches historiques, sans entrer dans
+// le JSON durable ni dans les empreintes. Les normalisations successives la conservent.
+const receivedInputs = new WeakMap<object, object>();
+export function receivedActionInput<T extends object>(input: T): T {
+  return (receivedInputs.get(input) ?? input) as T;
+}
 /** Parcourt toutes les valeurs ; seules les chaînes UUID complètes sont canonisées. */
 export function normalizeActionInput<T>(input: T): T {
   if (typeof input === "string") return (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input) ? input.toLowerCase() : input) as T;
-  if (Array.isArray(input)) return input.map(value => normalizeActionInput(value)) as T;
-  if (input && Object.prototype.toString.call(input) === "[object Object]") {
-    return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, normalizeActionInput(value)])) as T;
+  if (input && (Array.isArray(input) || Object.prototype.toString.call(input) === "[object Object]")) {
+    const normalized = Array.isArray(input) ? input.map(value => normalizeActionInput(value))
+      : Object.fromEntries(Object.entries(input).map(([key, value]) => [key, normalizeActionInput(value)]));
+    receivedInputs.set(normalized, receivedActionInput(input));
+    return normalized as T;
   }
   return input;
 }
 /** Tables historiques : au plus trois égalités indexées, sans réécrire la clé stockée. */
 export async function findHistoricalKey<T>(received: string, read: (key: string) => Promise<T | null>): Promise<T | null> {
-  const normalized = normalizeActionId(received);
+  const normalized = normalizeActionInput(received);
   const keys = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(received)
     ? [...new Set([received, normalized, received.toUpperCase()])] : [received];
   for (const key of keys) { const row = await read(key); if (row) return row; }
   return null;
+}
+/** Chaque composante texte d'une origine conserve ses égalités indexées. */
+export async function findHistoricalSource<T>(source: { sourceType?: string | null; sourceId?: string | null },
+  read: (sourceType: string, sourceId: string) => Promise<T | null>): Promise<T | null> {
+  if (!source.sourceType || !source.sourceId) return null;
+  return findHistoricalKey(source.sourceType, sourceType => findHistoricalKey(source.sourceId!, sourceId => read(sourceType, sourceId)));
 }
 export function date(value: unknown): Date {
   const v = text(value, 40); requireCash(/T.*(?:Z|[+-]\d\d:\d\d)$/.test(v)); const d = new Date(v); requireCash(Number.isFinite(d.getTime())); return d;

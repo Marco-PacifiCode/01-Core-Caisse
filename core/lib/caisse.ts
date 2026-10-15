@@ -70,13 +70,14 @@ import {
   reverseSale as reverseSaleLoyalty,
   adjustLoyalty as adjustLoyaltyDb,
   accountSummary as loyaltyAccountSummary,
+  lockAccount as lockLoyaltyAccount,
   offProgram,
   type LoyaltyProgramRow,
 } from "./loyalty-db";
 import { Prisma, type LineKind, type PayMethod, type SaleStatus } from "@prisma/client";
 import { annulerInscription, inscrirePosteEnLigne } from "./postes";
 import { appendDayFact, consumePickupOrder, lockDay, lockSharedSale, prepareSharedCheckout, recordSharedGift, recordSharedSale } from "./cash-day-ledger";
-import { findHistoricalKey, ackFinancial, lockCashTenant, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync";
+import { findHistoricalKey, findHistoricalSource, receivedActionInput, ackFinancial, lockCashTenant, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync";
 import { assertLegacyWriteAllowed } from "./cash-day-guard";
 import { verifierCorrection } from "./payment-correction";
 
@@ -412,16 +413,21 @@ export type ImporterClotureResult =
  * l'index unique concurrent (P2002 → relecture, cf. `uniq_session_external_source`).
  */
 export async function importerCloture(tenantId: string, input: ImporterClotureInput): Promise<ImporterClotureResult> {
+  const received = receivedActionInput(input);
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
   const prepared = prepareClotureImport(input);
   if (!prepared.ok) return prepared;
+  const source = { sourceType: received.sourceType?.trim(), sourceId: received.sourceId?.trim() };
+  // La validation métier retire les espaces AVANT de normaliser une nouvelle clé.
+  prepared.sourceType = normalizeActionInput(prepared.sourceType);
+  prepared.sourceId = normalizeActionInput(prepared.sourceId);
+  const readSource = (tx: Prisma.TransactionClient) => findHistoricalSource(source, (sourceType, sourceId) => tx.cashSession.findFirst({
+    where: { tenantId, sourceType, sourceId }, select: { id: true, varianceXpf: true },
+  }));
 
   return withTenant(tenantId, async (tx) => {
     await assertLegacyWriteAllowed(tx, tenantId);
-    const existing = await tx.cashSession.findFirst({
-      where: { tenantId, sourceType: prepared.sourceType, sourceId: prepared.sourceId },
-      select: { id: true, varianceXpf: true },
-    });
+    const existing = await readSource(tx);
     if (existing) {
       return {
         ok: true as const,
@@ -462,10 +468,7 @@ export async function importerCloture(tenantId: string, input: ImporterClotureIn
       // (sourceType, sourceId) passent tous deux le findFirst ci-dessus, et c'est la base qui
       // tranche. On retombe sur la session gagnante — même schéma qu'openSession/P2002.
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-        const gagnante = await tx.cashSession.findFirst({
-          where: { tenantId, sourceType: prepared.sourceType, sourceId: prepared.sourceId },
-          select: { id: true, varianceXpf: true },
-        });
+        const gagnante = await readSource(tx);
         if (gagnante) {
           return {
             ok: true as const,
@@ -528,6 +531,7 @@ export async function createSale(
   | { ok: false; error: "EMPTY" | "PRODUCT_LINE_WITHOUT_PRODUCT" | "INVALID_QTY" | "FUTURE_DATE" }
   | { ok: true; saleId: string; totalXpf: number; alreadyExisted: boolean }
 > {
+  const received = receivedActionInput(input);
   tenantId = uuid(tenantId);
   input = normalizeActionInput(input);
   if (!input.lines || input.lines.length === 0) return { ok: false, error: "EMPTY" };
@@ -558,15 +562,15 @@ export async function createSale(
     tgcRatePpm: l.tgcRatePpm ?? null,
   }));
   const total = linesData.reduce((t, l) => t + l.lineXpf, 0n);
+  const readSource = (tx: Prisma.TransactionClient) => findHistoricalSource(received, (sourceType, sourceId) => tx.sale.findFirst({
+    where: { tenantId, sourceType, sourceId }, select: { id: true, totalXpf: true },
+  }));
 
   return withTenant(tenantId, async (tx) => {
     await assertLegacyWriteAllowed(tx, tenantId);
     // Idempotence source externe
     if (input.sourceType && input.sourceId) {
-      const existing = await tx.sale.findFirst({
-        where: { tenantId, sourceType: input.sourceType, sourceId: input.sourceId },
-        select: { id: true, totalXpf: true },
-      });
+      const existing = await readSource(tx);
       if (existing) {
         return { ok: true as const, saleId: existing.id, totalXpf: Number(existing.totalXpf), alreadyExisted: true };
       }
@@ -600,10 +604,7 @@ export async function createSale(
         input.sourceType &&
         input.sourceId
       ) {
-        const existing = await tx.sale.findFirst({
-          where: { tenantId, sourceType: input.sourceType, sourceId: input.sourceId },
-          select: { id: true, totalXpf: true },
-        });
+        const existing = await readSource(tx);
         if (existing) {
           return { ok: true as const, saleId: existing.id, totalXpf: Number(existing.totalXpf), alreadyExisted: true };
         }
@@ -1831,10 +1832,19 @@ export type CreditLoyaltyVisitInput = {
  * si le RDV est antérieur à `activatedAt`, ou si la visite a déjà été créditée (rejeu).
  */
 export async function creditLoyaltyVisit(tenantId: string, input: CreditLoyaltyVisitInput) {
+  const receivedAppointmentId = receivedActionInput(input).appointmentId;
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
   return withTenant(tenantId, async (tx) => {
     const program = await tx.loyaltyProgram.findFirst({ where: { tenantId } });
     if (!program) return { ok: true as const, credited: false };
+    if (program.mode !== "OFF" && (!program.activatedAt || (input.occurredAt ?? new Date()) >= program.activatedAt)) {
+      // Même verrou de compte que creditVisitDb : le test et l'insertion sont sérialisés.
+      await lockLoyaltyAccount(tx, tenantId, input.clientFicheId, input.displayName);
+      const previous = await findHistoricalKey(receivedAppointmentId, appointmentId => tx.loyaltyEntry.findUnique({
+        where: { tenantId_ref: { tenantId, ref: `visit:rdv:${appointmentId}` } },
+      }));
+      if (previous) return { ok: true as const, credited: false };
+    }
     const result = await creditVisitDb(tx, {
       tenantId,
       program,
@@ -2099,10 +2109,10 @@ export async function recordCashMovement(
       // lecture et notre écriture. C'est le cas que la vérification applicative ci-dessus ne
       // peut PAS couvrir, et c'est précisément pour lui que l'index existe.
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002" && ref) {
-        const raced = await tx.cashMovement.findFirst({
-          where: { tenantId, ref },
+        const raced = await findHistoricalKey(receivedRef!, key => tx.cashMovement.findFirst({
+          where: { tenantId, ref: key },
           select: { id: true, sessionId: true, amountXpf: true, kind: true, reason: true, createdAt: true },
-        });
+        }));
         if (raced) {
           await journalMovement(raced);
           return {

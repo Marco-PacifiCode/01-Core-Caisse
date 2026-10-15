@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
-import { date, lockCashTenant, normalizeActionId, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, findHistoricalSource, receivedActionInput, lockCashTenant, normalizeActionId, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
@@ -206,8 +206,11 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
   });
   const saleIds: string[] = [];
   for (const value of origins) {
-    const origin = object(value), sourceType = text(origin.sourceType), sourceId = text(origin.sourceId, 300);
-    const sale = await tx.sale.findFirst({ where: { tenantId: b.tenantId, sourceType, sourceId } });
+    const origin = object(value);
+    text(origin.sourceType); text(origin.sourceId, 300);
+    const received = receivedActionInput(origin);
+    const sale = await findHistoricalSource({ sourceType: text(received.sourceType), sourceId: text(received.sourceId, 300) },
+      (sourceType, sourceId) => tx.sale.findFirst({ where: { tenantId: b.tenantId, sourceType, sourceId } }));
     requireCash(sale, "NOT_FOUND", 404);
     if (businessDay(sale.paidAt ?? sale.createdAt) !== day.businessDay) {
       // L'origine peut désigner la vente d'un avoir du jour ; la vente reste dans son Z d'origine.

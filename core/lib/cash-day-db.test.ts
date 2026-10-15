@@ -17,6 +17,7 @@ import * as reports from "./z-report.ts";
 import * as corrections from "./payment-correction.ts";
 import * as voidPolicy from "./void-sale.ts";
 import * as importsPolicy from "./import-cloture.ts";
+import * as loyalty from "./loyalty.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "ab000000-0000-0000-0000-000000000001", tenantB = "cd000000-0000-0000-0000-000000000002";
@@ -42,7 +43,8 @@ function caisseFunction(name: string, globals: Row) {
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...corrections,
     assertLegacyWriteAllowed: globals.assertLegacyWriteAllowed, lockCashTenant: globals.lockCashTenant ?? tenantLock,
-    uuid: activeSync.uuid, findHistoricalKey: activeSync.findHistoricalKey, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
+    uuid: activeSync.uuid, findHistoricalKey: activeSync.findHistoricalKey, findHistoricalSource: activeSync.findHistoricalSource,
+    receivedActionInput: activeSync.receivedActionInput, normalizeActionId: activeSync.normalizeActionId, normalizeActionInput: activeSync.normalizeActionInput,
     randomUUID: require("node:crypto").randomUUID, createHash: require("node:crypto").createHash, canonical: projection.canonical, ...globals });
 }
 type Row = Record<string, any>;
@@ -56,7 +58,7 @@ function fixture(enforceDayBeforeSale = false) {
     if (enforceDayBeforeSale) assert.ok(heldDays.size, "Day doit être verrouillé avant Sale");
     trace.push(`Sale:${id}`);
   };
-  const names = ["voidAction", "partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement"];
+  const names = ["voidAction", "partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement", "loyaltyProgram", "loyaltyAccount", "loyaltyEntry"];
   names.forEach(n => state[n] = []);
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
@@ -1318,6 +1320,105 @@ test('journal : UUID normalises des la creation et snapshots rejoues sans doublo
 });
 
 function sameResponse(actual: unknown, saved: unknown) { assert.equal(projection.canonical(actual), projection.canonical(saved)); }
+
+// Sources historiques TEXT : mêmes ports que la production, comparaisons sensibles
+// à la casse (contrairement aux colonnes PostgreSQL UUID).
+for (const storedSource of [actor.toUpperCase(), 'eF000000-0000-0000-0000-000000000003']) {
+  test(`createSale : source historique ${storedSource}, aucun second ticket ni encaissement`, async () => {
+    const f = fixture();
+    const old = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: 'synthetic', sourceId: storedSource,
+      status: 'PAID', paidAt: now, comptaSyncedAt: now, stockSyncedAt: now,
+      totalXpf: 1000n, lines: [thousandLine()], payments: [{ method: 'CASH', amountXpf: 1000n }] } });
+    await f.tx.sale.create({ data: { tenantId: tenantB, sourceType: 'synthetic', sourceId: actor, totalXpf: 9000n } });
+    const create = caisseFunction('createSale', { withTenant: f.withTenant, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed });
+    const native = financialPorts(f, { syncLoadedSale: async () => { assert.fail('aucun nouvel encaissement à synchroniser'); } });
+    const sources = storedSource === actor.toUpperCase() ? [storedSource, actor] : [storedSource];
+    for (const sourceId of sources) {
+      const result = await create(tenant, { sourceType: 'synthetic', sourceId, lines: [{ ...thousandLine(), unitXpf: 1000n }] });
+      assert.equal(result.alreadyExisted, true); assert.equal(result.saleId, old.id);
+      const paid = await native.checkoutSale(tenant, result.saleId, [{ method: 'CASH', amountXpf: 1000n }]);
+      assert.equal(paid.ok, true); assert.equal(paid.alreadyPaid, true);
+    }
+    assert.equal(f.rows('sale').length, 2); assert.equal(f.rows('sale')[0].sourceId, storedSource);
+    assert.equal(f.rows('sale')[0].payments.length, 1); assert.equal(f.rows('cashDay').length, 0);
+  });
+}
+
+test('createSale : ABC et abc distincts, nouvelle source UUID normalisée', async () => {
+  const f = fixture();
+  const create = caisseFunction('createSale', { withTenant: f.withTenant, assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed });
+  for (const sourceId of ['ABC', 'abc', actor.toUpperCase(), actor]) {
+    const result = await create(tenant, { sourceType: 'synthetic', sourceId, lines: [{ ...thousandLine(), unitXpf: 1000n }] });
+    assert.equal(result.alreadyExisted, sourceId === actor);
+  }
+  assert.deepEqual(f.rows('sale').map(s => s.sourceId), ['ABC', 'abc', actor]);
+});
+
+test('importerCloture : source historique majuscule, rejeux et nouveau Z normalisé', async () => {
+  const f = fixture();
+  const old = await f.tx.cashSession.create({ data: { tenantId: tenant, sourceType: 'synthetic', sourceId: actor.toUpperCase(),
+    status: 'CLOSED', varianceXpf: 42n } });
+  await f.tx.cashSession.create({ data: { tenantId: tenantB, sourceType: 'synthetic', sourceId: actor, varianceXpf: 99n } });
+  const importer = caisseFunction('importerCloture', { ...importsPolicy, withTenant: f.withTenant,
+    assertLegacyWriteAllowed: f.guard.assertLegacyWriteAllowed });
+  const b = { sourceType: 'synthetic', openedBy: actor, openedAt: now.toISOString(), closedAt: now.toISOString(),
+    openingFloatXpf: 25000, closingCountedXpf: 25000, expectedXpf: 25000 };
+  for (const sourceId of [actor.toUpperCase(), actor]) {
+    const result = await importer(tenant, { ...b, sourceId });
+    assert.equal(result.alreadyExisted, true); assert.equal(result.sessionId, old.id); assert.equal(result.varianceXpf, 42);
+  }
+  assert.equal(f.rows('cashSession').length, 2); assert.equal(f.rows('cashSession')[0].sourceId, actor.toUpperCase());
+  for (const sourceId of ['ABC', 'abc', ` ${tenant.toUpperCase()} `]) {
+    assert.equal((await importer(tenant, { ...b, sourceId })).alreadyExisted, false);
+  }
+  assert.deepEqual(f.rows('cashSession').slice(2).map(s => s.sourceId), ['ABC', 'abc', tenant]);
+});
+
+for (const path of ['attachLegacy', 'createDaySale']) {
+  for (const storedSource of [actor.toUpperCase(), 'eF000000-0000-0000-0000-000000000003']) {
+    test(`${path} : origine historique ${storedSource} conservée après envelope et normalisations successives`, async () => {
+      const f = fixture(true);
+      const old = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: 'synthetic', sourceId: storedSource,
+        status: 'PAID', paidAt: now, totalXpf: 1000n, lines: [{ ...thousandLine(), productId: null }], payments: [{ method: 'CASH', amountXpf: 1000n }] } });
+      await f.tx.sale.create({ data: { tenantId: tenantB, sourceType: 'synthetic', sourceId: actor, totalXpf: 9000n } });
+      await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+      const day = f.rows('cashDay')[0];
+      const sources = storedSource === actor.toUpperCase() ? [storedSource, actor] : [storedSource, storedSource];
+      for (const [i, sourceId] of sources.entries()) {
+        const raw = input({ actionId: `historical-${path}-${i}`, cycle: 0, sourceType: 'synthetic', sourceId,
+          origins: [{ sourceType: 'synthetic', sourceId }], lines: [{ ...thousandLine(), unitXpf: '1000', lineXpf: '1000' }] });
+        const b = f.sync.normalizeActionInput(f.sync.envelope(raw, raw.actionId));
+        const result = await f.sync.cashAction(path, b, (tx: Row) => path === 'attachLegacy'
+          ? f.days.attachLegacy(tx, day.id, b) : f.sales.createDaySale(tx, day.id, b));
+        assert.equal(result.status, 200, JSON.stringify(result));
+        if (path === 'createDaySale') assert.equal(result.body.data.alreadyExisted, true);
+      }
+      assert.equal(f.rows('sale').length, 2); assert.equal(f.rows('sale')[0].id, old.id);
+      assert.equal(f.rows('sale')[0].sourceId, storedSource); assert.equal(f.rows('sale')[0].cashDayId, day.id);
+      assert.equal(f.rows('sale')[0].payments.length, 1);
+      assert.equal(f.rows('cashDayEvent').filter(e => e.kind === 'SALE_PAID').length, 1);
+      assert.equal(await expected(f, day.id), 26000n);
+    });
+  }
+}
+
+test('fidélité : visite historique majuscule, références non UUID distinctes et nouvelles écritures normalisées', async () => {
+  const f = fixture();
+  await f.tx.loyaltyProgram.create({ data: { tenantId: tenant, mode: 'VISITS', visitsPerReward: null, activatedAt: now } });
+  await f.tx.loyaltyEntry.create({ data: { tenantId: tenant, kind: 'VISIT', ref: `visit:rdv:${actor.toUpperCase()}`, sourceId: actor.toUpperCase() } });
+  await f.tx.loyaltyEntry.create({ data: { tenantId: tenantB, kind: 'VISIT', ref: `visit:rdv:${tenant}` } });
+  f.tx.loyaltyAccount.upsert = async ({ create }: Row) => f.tx.loyaltyAccount.findFirst({ where: { tenantId: create.tenantId, clientFicheId: create.clientFicheId } })
+    .then((old: Row) => old ?? f.tx.loyaltyAccount.create({ data: create }));
+  const db = load('loyalty-db.ts', { './loyalty.ts': loyalty, './log.ts': { log: { warn() {} } } });
+  const visit = caisseFunction('creditLoyaltyVisit', { withTenant: f.withTenant, lockLoyaltyAccount: db.lockAccount, creditVisitDb: db.creditVisit });
+  const b = { clientFicheId: tenant, displayName: 'Synthétique', occurredAt: now };
+  for (const appointmentId of [actor.toUpperCase(), actor]) assert.equal((await visit(tenant, { ...b, appointmentId })).credited, false);
+  assert.equal(f.rows('loyaltyEntry').length, 2);
+  for (const appointmentId of ['ABC', 'abc', tenant.toUpperCase()]) assert.equal((await visit(tenant, { ...b, appointmentId })).credited, true);
+  assert.equal((await visit(tenant, { ...b, appointmentId: tenant })).credited, false);
+  assert.deepEqual(f.rows('loyaltyEntry').slice(2).map(e => e.ref), ['visit:rdv:ABC', 'visit:rdv:abc', `visit:rdv:${tenant}`]);
+  assert.equal(f.rows('loyaltyEntry')[0].sourceId, actor.toUpperCase());
+});
 
 test('normalisation recursive : UUID sous toute cle et dans les tableaux, autres valeurs exactes', () => {
   const f = fixture();

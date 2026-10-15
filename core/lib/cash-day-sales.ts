@@ -2,10 +2,12 @@ import type { LineKind, Prisma } from "@prisma/client";
 import { appendDayFact, lockDay, recordSharedSale } from "./cash-day-ledger";
 import { businessDay, canonical, requireCash, safeXpf, xpfInteger } from "./cash-day-projection";
 import { frozenLines } from "./cash-shared-policy";
-import { date, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, findHistoricalSource, normalizeActionInput, receivedActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { lockSaleRow } from "./sale-lock";
 
 export async function createDaySale(tx: CashTx, cashDayId: string, b: ActionInput) {
+  const received = receivedActionInput(b);
+  b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), occurredAt = date(b.occurredAt);
   requireCash(businessDay(occurredAt) === day.businessDay, "DAY_MISMATCH", 409);
   requireCash(day.currentSession.status === "OPEN" || b.offlineCompleted === true || b.importMode === true, "DAY_CLOSED", 409);
@@ -22,7 +24,8 @@ export async function createDaySale(tx: CashTx, cashDayId: string, b: ActionInpu
     return { tenantId: b.tenantId, kind: l.kind as LineKind, label: text(l.label, 1000), qty: Number(l.qty), unitXpf, lineXpf,
       productId: l.kind === "PRODUCT" ? uuid(l.productId) : null, tgcRatePpm: l.tgcRatePpm == null ? null : Number(l.tgcRatePpm) };
   });
-  const found = await tx.sale.findFirst({ where: { tenantId: b.tenantId, sourceType, sourceId }, include: { lines: true } });
+  const found = await findHistoricalSource({ sourceType: text(received.sourceType), sourceId: text(received.sourceId, 300) },
+    (sourceType, sourceId) => tx.sale.findFirst({ where: { tenantId: b.tenantId, sourceType, sourceId }, include: { lines: true } }));
   if (found) {
     requireCash(await lockSaleRow(tx, found.id, b.tenantId), "NOT_FOUND", 404);
     const old = await tx.sale.findFirstOrThrow({ where: { tenantId: b.tenantId, id: found.id }, include: { lines: true } });
