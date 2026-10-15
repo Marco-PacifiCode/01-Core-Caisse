@@ -135,6 +135,83 @@ function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open
   actorId: actor, actorName: "Opérateur synthétique", receivedById: actor, businessDay: "2026-10-15", localSessionKey: "local-A", sourceKey: "opening-A", openingFloatXpf: "25000", ...overrides }; }
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
 
+test("mouvement historique CashDay canonique ou alias : retrait 500, Z 24500 et rejeu sans doublon", async () => {
+  for (const alias of [false, true]) {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const id = f.rows("cashDay")[0].id;
+    const close = (sourceKey: string, cycle: number, countedXpf: string) => input({ sourceKey, cycle, closureMode: "ONLINE",
+      countedXpf, localExpectedXpf: countedXpf, localVarianceXpf: "0" });
+    if (alias) {
+      await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, id, close("before-reopen", 0, "25000")));
+      await f.withTenant(tenant, (tx: Row) => f.days.reopenCashDay(tx, id, input({ actionId: "reopen", administration: true })));
+    }
+    const record = caisseFunction("recordCashMovement", { withTenant: f.withTenant, ...f.ledger });
+    const b = { kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique", ref: "legacy-out" };
+    const first = await record(tenant, b);
+    const replay = await record(tenant, b);
+    assert.equal(first.ok, true); assert.equal(replay.alreadyExisted, true);
+    assert.equal(first.movement.id, replay.movement.id);
+    assert.equal(first.movement.sessionId, f.rows("cashDay")[0].currentSessionId);
+    assert.equal(f.rows("cashMovement").length, 1);
+    assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "MOVEMENT").length, 1);
+    const result = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, id, close("after-out", alias ? 1 : 0, "24500")));
+    assert.equal(result.report.expectedXpf, 24500); assert.equal(result.report.varianceXpf, 0);
+    assert.equal(result.report.cashOutXpf, 500);
+    const session = f.rows("cashSession").find(s => s.id === result.report.sessionId)!;
+    assert.equal(session.expectedXpf, 24500n); assert.equal(session.varianceXpf, 0n);
+  }
+  // Même mouvement déjà journalisé par le chemin CashDay : même clé, aucun second fait.
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  await f.withTenant(tenant, (tx: Row) => f.sales.dayMovement(tx, id, input({ actionId: "shared-out", kind: "CASH_OUT", amountXpf: "500", reason: "Retrait synthétique" })));
+  const record = caisseFunction("recordCashMovement", { withTenant: f.withTenant, ...f.ledger });
+  await record(tenant, { kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique", ref: "shared:shared-out" });
+  assert.equal(f.rows("cashMovement").length, 1);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "MOVEMENT").length, 1);
+  assert.ok(f.queries.every(q => !q.includes('"Poste"')));
+  // Une session native isolée garde son mouvement sans fait CashDay.
+  const standalone = fixture();
+  await standalone.withTenant(tenant, (tx: Row) => standalone.native.openSessionTx(tx, tenant, { openingFloatXpf: 25000n }));
+  const legacy = caisseFunction("recordCashMovement", { withTenant: standalone.withTenant, ...standalone.ledger });
+  await legacy(tenant, { kind: "CASH_OUT", amountXpf: 500n, reason: "Retrait synthétique", ref: "standalone" });
+  const session = standalone.rows("cashSession")[0];
+  const closed = await standalone.withTenant(tenant, (tx: Row) => standalone.native.closeSessionTx(tx, tenant, { sessionId: session.id, closingCountedXpf: 24500n }));
+  assert.equal(closed.report.expectedXpf, 24500); assert.equal(closed.report.varianceXpf, 0);
+  assert.equal(standalone.rows("cashDayEvent").length, 0);
+});
+
+test("seconde clôture après réouverture : rapport journalier CASH 1000 + CARD 2000 figé", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  const paid = async (amount: bigint, method: string, sessionId: string) => {
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId,
+      status: "PAID", paidAt: now, totalXpf: amount, lines: [{ lineXpf: amount }], payments: [{ method, amountXpf: amount }] } });
+    await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+  };
+  const close = (sourceKey: string, cycle: number) => input({ sourceKey, cycle, closureMode: "ONLINE",
+    countedXpf: "26000", localExpectedXpf: "26000", localVarianceXpf: "0" });
+  await paid(1000n, "CASH", day.canonicalSessionId);
+  const first = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, close("first", 0)));
+  assert.equal(first.report.totalSalesXpf, 1000); assert.equal(first.report.expectedXpf, 26000);
+  const frozen = f.rows("cashSession")[0];
+  await f.withTenant(tenant, (tx: Row) => f.days.reopenCashDay(tx, day.id, input({ actionId: "reopen", administration: true })));
+  // Le chemin CashDay vend sur la canonique même après réouverture.
+  await paid(2000n, "CARD", day.canonicalSessionId);
+  const second = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, close("second", 1)));
+  assert.equal(second.report.totalSalesXpf, 3000); assert.equal(second.report.salesCount, 2);
+  assert.equal(second.report.cashSalesXpf, 1000); assert.equal(second.report.byMethod.CASH, 1000);
+  assert.equal(second.report.byMethod.CARD, 2000); assert.equal(second.report.openingFloatXpf, 25000);
+  assert.equal(second.report.expectedXpf, 26000); assert.equal(second.report.varianceXpf, 0);
+  const stored = f.rows("cashDayEvent").find(e => e.kind === "CLOSURE" && e.sourceRef === "second")!;
+  assert.equal(projection.canonical(stored.snapshot.report), projection.canonical(second.report));
+  const replay = await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, close("second", 1)));
+  assert.equal(projection.canonical(replay.report), projection.canonical(second.report));
+  assert.deepEqual(f.rows("cashSession")[0], frozen);
+  const current = f.rows("cashSession")[1];
+  assert.equal(current.expectedXpf, 26000n); assert.equal(current.varianceXpf, 0n);
+  assert.ok(f.queries.every(q => !q.includes('"Poste"')));
+});
+
 test("avoir J+1 sur vente J : Z 26000 puis 24800, origine acceptée et rejeu sans doublon", async () => {
   for (const explicitDate of [true, false]) {
     const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));

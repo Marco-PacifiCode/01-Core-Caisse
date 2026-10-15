@@ -1812,13 +1812,31 @@ export async function recordCashMovement(
     });
     if (!session) return { ok: false as const, error: "NO_OPEN_SESSION" as const };
 
+    // Même verrou que la clôture : le mouvement et son fait appartiennent au même Z.
+    const movementDay = async (sessionId: string) => {
+      const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId } } });
+      const day = alias ? { id: alias.cashDayId } : await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: sessionId } });
+      return day ? lockDay(tx, tenantId, day.id) : null;
+    };
+    const day = await movementDay(session.id);
+    if (day) {
+      const current = await tx.cashSession.findFirst({ where: { tenantId, id: session.id } });
+      if (current?.status !== "OPEN") return { ok: false as const, error: "SESSION_CLOSED" as const };
+    }
+    const journalMovement = async (movement: { id: string; sessionId: string; kind: string; amountXpf: bigint; reason: string; createdAt: Date }) => {
+      const owner = movement.sessionId === session.id ? day : await movementDay(movement.sessionId);
+      if (owner) await appendDayFact(tx, tenantId, owner.id, { kind: "MOVEMENT", sourceRef: movement.id, deviceId: "legacy",
+        occurredAt: movement.createdAt, snapshot: { kind: movement.kind, amountXpf: movement.amountXpf, reason: movement.reason } });
+    };
+
     const ref = input.ref ?? null;
     if (ref) {
       const existing = await tx.cashMovement.findFirst({
         where: { tenantId, ref },
-        select: { id: true, sessionId: true, amountXpf: true, kind: true },
+        select: { id: true, sessionId: true, amountXpf: true, kind: true, reason: true, createdAt: true },
       });
       if (existing) {
+        await journalMovement(existing);
         return {
           ok: true as const,
           alreadyExisted: true,
@@ -1839,8 +1857,9 @@ export async function recordCashMovement(
           createdBy: input.createdBy ?? null,
           createdByName: input.createdByName ?? null,
         },
-        select: { id: true, sessionId: true, amountXpf: true, kind: true },
+        select: { id: true, sessionId: true, amountXpf: true, kind: true, reason: true, createdAt: true },
       });
+      await journalMovement(created);
       return {
         ok: true as const,
         alreadyExisted: false,
@@ -1853,9 +1872,10 @@ export async function recordCashMovement(
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002" && ref) {
         const raced = await tx.cashMovement.findFirst({
           where: { tenantId, ref },
-          select: { id: true, sessionId: true, amountXpf: true, kind: true },
+          select: { id: true, sessionId: true, amountXpf: true, kind: true, reason: true, createdAt: true },
         });
         if (raced) {
+          await journalMovement(raced);
           return {
             ok: true as const,
             alreadyExisted: true,

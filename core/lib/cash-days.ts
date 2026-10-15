@@ -1,5 +1,5 @@
 import type { Prisma } from "@prisma/client";
-import { closeSessionTx, openSessionTx } from "./caisse";
+import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
 import { date, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
@@ -76,7 +76,10 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
       && previous.closureMode === closureMode && previous.deviceId === b.deviceId && previous.deviceName === b.deviceName
       && previous.actorId === author.actorId && previous.actorName === author.actorName && previous.occurredAt.getTime() === occurredAt.getTime()
       && canonical(previous.legacySnapshot) === canonical(b.legacySnapshot ?? null), "SOURCE_CONFLICT", 409);
-    return { id: previous.id, alreadyClosed: true, recount: !previous.authoritative, cutoffRevision: previous.cutoffRevision };
+    const event = await tx.cashDayEvent.findUnique({ where: { tenantId_cashDayId_kind_sourceRef: {
+      tenantId: b.tenantId, cashDayId, kind: "CLOSURE", sourceRef: sourceKey } } });
+    return { id: previous.id, alreadyClosed: true, recount: !previous.authoritative, cutoffRevision: previous.cutoffRevision,
+      report: event ? object(event.snapshot).report ?? null : null };
   }
   const first = await tx.cashDayClosure.findFirst({ where: { tenantId: b.tenantId, cashDayId, cycle, authoritative: true } });
   let legacySessionId: string | undefined;
@@ -86,18 +89,24 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     requireCash(alias?.cashDayId === day.id, "DAY_MISMATCH", 409);
   }
   const authoritative = !first && cycle === day.cycle;
-  const marker = await appendDayFact(tx, b.tenantId, day.id, { kind: "CLOSURE", sourceRef: sourceKey, deviceId: b.deviceId, occurredAt,
-    snapshot: { cycle, countedXpf, ...author } });
-  const facts = await readFacts(tx, b.tenantId, day.id, marker.sequence);
-  const expected = projectCashDay({ fond: day.canonicalSession.openingFloatXpf, cycle, revision: marker.sequence, facts, closures: [] }).totauxCourants.expectedXpf;
-  let report: unknown = null;
+  const facts = await readFacts(tx, b.tenantId, day.id, day.revision);
+  const totals = projectCashDay({ fond: day.canonicalSession.openingFloatXpf, cycle, revision: day.revision, facts, closures: [] }).totauxCourants;
+  const expected = totals.expectedXpf;
+  let report: ZReport | null = null;
   if (authoritative) {
     // Le rapport natif utilise son contrat numérique historique : refus de conversion non sûre.
     safeXpf(countedXpf); safeXpf(expected);
     const native = await closeSessionTx(tx, b.tenantId, { sessionId: day.currentSessionId, closedBy: author.actorId ?? author.receivedById,
       closedByName: author.actorName, closingCountedXpf: countedXpf });
     requireCash(native.ok, "NOT_FOUND", 404);
-    report = native.report;
+    // Tous les montants couvrent le jour entier, y compris après une réouverture.
+    report = { sessionId: day.currentSessionId, openingFloatXpf: safeXpf(day.canonicalSession.openingFloatXpf),
+      cashSalesXpf: safeXpf(totals.cashXpf), totalSalesXpf: safeXpf(totals.totalSalesXpf), salesCount: totals.salesCount,
+      byMethod: Object.fromEntries(Object.entries(totals.byMethod).map(([method, amount]) => [method, safeXpf(amount)])),
+      refundsXpf: safeXpf(totals.refundsXpf), cashInXpf: safeXpf(totals.cashInXpf), cashOutXpf: safeXpf(totals.cashOutXpf),
+      giftCardRedeemedCount: totals.giftCardRedeemedCount, giftCardRedeemedXpf: safeXpf(totals.giftCardRedeemedXpf),
+      // SALE_PAID impose un paiement intégral dans le journal CashDay.
+      creditXpf: 0, expectedXpf: safeXpf(expected), countedXpf: safeXpf(countedXpf), varianceXpf: safeXpf(countedXpf - expected) };
     // Heure d'origine seulement à la première clôture ; aucune pièce fermée n'est réécrite.
     if (!native.alreadyClosed) {
       const variance = countedXpf - expected;
@@ -105,9 +114,11 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
       await tx.cashSession.update({ where: { id: day.currentSessionId }, data: {
         closedAt: occurredAt, expectedXpf: expected, varianceXpf: variance,
       } });
-      report = { ...native.report, expectedXpf: safeXpf(expected), varianceXpf: safeXpf(variance) };
     }
   }
+  // Le rapport est figé dans le fait de clôture, à la même révision que son Z.
+  const marker = await appendDayFact(tx, b.tenantId, day.id, { kind: "CLOSURE", sourceRef: sourceKey, deviceId: b.deviceId, occurredAt,
+    snapshot: { cycle, countedXpf, ...author, report } });
   const closure = await tx.cashDayClosure.create({ data: { tenantId: b.tenantId, cashDayId, sourceKey, cycle, deviceId: b.deviceId,
     deviceName: text(b.deviceName), ...author, occurredAt, countedXpf, localExpectedXpf, localVarianceXpf,
     baselineExpectedXpf: closureMode === "ONLINE" ? expected : localExpectedXpf, closureMode, cutoffRevision: marker.sequence,

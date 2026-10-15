@@ -109,6 +109,7 @@ function totals(facts: DayFact[], fond: bigint) {
   const byMethod: Record<string, bigint> = {};
   const parTaux: Record<string, { ttcXpf: bigint; htXpf: bigint; tgcXpf: bigint }> = {};
   let cash = 0n, refunds = 0n, movements = 0n, totalSales = 0n, gift = 0n, giftCount = 0;
+  let salesCount = 0, cashInXpf = 0n, cashOutXpf = 0n, movementRefundsXpf = 0n;
   for (const f of facts) {
     requireCash(factDelta(f.kind, f.snapshot) === f.cashDeltaXpf, "CORRUPT_CASH_FACT", 409);
     const s = object(f.snapshot);
@@ -117,6 +118,7 @@ function totals(facts: DayFact[], fond: bigint) {
       for (const [k, n] of Object.entries(parts)) byMethod[k] = (byMethod[k] ?? 0n) + n;
       cash += parts.CASH ?? 0n;
       totalSales += xpfInteger(s.totalXpf);
+      salesCount++;
       for (const t of taxes(s.lines as FrozenLine[])) {
         const row = parTaux[t.tgcRatePpm] ??= { ttcXpf: 0n, htXpf: 0n, tgcXpf: 0n };
         row.ttcXpf += BigInt(t.ttcXpf); row.htXpf += BigInt(t.htXpf); row.tgcXpf += BigInt(t.tgcXpf);
@@ -128,10 +130,16 @@ function totals(facts: DayFact[], fond: bigint) {
       for (const [k, n] of Object.entries(parts)) byMethod[k] = (byMethod[k] ?? 0n) + n;
       cash += parts.CASH ?? 0n;
     }
-    if (f.kind === "MOVEMENT") movements += f.cashDeltaXpf;
+    if (f.kind === "MOVEMENT") {
+      movements += f.cashDeltaXpf;
+      if (s.kind === "CASH_IN") cashInXpf += f.cashDeltaXpf;
+      else if (s.kind === "CASH_OUT") cashOutXpf -= f.cashDeltaXpf;
+      else movementRefundsXpf -= f.cashDeltaXpf;
+    }
     if (f.kind === "GIFT_CARD_REDEEMED") { gift += xpfInteger(s.amountXpf); giftCount++; }
   }
   return { cashXpf: cash, refundCashXpf: refunds, movementNetXpf: movements, expectedXpf: fond + cash - refunds + movements,
+    salesCount, cashInXpf, cashOutXpf, refundsXpf: refunds + movementRefundsXpf,
     totalSalesXpf: totalSales, byMethod, parTaux, cancelledCount: voided.size, giftCardRedeemedCount: giftCount, giftCardRedeemedXpf: gift };
 }
 export function projectCashDay(input: {
