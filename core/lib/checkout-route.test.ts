@@ -68,7 +68,7 @@ test("forme valide : `loyalty` et `redeemLoyalty` sont bien transmis dans `optio
   assert.match(body, /giftCards \|\| paidAt \|\| redeemGiftCards \|\| credit \|\| loyalty \|\| redeemLoyalty/);
   assert.match(body, /\.\.\.\(loyalty \? \{ loyalty \} : \{\}\)/);
   assert.match(body, /\.\.\.\(redeemLoyalty \? \{ redeemLoyalty \} : \{\}\)/);
-  assert.match(body, /const result = await checkoutSale\(tenantId, saleId, parsed, options\);/);
+  assert.match(body, /result = await checkoutSale\(tenantId, saleId, parsed, options\);/);
 });
 
 test("les erreurs de fidélité renvoyées par checkoutSale sont mappées sur 409 (conflit d'état, pas requête malformée)", () => {

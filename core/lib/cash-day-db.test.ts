@@ -8,6 +8,9 @@ import vm from "node:vm";
 import ts from "typescript";
 import * as projection from "./cash-day-projection.ts";
 import * as policy from "./cash-shared-policy.ts";
+import * as money from "./money.ts";
+import * as credit from "./credit.ts";
+import * as refundPolicy from "./partial-refund.ts";
 
 const require = createRequire(import.meta.url);
 const tenant = "10000000-0000-0000-0000-000000000001", tenantB = "10000000-0000-0000-0000-000000000002";
@@ -21,12 +24,21 @@ function load(file: string, imports: Record<string, unknown>) {
   run((name: string) => name in imports ? imports[name] : require(name), module, module.exports);
   return module.exports;
 }
+function caisseFunction(name: string, globals: Row) {
+  const source = readFileSync(new URL("caisse.ts", import.meta.url), "utf8");
+  const start = source.indexOf(`export async function ${name}(`);
+  assert.ok(start >= 0);
+  const end = source.indexOf("\nexport ", start + 10);
+  const js = ts.transpileModule(source.slice(start, end < 0 ? undefined : end).replace("export ", ""),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  return vm.runInNewContext(`${js}\n${name}`, { Date: fixedDate, ...projection, ...money, ...credit, ...globals });
+}
 type Row = Record<string, any>;
 function fixture() {
   let state: Record<string, Row[]> = {}, saved: Record<string, Row[]> | null = null, serial = 0;
   let tail = Promise.resolve();
   const queries: string[] = [];
-  const names = ["cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement"];
+  const names = ["partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement"];
   names.forEach(n => state[n] = []);
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
@@ -38,6 +50,11 @@ function fixture() {
     });
   }
   const tx: Row = {};
+  tx.salePayment = {
+    async count({ where }: Row) { return state.sale.find(s => s.id === where.saleId)!.payments.length; },
+    async findMany({ where }: Row) { return structuredClone(state.sale.find(s => s.id === where.saleId)!.payments); },
+    async create({ data }: Row) { state.sale.find(s => s.id === data.saleId)!.payments.push(structuredClone(data)); return data; },
+  };
   function view(name: string, row: Row, include?: Row) {
     const out = structuredClone(row);
     if (name === "cashDay" && include) {
@@ -116,6 +133,82 @@ function fixture() {
 function input(overrides: Row = {}) { return { tenantId: tenant, actionId: "open-a", entityKey: "day", deviceId: "A", deviceName: "Synthétique A", occurredAt: now.toISOString(),
   actorId: actor, actorName: "Opérateur synthétique", receivedById: actor, businessDay: "2026-10-15", localSessionKey: "local-A", sourceKey: "opening-A", openingFloatXpf: "25000", ...overrides }; }
 const basketLines = [{ qty: 1, unitXpf: "3000", lineXpf: "3000", label: "Synthétique", kind: "OTHER", tgcRatePpm: 60000 }];
+
+test("import : avoir espèces existant, théorique 25 800, complément et rejeu sans doublon", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "legacy-refund",
+    status: "PAID", paidAt: now, totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  const b = input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "legacy-refund" }] });
+  await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+    input: { refundMethod: "CASH" }, plan: { amountXpf: 200, parTaux: [] } } });
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, b));
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, b));
+  const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+  assert.equal(page.projection.totauxCourants.expectedXpf, 25800n);
+  assert.equal(page.projection.totauxCourants.refundCashXpf, 200n);
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE").length, 1);
+});
+
+test("checkouts CASH/CARD concurrents : un succès, un 409 avec le paiement retenu", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: id, totalXpf: 1000n, lines: [{ lineXpf: 1000n }] } });
+  let locked = 0;
+  const checkout = caisseFunction("checkoutSale", {
+    getSale: () => f.tx.sale.findFirst({ where: { id: sale.id } }), withTenant: f.withTenant,
+    comptaClient: () => ({}),
+    lockSharedSale: f.ledger.lockSharedSale, lockSaleRow: async () => { locked++; return true; },
+    prepareSharedCheckout: f.ledger.prepareSharedCheckout, recordSharedSale: f.ledger.recordSharedSale,
+    consumePickupOrder: f.ledger.consumePickupOrder, ackFinancial: f.sync.ackFinancial,
+    CAISSE_SOURCE_TYPE: "caisse", syncLoadedSale: async () => ({ synced: true, invoiceId: null, stockDecremented: 0 }),
+  });
+  const finance = load("cash-day-finance.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse": { checkoutSale: checkout },
+    "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger, "./cash-day-projection": projection, "./partial-refund": refundPolicy });
+  const body = (actionId: string, method: string) => input({ actionId, payments: [{ method, amountXpf: "1000" }] });
+  const a = body(actor, "CASH"), b = body(tenantB, "CARD");
+  const results = await Promise.allSettled([finance.dayFinancial(id, sale.id, "checkout", a), finance.dayFinancial(id, sale.id, "checkout", b),
+    finance.dayFinancial(id, sale.id, "checkout", a)]);
+  assert.equal(results.filter(r => r.status === "fulfilled").length, 2,
+    results.map(r => r.status === "rejected" ? String(r.reason?.stack) : "success").join("\n"));
+  const refused = results.find(r => r.status === "rejected") as PromiseRejectedResult;
+  assert.equal(refused.reason.status, 409); assert.equal(refused.reason.message, "SALE_ALREADY_PAID");
+  assert.equal(refused.reason.data.payments[0].method, "CASH"); assert.ok(locked >= 1);
+  const replay = await finance.dayFinancial(id, sale.id, "checkout", a);
+  assert.equal(replay.ok, true); assert.equal(replay.alreadyApplied, true);
+  assert.equal(f.rows("sale")[0].payments.length, 1);
+  // Route historique : même paiement = rejeu idempotent ; autre moyen = 409, jamais un succès.
+  const same = await checkout(tenant, sale.id, [{ method: "CASH", amountXpf: 1000n }]);
+  assert.equal(same.ok, true); assert.equal(same.alreadyPaid, true);
+  await assert.rejects(checkout(tenant, sale.id, [{ method: "CARD", amountXpf: 1000n }]),
+    (e: Row) => e.status === 409 && e.message === "SALE_ALREADY_PAID");
+  assert.equal(f.rows("sale")[0].payments.length, 1);
+});
+
+test("route remboursement partiel : métadonnées transmises au ledger et rejeu sans doublon", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  const native = caisseFunction("rembourserPartiellement", {
+    ...refundPolicy, assertTenantId: (v: string) => v, withTenant: f.withTenant,
+    lockDay: f.ledger.lockDay, appendDayFact: f.ledger.appendDayFact, ackFinancial: f.sync.ackFinancial,
+    comptaClient: () => ({}),
+    // Port de confirmation Compta : appelle le vrai branchement ledger de caisse.ts.
+    partialRefundWithPorts: async (_t: string, _s: string, _b: Row, deps: Row) => {
+      await deps.transact((tx: Row) => deps.recordDrawer(tx, { id: actor }, { amountXpf: 200, parTaux: [] }));
+      return { ok: true };
+    },
+  });
+  const route = load("../app/api/sales/[id]/partial-refund/route.ts", {
+    "next/server": { NextResponse: { json: (body: unknown, options: Row) => ({ body, status: options.status }) } },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": { rembourserPartiellement: native },
+    "@/lib/partial-refund": refundPolicy,
+  });
+  const b = { tenantId: tenant, actionId: actor, reason: "Retour synthétique", lines: [{ lineId: tenantB, qty: 1 }],
+    refundMethod: "CASH", cashDrawer: "EXTERNAL", cashDayId: id, drawerBusinessDay: "2026-10-15", deviceId: "A", occurredAt: now.toISOString() };
+  for (let i = 0; i < 2; i++) assert.equal((await route.POST({ json: async () => b }, { params: Promise.resolve({ id: tenantB }) })).status, 200);
+  const facts = f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE");
+  assert.equal(facts.length, 1); assert.equal(facts[0].cashDeltaXpf, -200n); assert.equal(facts[0].sourceRef, actor);
+});
 
 test("deux ouvertures concurrentes : 1 CashDay/OPEN, fond premier serveur et fonds divergents tracés", async () => {
   const f = fixture();

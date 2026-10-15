@@ -16,6 +16,7 @@
 // (endpoint /api/sales/:id/repair + balayage /api/cron/repair-sales).
 
 import { randomUUID } from "node:crypto";
+import { canonical, CashContractError, paymentParts } from "./cash-day-projection";
 import { assertTenantId, withTenant } from "./tenant";
 import { comptaClient, stockClient } from "./clients";
 import { log } from "./log";
@@ -881,6 +882,19 @@ export async function checkoutSale(
   // 1. Charger le ticket + lignes + paiements déjà enregistrés
   const sale = await getSale(tenantId, saleId);
   if (!sale) return { ok: false, error: "SALE_NOT_FOUND" };
+  // Mêmes moyens et mêmes montants (par moyen), quel que soit l'ordre des lignes.
+  type PayPart = { method: string; amountXpf: bigint | number };
+  const samePayments = (a: readonly PayPart[], b: readonly PayPart[]) => {
+    const parts = (x: readonly PayPart[]) => canonical(paymentParts(x.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) }))));
+    return parts(a) === parts(b);
+  };
+  // Caisse partagée : une vente déjà payée par d'AUTRES moyens est un refus, jamais un succès.
+  // Mêmes moyens et montants = rejeu légitime : on garde le chemin idempotent historique ci-dessous.
+  if (sale.cashDayId && sale.status === "PAID" && payments && payments.length > 0) {
+    const asked = normalizePayments(sale.totalXpf, payments);
+    if (!asked.ok || !samePayments(sale.payments, asked.payments)) throw new CashContractError("SALE_ALREADY_PAID", 409,
+      { payments: sale.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
+  }
   if (sale.status === "VOID") return { ok: false, error: "ALREADY_VOID" };
 
   // ── Bons cadeaux : validation de FORME, avant tout le reste ────────────────────────────
@@ -1099,7 +1113,13 @@ export async function checkoutSale(
     await withTenant(tenantId, async (tx) => {
       if (sale.cashDayId) {
         await lockSharedSale(tx, tenantId, saleId);
-        const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
+        await lockSaleRow(tx, saleId, tenantId);
+        const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
+        // Course perdue contre un autre moyen de paiement : refus explicite (409), pas de faux succès.
+        if (current.payments.length && !samePayments(current.payments, toPersist)) {
+          throw new CashContractError("SALE_ALREADY_PAID", 409,
+            { payments: current.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
+        }
         if (current.status !== "DRAFT") return;
       }
       // On (re)crée les paiements uniquement si aucun n'est encore enregistré (évite les doublons au rejeu).

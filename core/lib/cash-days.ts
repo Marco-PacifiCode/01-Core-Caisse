@@ -163,6 +163,21 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
     requireCash(businessDay(sale.paidAt ?? sale.createdAt) === day.businessDay && (!sale.cashDayId || sale.cashDayId === id), "DAY_MISMATCH", 409);
     await tx.sale.update({ where: { id: sale.id }, data: { cashDayId: id, sessionId: day.canonicalSessionId } });
     await recordSharedSale(tx, b.tenantId, sale.id);
+    // Les avoirs confirmés ont leur propre clé : un complément ne change pas la vente.
+    const refunds = await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, saleId: sale.id, status: "DONE" } });
+    for (const refund of refunds) {
+      const input = object(refund.input), plan = object(refund.plan);
+      if (input.refundMethod !== "CASH") continue;
+      // Avoir rendu un AUTRE jour : il sort d'un autre tiroir, il n'entre pas dans ce Z (et ne bloque pas l'import).
+      if (refund.cashDayId && refund.cashDayId !== id) continue;
+      const occurredAt = input.occurredAt ? date(input.occurredAt) : refund.createdAt;
+      if (businessDay(occurredAt) !== day.businessDay) continue;
+      await appendDayFact(tx, b.tenantId, id, { kind: "PARTIAL_REFUND_DONE", sourceRef: refund.actionId,
+        refundActionId: refund.id, deviceId: refund.deviceId ?? sale.deviceId ?? "legacy", occurredAt,
+        snapshot: { payments: [{ method: "CASH", amountXpf: String(xpfInteger(String(plan.amountXpf))) }],
+          parTaux: (plan.parTaux as unknown[]).map(v => { const t = object(v); return { tgcRatePpm: t.tgcRatePpm,
+            htXpf: String(t.htXpf), tgcXpf: String(t.tgcXpf), ttcXpf: String(t.ttcXpf) }; }) } });
+    }
     saleIds.push(sale.id);
   }
   for (const value of localVoids) {

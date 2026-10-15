@@ -16,10 +16,15 @@ export async function dayFinancial(cashDayId: string, saleId: string, operation:
     return await applyDayFinancial(cashDayId, saleId, operation, b);
   } catch (e) {
     if (e instanceof CashContractError) {
-      await withTenant(b.tenantId, async tx => {
+      const completed = await withTenant(b.tenantId, async tx => {
+        // Un appel concurrent de la même clé peut avoir terminé entre-temps.
+        const action = await tx.caisseSyncAction.findUnique({ where: { tenantId_actionId: { tenantId: b.tenantId, actionId: b.actionId } } });
+        if (action?.state === "ACK") return action.response;
         await tx.caisseSyncAction.updateMany({ where: { tenantId: b.tenantId, actionId: b.actionId, state: "PENDING" },
           data: { state: e.status === 409 ? "CONFLICT" : "REJECTED", response: jsonValue({ ok: false, error: e.message, status: e.status, data: e.data }) as Prisma.InputJsonValue } });
+        return null;
       });
+      if (completed) return { ...object(completed), alreadyApplied: true };
     }
     throw e;
   }
@@ -35,9 +40,14 @@ async function applyDayFinancial(cashDayId: string, saleId: string, operation: s
       requireCash(businessDay(date(b.occurredAt)) === day.businessDay, "DAY_MISMATCH", 409);
     }
     if (operation === "checkout") {
+      if (sale.status === "PAID") throw new CashContractError("SALE_ALREADY_PAID", 409,
+        { payments: sale.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
       const parts = paymentParts(b.payments);
       requireCash(Object.values(parts).reduce((s, n) => s + n, 0n) === sale.totalXpf);
-      if (sale.payments.length) requireCash(canonical(parts) === canonical(paymentParts(sale.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })))), "SOURCE_CONFLICT", 409);
+      if (sale.payments.length && canonical(parts) !== canonical(paymentParts(sale.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) }))))) {
+        throw new CashContractError("SALE_ALREADY_PAID", 409,
+          { payments: sale.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
+      }
     }
   });
   let result: { ok: boolean; [key: string]: unknown };
