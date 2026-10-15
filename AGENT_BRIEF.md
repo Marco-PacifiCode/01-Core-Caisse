@@ -4,6 +4,14 @@
 
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
+## 🧾 2026-10-15 — RÉPARATION ET VENTE ANNULÉE : plus de facture ni de règlement pour une VOID — fusionné, ⛔ NON DÉPLOYÉ
+
+- **Défaut (préexistant, relevé par relecture GPT)** : `repairSale`/`syncLoadedSale` travaillaient sur une photo chargée avant la synchro ; une vente annulée entre-temps était facturée, soldée et décrémentée sans avoir.
+- **Correctif** (`lib/sync.ts` `runGuardedSaleSync` + `SyncGuard`, `lib/caisse.ts` `guardFor`) : avant chaque étape (facture, règlements, stock), relecture sous `lockSaleRow` en transaction courte, **aucun appel réseau sous verrou** (doctrine `sale-lock.ts`). VOID ou `voidPreparedAt` → arrêt sans appel. Référence facture enregistrée seulement si la vente relue est encore PAID.
+- **Décision Marco (QCM 15/10)** : annulation directe survenue PENDANT `createInvoice` → la facture tout juste créée est **neutralisée par un avoir** et rattachée à la vente VOID. Avoir en échec → `syncError` = `NEUTRALISATION_EN_ATTENTE …`, repris par `repairSale` et le balayage (50 max/passage) ; une synchro ordinaire n'écrase jamais ce marqueur. Une facture existant AVANT l'annulation reste régularisée par l'avoir d'`annulerVente`.
+- **Fenêtres résiduelles assumées** (doctrine sans verrou réseau) : annulation pendant les appels `settle` ou `recordSale` → effet externe conservé, signalé au watchdog (`caisse.saleSyncRaceVoid`) pour arbitrage. Encaissement : la réponse dit encore PAID si une annulation concurrente tombe pendant la synchro (non traité).
+- Nouvelles erreurs de `POST /api/sales/:id/repair` (409) : `VOID_IN_PROGRESS`, `SALE_LOCKED`, `INVOICE_CONFLICT`. Test `lib/repair-void.test.ts` (cas a→m). 504 tests verts, tsc 0.
+
 ## 🔒 2026-10-05 — QUOTA DE POSTES DE CAISSE (chantier quotas, lot 4) — ⛔ NON DÉPLOYÉ, migration NON JOUÉE, verrou NON BRANCHÉ
 
 - **État au 2026-10-06** : seul l'admin PacifiCode est en production (catalogue à niveaux, brique sur l'abonnement, tenant Core sur le client ; son envoi des droits reste inerte, aucune clé posée). **Ici rien n'a bougé** : ce moteur n'est pas déployé avec le registre des postes, la migration `20261005130000_postes` n'est pas jouée, Core-Auth non plus (sa table des droits n'existe pas en production), `CORE_AUTH_API_KEY` n'est pas posée → aucun verrou actif. Le plafond de postes suit désormais une grille à 6 niveaux côté catalogue (1, 2, 3, 4, 6, 10 postes) : ce moteur ne connaît que le `plafond` reçu de Core-Auth, rien à adapter ici. Ordre de branchement et décisions : brief de l'admin PacifiCode, `[ch:quotas]`.

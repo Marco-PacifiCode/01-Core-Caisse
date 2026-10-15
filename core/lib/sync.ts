@@ -62,6 +62,10 @@ export type SyncSaleSnapshot = {
    *  disponible aussi bien à la synchro nominale qu'à une reprise différée (`repairSale` / cron
    *  `repair-sales`) après un échec du premier `createInvoice`. */
   dueAt?: string | null;
+  status?: string;
+  voidPreparedAt?: Date | null;
+  creditNoteId?: string | null;
+  syncError?: string | null;
   lines: SyncLine[];
   payments: SyncPayment[];
 };
@@ -86,7 +90,28 @@ export type CoreFailure = {
   detail: string;
 };
 
+export const NEUTRALISATION_MARKER = "NEUTRALISATION_EN_ATTENTE";
+/** Une synchro ordinaire ne peut ni remplacer ni effacer une neutralisation en attente. */
+export function shouldWriteSyncError(current: string | null | undefined, detail: string | null): boolean {
+  return !current?.startsWith(NEUTRALISATION_MARKER) || !!detail?.startsWith(NEUTRALISATION_MARKER);
+}
+const NEUTRALISATION_REASON = "Vente annulée pendant la synchro : facture neutralisée";
+
+/** Transactions courtes sous verrou, sans appel réseau. */
+export type SyncGuard = {
+  reread(): Promise<SyncSaleSnapshot | null>;
+  saveInvoiceRefIfLive(invoiceId: string, invoiceNumber: string | null): Promise<
+    { saved: true } | { saved: false; fresh: SyncSaleSnapshot | null }
+  >;
+  attachOrphanInvoice(invoiceId: string, invoiceNumber: string | null): Promise<boolean>;
+  attachNeutralization(invoiceId: string, creditNoteId: string): Promise<void>;
+};
+
 export type SyncOutcome = {
+  stopped?: "VOID" | "VOID_IN_PROGRESS" | "NOT_FOUND" | "LOCKED" | "INVOICE_CONFLICT";
+  neutralized?: boolean;
+  settledOnVoidingSale?: boolean;
+  stockOnVoidingSale?: boolean;
   synced: boolean;
   invoiceId: string | null;
   invoiceNumber: string | null;
@@ -114,6 +139,135 @@ export function formatFailure(f: CoreFailure): string {
   return `${f.core}:${f.op} ${f.kind} ${f.status} ${f.detail}`.slice(0, 800);
 }
 
+function createInvoice(sale: SyncSaleSnapshot, compta: ComptaClient) {
+  return compta.createInvoice({
+    tenantId: sale.tenantId, sourceType: CAISSE_SOURCE_TYPE, sourceId: sale.id,
+    ticketRef: sale.sourceId, clientName: sale.clientName,
+    // Vente à crédit (lot A) : omis quand non renseigné — PAS de fallback à une date bidon.
+    ...(sale.dueAt ? { dueAt: sale.dueAt } : {}),
+    lines: sale.lines.map(l => ({
+      label: l.label, qty: l.qty, unitXpf: Number(l.unitXpf),
+      // Omis quand non renseigné — PAS 0 (0 signifierait « hors champ TGC » côté Compta).
+      ...(l.tgcRatePpm !== undefined && l.tgcRatePpm !== null ? { tgcRatePpm: l.tgcRatePpm } : {}),
+    })),
+  });
+}
+
+export async function retryNeutralization(sale: SyncSaleSnapshot, compta: ComptaClient, guard: SyncGuard) {
+  if (sale.status !== "VOID" || !sale.invoiceId || sale.creditNoteId ||
+      !sale.syncError?.startsWith(NEUTRALISATION_MARKER)) {
+    return { neutralized: false, creditNoteId: sale.creditNoteId ?? null, failure: null };
+  }
+  try {
+    const note = await compta.creditNote({ tenantId: sale.tenantId, invoiceId: sale.invoiceId, reason: NEUTRALISATION_REASON });
+    await guard.attachNeutralization(sale.invoiceId, note.creditNoteId);
+    return { neutralized: true, creditNoteId: note.creditNoteId, failure: null };
+  } catch (e) {
+    const failure = asCoreFailure(e);
+    if (!failure) throw e;
+    return { neutralized: false, creditNoteId: null, failure };
+  }
+}
+
+function stoppedFor(sale: SyncSaleSnapshot | null): SyncOutcome["stopped"] {
+  if (!sale) return "NOT_FOUND";
+  if (sale.status !== undefined && sale.status !== "PAID") return "VOID";
+  if (sale.voidPreparedAt) return "VOID_IN_PROGRESS";
+}
+
+/**
+ * Relecture sous verrou avant chaque étape ; appels réseau hors verrou.
+ * Facture créée pendant une annulation directe : neutralisation (décision Marco 15/10).
+ * Relecture après règlements et stock, puis marquage de leurs effets externes.
+ * Fenêtres résiduelles signalées par settledOnVoidingSale / stockOnVoidingSale.
+ */
+async function runGuardedSaleSync(
+  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard,
+): Promise<SyncOutcome> {
+  let invoiceId: string | null = null;
+  let invoiceNumber: string | null = null;
+  let stockDecremented = 0;
+  const races: Pick<SyncOutcome, "settledOnVoidingSale" | "stockOnVoidingSale"> = {};
+  const stop = async (stopped: NonNullable<SyncOutcome["stopped"]>): Promise<SyncOutcome> => {
+    if (stopped === "VOID_IN_PROGRESS") {
+      await persist.recordFailure("VOID_IN_PROGRESS annulation en cours : synchro Compta/Stock suspendue");
+    }
+    return { synced: false, failure: null, stopped, invoiceId, invoiceNumber, stockDecremented, ...races };
+  };
+  const reread = async () => {
+    const cur = await guard.reread();
+    invoiceId = cur?.invoiceId ?? null;
+    invoiceNumber = cur?.invoiceNumber ?? null;
+    if (cur?.stockSyncedAt) stockDecremented = cur.lines.filter(l => l.kind === "PRODUCT" && l.productId).length;
+    return cur;
+  };
+  try {
+    let cur = await reread();
+    let stopped = stoppedFor(cur);
+    if (stopped) return await stop(stopped);
+    if (!cur) return await stop("NOT_FOUND");
+    if (!cur.comptaSyncedAt && !cur.invoiceId) {
+      const inv = await createInvoice(cur, compta);
+      invoiceId = inv.invoiceId;
+      invoiceNumber = inv.number;
+      const saved = await guard.saveInvoiceRefIfLive(inv.invoiceId, inv.number);
+      if (!saved.saved) {
+        const fresh = saved.fresh;
+        if (fresh?.status === "VOID" && !fresh.invoiceId) {
+          if (!await guard.attachOrphanInvoice(inv.invoiceId, inv.number)) return await stop("VOID");
+          const result = await retryNeutralization({ ...fresh, invoiceId: inv.invoiceId, syncError: NEUTRALISATION_MARKER }, compta, guard);
+          // Ne pas écraser le marqueur en cas d'échec : le balayage doit reprendre l'avoir.
+          return { ...await stop("VOID"), failure: result.failure, ...(result.neutralized ? { neutralized: true } : {}) };
+        }
+        stopped = stoppedFor(fresh);
+        if (stopped) return await stop(stopped);
+        if (fresh?.invoiceId && fresh.invoiceId !== inv.invoiceId) {
+          await persist.recordFailure(`INVOICE_CONFLICT facture créée ${inv.invoiceId} ≠ facture enregistrée ${fresh.invoiceId}`);
+          return await stop("INVOICE_CONFLICT");
+        }
+        // Refus inexpliqué : aucune opération d'argent supplémentaire.
+        return await stop("LOCKED");
+      }
+    }
+    cur = await reread();
+    stopped = stoppedFor(cur);
+    if (stopped) return await stop(stopped);
+    if (!cur) return await stop("NOT_FOUND");
+    if (!cur.comptaSyncedAt) {
+      if (!cur.invoiceId) throw new Error("Synchro règlements : invoiceId absent");
+      for (const p of cur.payments) {
+        await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
+          amountXpf: Number(p.amountXpf), method: p.method,
+          paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+      }
+      const afterSettle = await guard.reread();
+      if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
+      await persist.markComptaSynced();
+    }
+    cur = await reread();
+    stopped = stoppedFor(cur);
+    if (stopped) return await stop(stopped);
+    if (!cur) return await stop("NOT_FOUND");
+    if (!cur.stockSyncedAt) {
+      for (const l of cur.lines.filter(l => l.kind === "PRODUCT" && l.productId)) {
+        await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
+          sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
+        stockDecremented++;
+      }
+      const afterStock = await guard.reread();
+      if (afterStock?.status === "VOID" || afterStock?.voidPreparedAt) races.stockOnVoidingSale = true;
+      await persist.markStockSynced();
+    }
+    await persist.clearError();
+    return { synced: true, failure: null, invoiceId, invoiceNumber, stockDecremented, ...races };
+  } catch (e) {
+    const failure = asCoreFailure(e);
+    if (!failure) throw e;
+    await persist.recordFailure(formatFailure(failure));
+    return { synced: false, failure, invoiceId, invoiceNumber, stockDecremented, ...races };
+  }
+}
+
 /**
  * Rejoue UNIQUEMENT les étapes manquantes de la synchro d'une vente PAID.
  *   compta manquante → créer la facture si pas d'invoiceId (persistée aussitôt), puis settle chaque
@@ -127,7 +281,9 @@ export async function runSaleSync(
   compta: ComptaClient,
   stock: StockClient,
   persist: SyncPersist,
+  guard?: SyncGuard,
 ): Promise<SyncOutcome> {
+  if (guard) return runGuardedSaleSync(compta, stock, persist, guard);
   let invoiceId = sale.invoiceId;
   let invoiceNumber = sale.invoiceNumber;
   const productLines = sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId);
@@ -137,22 +293,7 @@ export async function runSaleSync(
     // ÉTAPE COMPTA (facture + settles) — sautée si déjà marquée faite.
     if (!sale.comptaSyncedAt) {
       if (!invoiceId) {
-        const inv = await compta.createInvoice({
-          tenantId: sale.tenantId,
-          sourceType: CAISSE_SOURCE_TYPE,
-          sourceId: sale.id,
-          ticketRef: sale.sourceId,
-          clientName: sale.clientName,
-          // Vente à crédit (lot A) : omis quand non renseigné — PAS de fallback à une date bidon.
-          ...(sale.dueAt ? { dueAt: sale.dueAt } : {}),
-          lines: sale.lines.map((l) => ({
-            label: l.label,
-            qty: l.qty,
-            unitXpf: Number(l.unitXpf),
-            // Omis quand non renseigné — PAS 0 (0 signifierait « hors champ TGC » côté Compta).
-            ...(l.tgcRatePpm !== undefined && l.tgcRatePpm !== null ? { tgcRatePpm: l.tgcRatePpm } : {}),
-          })),
-        });
+        const inv = await createInvoice(sale, compta);
         invoiceId = inv.invoiceId;
         invoiceNumber = inv.number;
         await persist.saveInvoiceRef(invoiceId, invoiceNumber);

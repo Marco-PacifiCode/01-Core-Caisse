@@ -9,11 +9,12 @@ export const runtime = "nodejs";
  * Rejoue UNIQUEMENT les étapes Compta/Stock manquantes d'une vente PAID (idempotent : toutes les
  * cibles dédupliquent — facture par sourceId, settle par paymentRef, mouvement stock par ligne).
  * Sans effet si la vente est déjà convergée (alreadySynced=true).
+ * Reprend aussi l'avoir d'une facture créée pendant une annulation, si marqué en attente.
  *
  * Body : { tenantId }
  * Réponse 200 : { ok, saleId, synced, alreadySynced, invoiceId, invoiceNumber, stockDecremented, syncError }
  *   synced=false → l'étape manquante a ENCORE échoué (détail dans syncError) ; rejouable.
- * Erreurs : 404 SALE_NOT_FOUND · 409 NOT_PAID (une vente non encaissée n'a rien à réparer).
+ * Erreurs : 404 SALE_NOT_FOUND · 409 NOT_PAID / VOID_IN_PROGRESS / SALE_LOCKED / INVOICE_CONFLICT.
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
