@@ -1,6 +1,8 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { closeSession } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 /**
  * POST /api/sessions/:id/close
@@ -27,12 +29,19 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "tenantId, closedBy et closingCountedXpf sont requis" }, { status: 400 });
   }
 
-  const result = await closeSession(tenantId, {
-    sessionId,
-    closedBy,
-    closedByName: body.closedByName?.trim() || undefined,
-    closingCountedXpf: BigInt(Math.round(closingCountedXpf)),
-  });
+  let result;
+  try {
+    if (await cashDayGuard(tenantId, { sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+    result = await closeSession(tenantId, {
+      sessionId,
+      closedBy,
+      closedByName: body.closedByName?.trim() || undefined,
+      closingCountedXpf: BigInt(Math.round(closingCountedXpf)),
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) return NextResponse.json(result, { status: 404 });
   return NextResponse.json(result);

@@ -39,6 +39,8 @@
 // =============================================================================
 
 import type { Prisma } from "@prisma/client";
+import { CashContractError } from "./cash-day-projection";
+import { uuid } from "./caisse-sync";
 
 /**
  * Plafond d'attente sur le verrou. Une caisse qui attend indéfiniment est PIRE qu'une
@@ -84,9 +86,8 @@ export async function lockSaleRow(
   saleId: string,
   tenantId: string,
 ): Promise<boolean> {
-  // Un id non-UUID ferait lever 22P02 au cast `::uuid` — donc un 500 là où le code
-  // rendait 404. On rend « introuvable », ce qui est la vérité.
-  if (!UUID_RE.test(saleId) || !UUID_RE.test(tenantId)) return false;
+  // Les UUID externes sont validés et canonisés avant toute requête transactionnelle.
+  saleId = uuid(saleId); tenantId = uuid(tenantId);
 
   try {
     // SET LOCAL, mais PARAMÉTRÉ (même geste que app.current_tenant) : `SET` n'accepte
@@ -105,9 +106,13 @@ export async function lockSaleRow(
 
 /** Verrou d'annulation transactionnel, toujours cle puis vente. */
 export async function lockVoidResource(tx: Prisma.TransactionClient, tenantId: string, resource: string): Promise<void> {
+  tenantId = uuid(tenantId);
+  const resourceMatch = /^(action|partial-action):(.+)$/.exec(resource);
+  if (!resourceMatch) throw new CashContractError("INVALID_PAYLOAD", 400);
+  const normalizedResource = `${resourceMatch[1]}:${uuid(resourceMatch[2])}`;
   try {
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${SALE_LOCK_TIMEOUT}, true)`;
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId.toLowerCase() + ':' + resource}, 0))`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId + ':' + normalizedResource}, 0))`;
   } catch (err) {
     if (isLockTimeout(err)) throw new SaleLockTimeoutError();
     throw err;

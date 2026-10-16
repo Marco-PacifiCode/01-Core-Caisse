@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { getLoyaltyProgram, upsertLoyaltyProgram } from "@/lib/caisse";
 import { serializeProgram } from "@/lib/loyalty-serialize";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -18,8 +19,13 @@ export async function GET(req: NextRequest) {
   const tenantId = (url.searchParams.get("tenantId") ?? "").trim();
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
-  const program = await getLoyaltyProgram(tenantId);
-  return NextResponse.json({ ok: true, program: serializeProgram(program) });
+  try {
+    const program = await getLoyaltyProgram(tenantId);
+    return NextResponse.json({ ok: true, program: serializeProgram(program) });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 }
 
 /**
@@ -54,23 +60,29 @@ export async function PUT(req: NextRequest) {
 
   const updatedBy = typeof body.updatedBy === "string" ? body.updatedBy : null;
 
-  const result = await upsertLoyaltyProgram(
-    tenantId,
-    {
-      mode: typeof body.mode === "string" ? body.mode : "",
-      visitsPerReward: typeof body.visitsPerReward === "number" ? body.visitsPerReward : null,
-      pointsPerHundredXpf: typeof body.pointsPerHundredXpf === "number" ? body.pointsPerHundredXpf : null,
-      pointsBase: typeof body.pointsBase === "string" ? body.pointsBase : null,
-      pointsPerReward: typeof body.pointsPerReward === "number" ? body.pointsPerReward : null,
-      rewardKind: typeof body.rewardKind === "string" ? body.rewardKind : null,
-      rewardPercent: typeof body.rewardPercent === "number" ? body.rewardPercent : null,
-      rewardAmountXpf,
-      rewardBase: typeof body.rewardBase === "string" ? body.rewardBase : null,
-      rewardValidityMonths: typeof body.rewardValidityMonths === "number" ? body.rewardValidityMonths : null,
-      clientPortalVisible: typeof body.clientPortalVisible === "boolean" ? body.clientPortalVisible : null,
-    },
-    updatedBy,
-  );
+  let result;
+  try {
+    result = await upsertLoyaltyProgram(
+      tenantId,
+      {
+        mode: typeof body.mode === "string" ? body.mode : "",
+        visitsPerReward: typeof body.visitsPerReward === "number" ? body.visitsPerReward : null,
+        pointsPerHundredXpf: typeof body.pointsPerHundredXpf === "number" ? body.pointsPerHundredXpf : null,
+        pointsBase: typeof body.pointsBase === "string" ? body.pointsBase : null,
+        pointsPerReward: typeof body.pointsPerReward === "number" ? body.pointsPerReward : null,
+        rewardKind: typeof body.rewardKind === "string" ? body.rewardKind : null,
+        rewardPercent: typeof body.rewardPercent === "number" ? body.rewardPercent : null,
+        rewardAmountXpf,
+        rewardBase: typeof body.rewardBase === "string" ? body.rewardBase : null,
+        rewardValidityMonths: typeof body.rewardValidityMonths === "number" ? body.rewardValidityMonths : null,
+        clientPortalVisible: typeof body.clientPortalVisible === "boolean" ? body.clientPortalVisible : null,
+      },
+      updatedBy,
+    );
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
   return NextResponse.json({ ok: true, program: serializeProgram(result.data) });
 }

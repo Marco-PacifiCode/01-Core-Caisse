@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { recordCashMovement } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 import {
   isCashMovementKind,
   normalizeMovementAmount,
@@ -59,14 +60,20 @@ export async function POST(req: NextRequest) {
   const ref = normalizeMovementRef(body.ref);
   if (ref?.startsWith(PARTIAL_REFUND_REF_PREFIX)) return NextResponse.json({ error: "REF_RESERVED" }, { status: 400 });
 
-  const result = await recordCashMovement(tenantId, {
-    kind: body.kind,
-    amountXpf: amount.amountXpf,
-    reason,
-    ref,
-    createdBy: typeof body.createdBy === "string" ? body.createdBy : null,
-    createdByName: typeof body.createdByName === "string" ? body.createdByName : null,
-  });
+  let result;
+  try {
+    result = await recordCashMovement(tenantId, {
+      kind: body.kind,
+      amountXpf: amount.amountXpf,
+      reason,
+      ref,
+      createdBy: typeof body.createdBy === "string" ? body.createdBy : null,
+      createdByName: typeof body.createdByName === "string" ? body.createdByName : null,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) return NextResponse.json(result, { status: 409 });
 

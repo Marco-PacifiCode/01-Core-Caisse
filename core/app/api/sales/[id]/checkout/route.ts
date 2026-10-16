@@ -1,6 +1,8 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { checkoutSale, type PaymentInput } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 import { parseDueAt } from "@/lib/credit";
 import type { GiftCardInput } from "@/lib/gift-card";
 import type { PayMethod } from "@prisma/client";
@@ -184,7 +186,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
           ...(redeemLoyalty ? { redeemLoyalty } : {}),
         }
       : undefined;
-  const result = await checkoutSale(tenantId, saleId, parsed, options);
+  let result: Awaited<ReturnType<typeof checkoutSale>>;
+  try {
+    if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+    result = await checkoutSale(tenantId, saleId, parsed, options);
+  } catch (e) {
+    // Caisse partagée : vente déjà payée par d'autres moyens → 409 explicite, pas une 500.
+    if (e instanceof CashContractError) return NextResponse.json({ ok: false, error: e.message, data: e.data }, { status: e.status });
+    throw e;
+  }
 
   if (!result.ok) {
     const map: Record<string, number> = {

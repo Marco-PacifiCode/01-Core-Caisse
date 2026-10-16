@@ -26,7 +26,9 @@ DECLARE
   t text;
   tables text[] := ARRAY[
     'CashSession','Sale','SaleLine','SalePayment','CashMovement','GiftCard','GiftCardOrder',
-    'LoyaltyProgram','LoyaltyAccount','LoyaltyEntry','VoidAction','Poste'
+    'LoyaltyProgram','LoyaltyAccount','LoyaltyEntry','VoidAction','Poste',
+    'CashSettings','CaisseSyncAction','ParkedBasket','PickupOrder',
+    'CashDay','CashDaySession','CashDayOpening','CashDayClosure','CashDayEvent'
   ];
 BEGIN
   FOREACH t IN ARRAY tables LOOP

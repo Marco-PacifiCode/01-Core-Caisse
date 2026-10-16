@@ -1,7 +1,9 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { rembourserPartiellement } from "@/lib/caisse";
 import { validRefundInput } from "@/lib/partial-refund";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -16,13 +18,17 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (typeof tenantId !== "string" || !uuid.test(tenantId) || !uuid.test(id) || !validRefundInput(body)) {
     return NextResponse.json({ error: "INVALID_REFUND_INPUT" }, { status: 400 });
   }
+  if (await cashDayGuard(tenantId, { saleId: id, refundCashDayId: body.cashDayId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+
   // tenantId n'appartient pas à l'empreinte métier ni au JSON de réservation.
-  const { actionId, reason, lines, refundMethod, cashDrawer, createdBy, createdByName } = body;
+  const { actionId, reason, lines, refundMethod, cashDrawer, createdBy, createdByName, cashDayId, drawerBusinessDay, deviceId, occurredAt } = body;
   try {
     const result = await rembourserPartiellement(tenantId, id, { actionId, reason, lines, refundMethod,
+      ...(cashDayId !== undefined ? { cashDayId, drawerBusinessDay, deviceId, occurredAt } : {}),
       ...(cashDrawer !== undefined ? { cashDrawer } : {}), ...(createdBy !== undefined ? { createdBy } : {}), ...(createdByName !== undefined ? { createdByName } : {}) });
     return NextResponse.json(result, { status: result.ok ? 200 : result.status ?? 409 });
-  } catch {
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
     return NextResponse.json({ ok: false, error: "REFUND_RETRY_REQUIRED" }, { status: 502 });
   }
 }

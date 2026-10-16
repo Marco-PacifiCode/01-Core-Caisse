@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { repairSale } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -28,7 +29,13 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
   if (!body.tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
 
-  const result = await repairSale(body.tenantId, saleId);
+  let result;
+  try {
+    result = await repairSale(body.tenantId, saleId);
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
+    throw error;
+  }
   if (!result.ok) {
     const status = result.error === "SALE_NOT_FOUND" ? 404 : 409;
     return NextResponse.json(result, { status });

@@ -1,7 +1,9 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { withTenant } from "@/lib/tenant";
 import { createSale, type SaleLineInput } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 import { xpf } from "@/lib/serialize";
 import type { LineKind } from "@prisma/client";
 
@@ -87,19 +89,26 @@ export async function POST(req: NextRequest) {
     occurredAt = d;
   }
 
-  const result = await createSale(tenantId, {
-    cashierId: body.cashierId,
-    sessionId: body.sessionId ?? null,
-    clientName: body.clientName ?? null,
-    sourceType: body.sourceType ?? null,
-    sourceId: body.sourceId ?? null,
-    posteId: body.posteId?.trim() || null,
-    occurredAt,
-    lines: parsed,
-  });
+  let result;
+  try {
+    if (await cashDayGuard(tenantId, { sessionId: body.sessionId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+    result = await createSale(tenantId, {
+      cashierId: body.cashierId,
+      sessionId: body.sessionId ?? null,
+      clientName: body.clientName ?? null,
+      sourceType: body.sourceType ?? null,
+      sourceId: body.sourceId ?? null,
+      posteId: body.posteId?.trim() || null,
+      occurredAt,
+      lines: parsed,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) {
-    const status = result.error === "PRODUCT_LINE_WITHOUT_PRODUCT" || result.error === "INVALID_QTY" ? 400 : 400;
+    const status = 400;
     return NextResponse.json({ error: result.error }, { status });
   }
   return NextResponse.json(result);

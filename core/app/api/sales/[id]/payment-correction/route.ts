@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { corrigerMoyenPaiement } from "@/lib/caisse";
 import { log } from "@/lib/log";
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -28,6 +30,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   let body: {
     tenantId?: string;
+    actionId?: string;
     fromMethod?: string;
     toMethod?: string;
     amountXpf?: number;
@@ -50,7 +53,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "amountXpf requis" }, { status: 400 });
   }
 
-  const result = await corrigerMoyenPaiement(tenantId, { saleId, fromMethod, toMethod, amountXpf });
+  let result;
+  try {
+    if (await cashDayGuard(tenantId, { saleId, paymentCorrection: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+    result = await corrigerMoyenPaiement(tenantId, { saleId, fromMethod, toMethod, amountXpf, actionId: body.actionId ?? req.headers?.get("Idempotency-Key") ?? undefined });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) {
     const map: Record<string, number> = {

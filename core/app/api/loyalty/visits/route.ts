@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { creditLoyaltyVisit } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -46,13 +47,18 @@ export async function POST(req: NextRequest) {
     occurredAt = d;
   }
 
-  const result = await creditLoyaltyVisit(tenantId, {
-    clientFicheId,
-    displayName,
-    appointmentId,
-    occurredAt,
-    by: typeof body.by === "string" ? body.by : null,
-    byName: typeof body.byName === "string" ? body.byName : null,
-  });
-  return NextResponse.json(result);
+  try {
+    const result = await creditLoyaltyVisit(tenantId, {
+      clientFicheId,
+      displayName,
+      appointmentId,
+      occurredAt,
+      by: typeof body.by === "string" ? body.by : null,
+      byName: typeof body.byName === "string" ? body.byName : null,
+    });
+    return NextResponse.json(result);
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 }

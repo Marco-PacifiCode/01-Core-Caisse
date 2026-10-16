@@ -1,6 +1,8 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { annulerVente } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 
 export const runtime = "nodejs";
 
@@ -39,7 +41,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (normalizedHeaderActionId && normalizedBodyActionId && normalizedHeaderActionId !== normalizedBodyActionId) {
     return NextResponse.json({ error: "ACTION_ID_CONFLICT" }, { status: 400 });
   }
-  const rawActionId = normalizedHeaderActionId ?? normalizedBodyActionId;
+  const rawActionId = headerActionId ?? body.actionId;
   if (rawActionId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawActionId)) {
     return NextResponse.json({ error: "actionId doit être un UUID" }, { status: 400 });
   }
@@ -47,8 +49,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   let result;
   try {
+    if (await cashDayGuard(tenantId, { saleId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
     result = await annulerVente(tenantId, saleId, { ...(reason ? { reason } : {}), ...(actionId ? { actionId } : {}) });
-  } catch {
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ ok: false, error: error.message }, { status: error.status });
     return NextResponse.json({ ok: false, error: "VOID_FAILED" }, { status: 502 });
   }
 

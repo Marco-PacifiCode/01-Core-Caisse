@@ -9,6 +9,7 @@ export type RefundInput = {
   // Espèces rendues par un tiroir hors session Core (Z importé déjà net des remboursements).
   cashDrawer?: "EXTERNAL";
   createdBy?: string; createdByName?: string;
+  cashDayId?: string; drawerBusinessDay?: string; deviceId?: string; occurredAt?: string;
 };
 export type RefundSale = {
   id: string; status: string; invoiceId: string | null; totalXpf: bigint;
@@ -39,13 +40,21 @@ export function validRefundInput(input: unknown): input is RefundInput {
     && x.lines.every(l => l && typeof l.lineId === "string" && uuid.test(l.lineId) && Number.isSafeInteger(l.qty) && l.qty >= 1)
     && new Set(x.lines.map(l => l.lineId.toLowerCase())).size === x.lines.length
     && (x.createdBy === undefined || typeof x.createdBy === "string" && uuid.test(x.createdBy))
-    && (x.createdByName === undefined || typeof x.createdByName === "string" && x.createdByName.length <= 200);
+    && (x.createdByName === undefined || typeof x.createdByName === "string" && x.createdByName.length <= 200)
+    && (x.cashDayId === undefined && x.drawerBusinessDay === undefined && x.deviceId === undefined && x.occurredAt === undefined
+      || typeof x.cashDayId === "string" && uuid.test(x.cashDayId)
+      && typeof x.drawerBusinessDay === "string" && /^\d{4}-\d{2}-\d{2}$/.test(x.drawerBusinessDay)
+      && typeof x.deviceId === "string" && x.deviceId.length > 0 && x.deviceId.length <= 120
+      && typeof x.occurredAt === "string" && Number.isFinite(Date.parse(x.occurredAt))
+      && new Date(Date.parse(x.occurredAt) + 11 * 3600000).toISOString().slice(0, 10) === x.drawerBusinessDay
+      && (x.refundMethod !== "CASH" || x.cashDrawer === "EXTERNAL"));
 }
 export function refundFingerprint(input: RefundInput): string {
   // PostgreSQL JSONB réordonne les clés: l'empreinte ne dépend jamais de leur ordre.
   return JSON.stringify({ actionId: input.actionId, reason: input.reason, refundMethod: input.refundMethod,
     createdBy: input.createdBy, createdByName: input.createdByName,
     ...(input.cashDrawer !== undefined ? { cashDrawer: input.cashDrawer } : {}),
+    ...(input.cashDayId !== undefined ? { cashDayId: input.cashDayId, drawerBusinessDay: input.drawerBusinessDay, deviceId: input.deviceId, occurredAt: input.occurredAt } : {}),
     lines: [...input.lines].sort((a, b) => a.lineId.localeCompare(b.lineId)).map(l => ({ lineId: l.lineId, qty: l.qty })) });
 }
 const safe = (n: bigint) => n >= 0n && n <= BigInt(Number.MAX_SAFE_INTEGER);

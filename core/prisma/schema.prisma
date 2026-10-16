@@ -94,7 +94,13 @@ model CashSession {
 
   sales     Sale[]
   movements CashMovement[]
+  canonicalDays CashDay[] @relation("CanonicalSession")
+  currentDays CashDay[] @relation("CurrentSession")
+  dayAliases CashDaySession[]
+  dayOpenings CashDayOpening[]
+  dayClosures CashDayClosure[]
 
+  @@unique([tenantId, id])
   @@index([tenantId])
   @@index([tenantId, status])
   @@index([tenantId, openedAt])
@@ -143,6 +149,18 @@ model Sale {
   lines    SaleLine[]
   payments SalePayment[]
   partialRefunds PartialRefund[]
+  deviceId String?
+  deviceName String?
+  ticketNumber String?
+  sellerId String? @db.Uuid
+  sellerName String?
+  pickupOrderId String? @db.Uuid
+  pickupOrder PickupOrder? @relation("SalePickup", fields: [tenantId, pickupOrderId], references: [tenantId, id], onDelete: Restrict)
+  fulfilledOrders PickupOrder[] @relation("OrderSale")
+  cashDayId String? @db.Uuid
+  cashDay CashDay? @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  dayEvents CashDayEvent[]
+  @@unique([tenantId, id])
 
   // Idempotence source externe : une vente issue d'un même (sourceType, sourceId) n'est créée qu'une fois.
   @@index([tenantId, sourceType, sourceId])
@@ -515,6 +533,12 @@ model PartialRefund {
   creditNoteId String?
   sessionId String? @db.Uuid
   createdAt DateTime @default(now())
+  cashDayId String? @db.Uuid
+  drawerBusinessDay String?
+  deviceId String?
+  cashDay CashDay? @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  dayEvents CashDayEvent[]
+  @@unique([tenantId, id])
   @@unique([tenantId, actionId])
   @@index([tenantId, saleId])
 }
@@ -532,4 +556,187 @@ model Poste {
 
   @@unique([tenantId, posteId])
   @@index([tenantId, actif])
+}
+
+// L4 : contrats opt-in, indépendants du registre Poste. Acompte = métadonnée uniquement.
+model CashSettings {
+  tenantId String @id @db.Uuid
+  defaultFloatXpf BigInt @default(25000)
+  revision Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CaisseSyncAction {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  actionId String
+  deviceId String
+  kind String
+  entityKey String
+  requestHash String
+  payload Json
+  state String @default("PENDING")
+  response Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([tenantId, actionId])
+  @@index([tenantId, entityKey])
+}
+
+model ParkedBasket {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  sourceKey String
+  label String
+  lines Json
+  occurredAt DateTime
+  status String @default("WAITING")
+  claimedByDevice String?
+  claimActionId String?
+  revision Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([tenantId, id])
+  @@unique([tenantId, sourceKey])
+  @@index([tenantId, createdAt, id])
+}
+
+model PickupOrder {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  sourceKey String
+  clientName String
+  phone String
+  pickupDay String
+  pickupTime String
+  lines Json
+  summary String @default("")
+  totalXpf BigInt
+  depositXpf BigInt @default(0)
+  status String @default("A_PREPARER")
+  occurredAt DateTime
+  pickedUpAt DateTime?
+  cancelledAt DateTime?
+  saleId String? @db.Uuid
+  sale Sale? @relation("OrderSale", fields: [tenantId, saleId], references: [tenantId, id], onDelete: Restrict)
+  sourceSales Sale[] @relation("SalePickup")
+  ticketNumber String?
+  claimedByDevice String?
+  claimActionId String?
+  revision Int @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([tenantId, id])
+  @@unique([tenantId, sourceKey])
+  @@index([tenantId, createdAt, id])
+  @@index([tenantId, pickupDay])
+}
+
+model CashDay {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  scope String @default("rotisserie-caisse")
+  businessDay String
+  canonicalSessionId String @db.Uuid
+  canonicalSession CashSession @relation("CanonicalSession", fields: [tenantId, canonicalSessionId], references: [tenantId, id], onDelete: Restrict)
+  currentSessionId String @db.Uuid
+  currentSession CashSession @relation("CurrentSession", fields: [tenantId, currentSessionId], references: [tenantId, id], onDelete: Restrict)
+  cycle Int @default(0)
+  revision BigInt @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  aliases CashDaySession[]
+  openings CashDayOpening[]
+  closures CashDayClosure[]
+  events CashDayEvent[]
+  sales Sale[]
+  refunds PartialRefund[]
+  @@unique([tenantId, id])
+  @@unique([tenantId, scope, businessDay])
+}
+
+// Chaque session native reste intacte ; les réouvertures ajoutent un alias et un cycle.
+model CashDaySession {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  cashDayId String @db.Uuid
+  cashDay CashDay @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  sessionId String @db.Uuid
+  session CashSession @relation(fields: [tenantId, sessionId], references: [tenantId, id], onDelete: Restrict)
+  cycle Int
+  createdAt DateTime @default(now())
+  @@unique([tenantId, sessionId])
+  @@index([tenantId, cashDayId])
+}
+
+model CashDayOpening {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  cashDayId String @db.Uuid
+  cashDay CashDay @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  sourceKey String
+  localSessionKey String
+  deviceId String
+  deviceName String
+  actorId String? @db.Uuid
+  actorName String @default("auteur non enregistré")
+  receivedById String @db.Uuid
+  occurredAt DateTime
+  receivedAt DateTime @default(now())
+  openingFloatXpf BigInt
+  legacySessionId String? @db.Uuid
+  legacySession CashSession? @relation(fields: [tenantId, legacySessionId], references: [tenantId, id], onDelete: Restrict)
+  @@unique([tenantId, sourceKey])
+  @@index([tenantId, cashDayId, receivedAt])
+}
+
+model CashDayClosure {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  cashDayId String @db.Uuid
+  cashDay CashDay @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  sourceKey String
+  cycle Int @default(0)
+  deviceId String
+  deviceName String
+  actorId String? @db.Uuid
+  actorName String @default("auteur non enregistré")
+  receivedById String @db.Uuid
+  occurredAt DateTime
+  receivedAt DateTime @default(now())
+  countedXpf BigInt
+  localExpectedXpf BigInt
+  localVarianceXpf BigInt
+  baselineExpectedXpf BigInt
+  closureMode String
+  cutoffRevision BigInt
+  authoritative Boolean
+  legacySessionId String? @db.Uuid
+  legacySession CashSession? @relation(fields: [tenantId, legacySessionId], references: [tenantId, id], onDelete: Restrict)
+  legacySnapshot Json?
+  @@unique([tenantId, sourceKey])
+  @@index([tenantId, cashDayId, cycle])
+  // Un Z autoritaire PAR CYCLE : index partiel dans la migration, aucune réécriture de l'ancien Z.
+}
+
+model CashDayEvent {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  cashDayId String @db.Uuid
+  cashDay CashDay @relation(fields: [tenantId, cashDayId], references: [tenantId, id], onDelete: Restrict)
+  sequence BigInt
+  kind String
+  sourceRef String
+  saleId String? @db.Uuid
+  sale Sale? @relation(fields: [tenantId, saleId], references: [tenantId, id], onDelete: Restrict)
+  refundActionId String? @db.Uuid
+  refundAction PartialRefund? @relation(fields: [tenantId, refundActionId], references: [tenantId, id], onDelete: Restrict)
+  deviceId String
+  occurredAt DateTime
+  receivedAt DateTime @default(now())
+  cashDeltaXpf BigInt
+  snapshot Json
+  @@unique([tenantId, cashDayId, sequence])
+  @@unique([tenantId, cashDayId, kind, sourceRef])
 }

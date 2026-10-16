@@ -1,7 +1,9 @@
+import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
 import { withTenant } from "@/lib/tenant";
 import { openSession } from "@/lib/caisse";
+import { CashContractError } from "@/lib/cash-day-projection";
 import { xpf } from "@/lib/serialize";
 
 /**
@@ -28,13 +30,20 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
 
-  const result = await openSession(tenantId, {
-    openedBy,
-    openedByName: body.openedByName?.trim() || undefined,
-    openingFloatXpf: BigInt(Math.round(body.openingFloatXpf ?? 0)),
-    note: body.note,
-    posteId: body.posteId?.trim() || null,
-  });
+  let result;
+  try {
+    if (await cashDayGuard(tenantId, { openSession: true })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
+    result = await openSession(tenantId, {
+      openedBy,
+      openedByName: body.openedByName?.trim() || undefined,
+      openingFloatXpf: BigInt(Math.round(body.openingFloatXpf ?? 0)),
+      note: body.note,
+      posteId: body.posteId?.trim() || null,
+    });
+  } catch (error) {
+    if (error instanceof CashContractError) return NextResponse.json({ error: error.message }, { status: error.status });
+    throw error;
+  }
 
   if (!result.ok) return NextResponse.json(result, { status: 409 });
 
