@@ -121,7 +121,9 @@ export async function cashAction(kind: string, b: ActionInput, mutate: (tx: Cash
       await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT cash_l4_business");
       result = { status: e.status, body: { ok: false, error: e.message, ...(e.data === undefined ? {} : { data: jsonValue(e.data) }) } };
     }
-    const retryable = result.status === 409 && result.body.error === "LEGACY_IN_PROGRESS";
+    // Refus dus à un état passager (reprise en cours, autre session encore ouverte) : jamais mémorisés,
+    // le rejeu identique repasse par la mutation une fois la cause disparue.
+    const retryable = result.status === 409 && ["LEGACY_IN_PROGRESS", "PREVIOUS_SESSION_OPEN"].includes(String(result.body.error));
     await tx.caisseSyncAction.update({ where: key, data: { state: result.status === 200 ? "ACK" : retryable ? "PENDING" : result.status === 409 ? "CONFLICT" : "REJECTED",
       response: jsonValue(result) as Prisma.InputJsonValue } });
     return result;

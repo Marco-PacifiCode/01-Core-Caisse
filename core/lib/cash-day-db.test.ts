@@ -1125,6 +1125,54 @@ test("avoir J+1 sur vente J : Z 26000 puis 24800, origine acceptée et rejeu san
   }
 });
 
+test("avoir réservé J, confirmé J+1 : compté au jour de la confirmation, jamais deux fois", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const first = f.rows("cashDay")[0].id, tomorrow = "2026-10-16T01:00:00.000Z";
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "reserve-j",
+    status: "PAID", paidAt: now, totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+    createdAt: new Date(now), input: { refundMethod: "CASH" }, outcome: { ok: true, doneAt: tomorrow }, plan: { amountXpf: 200, parTaux: [] } } });
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, first, input({ cycle: 0, origins: [{ sourceType: "synthetic", sourceId: "reserve-j" }] })));
+  const c = input({ sourceKey: "close-J", cycle: 0, closureMode: "ONLINE", countedXpf: "26000", localExpectedXpf: "26000", localVarianceXpf: "0" });
+  await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, first, c));
+  await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input({ businessDay: "2026-10-16", occurredAt: tomorrow,
+    sourceKey: "opening-J+1", localSessionKey: "local-J+1" })));
+  const second = f.rows("cashDay")[1].id;
+  for (let i = 0; i < 2; i++) await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, second, input({ cycle: 0 })));
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, first, input({ cycle: 0 })));
+  for (const [id, expected] of [[first, 26000n], [second, 24800n]] as const) {
+    const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+    assert.equal(page.projection.totauxCourants.expectedXpf, expected);
+  }
+  const facts = f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE");
+  assert.equal(facts.length, 1); assert.equal(facts[0].cashDayId, second);
+});
+test("avoir déjà porté au journal d'un autre jour : jamais rattaché une seconde fois", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const first = f.rows("cashDay")[0].id;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "ailleurs",
+    status: "PAID", paidAt: now, totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  const refund = await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+    input: { refundMethod: "CASH" }, plan: { amountXpf: 200, parTaux: [] } } });
+  await f.tx.cashDayEvent.create({ data: { tenantId: tenant, cashDayId: "99999999-9999-4999-a999-999999999999", kind: "PARTIAL_REFUND_DONE",
+    sourceRef: actor, refundActionId: refund.id, deviceId: "autre", occurredAt: new Date(now), snapshot: {}, sequence: 1n, cashDeltaXpf: -200n } });
+  await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, first, input({ cycle: 0 })));
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE" && e.cashDayId === first).length, 0);
+});
+test("PREVIOUS_SESSION_OPEN n'est pas mémorisé : le rejeu identique réussit une fois l'autre session close", async () => {
+  const f = fixture();
+  await f.sync.cashAction("open", input(), (tx: Row) => f.days.openCashDay(tx, input()));
+  const next = input({ actionId: "next-retry", sourceKey: "opening-next-retry", businessDay: "2026-10-16", occurredAt: "2026-10-16T01:00:00Z" });
+  let calls = 0;
+  const open = () => f.sync.cashAction("open", next, (tx: Row) => { calls++; return f.days.openCashDay(tx, next); });
+  assert.equal((await open()).body.error, "PREVIOUS_SESSION_OPEN");
+  assert.equal(f.rows("caisseSyncAction").find(r => r.actionId === "next-retry")!.state, "PENDING");
+  const id = f.rows("cashDay")[0].id;
+  await f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, id, input({ sourceKey: "close-before-retry", cycle: 0, closureMode: "ONLINE",
+    countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0" })));
+  const retried = await open();
+  assert.equal(retried.status, 200); assert.equal(calls, 2); assert.equal(f.rows("cashDay").length, 2);
+});
 test("clôture CashDay : ledger 25800 avec avoir 200, théorique persisté et écart zéro", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
   const id = f.rows("cashDay")[0].id;

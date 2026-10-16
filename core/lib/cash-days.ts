@@ -313,13 +313,21 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
     await appendDayFact(tx, b.tenantId, id, { kind: "MOVEMENT", sourceRef: movement.id, deviceId: "legacy",
       occurredAt: movement.createdAt, snapshot: { kind: movement.kind, amountXpf: movement.amountXpf, reason: movement.reason } });
   }
-  // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins.
-  // Borne basse : un avoir est enregistré après avoir été rendu (createdAt ≥ occurredAt), marge d'un jour.
-  const since = new Date(Date.parse(`${day.businessDay}T00:00:00Z`) - 35 * 3600000);
-  const refunds = (await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
-    createdAt: { gte: since }, OR: [{ cashDayId: null }, { cashDayId: id }] } })).filter(refund => {
-    const input = object(refund.input);
-    return businessDay(input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
+  // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins. Rendu = confirmation
+  // (outcome.doneAt) : un avoir réservé J puis confirmé J+1 sort du tiroir J+1, comme le compte la
+  // tablette. Borne basse large : la réservation peut précéder la confirmation de plusieurs jours.
+  const since = new Date(Date.parse(`${day.businessDay}T00:00:00Z`) - 31 * 24 * 3600000);
+  const candidates = await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
+    createdAt: { gte: since }, OR: [{ cashDayId: null }, { cashDayId: id }] } });
+  // Un avoir déjà porté au journal d'un AUTRE jour (rejeu par la route CashDay) n'est jamais compté deux fois.
+  const elsewhere = new Set((candidates.length ? await tx.cashDayEvent.findMany({ where: { tenantId: b.tenantId,
+    kind: "PARTIAL_REFUND_DONE", refundActionId: { in: candidates.map(refund => refund.id) } } }) : [])
+    .filter(event => event.cashDayId !== id).map(event => event.refundActionId));
+  const refunds = candidates.filter(refund => {
+    if (elsewhere.has(refund.id)) return false;
+    if (refund.cashDayId === id) return true;
+    const input = object(refund.input), doneAt = object(refund.outcome ?? {}).doneAt;
+    return businessDay(typeof doneAt === "string" ? date(doneAt) : input.occurredAt ? date(input.occurredAt) : refund.createdAt) === day.businessDay;
   });
   const saleIds: string[] = [];
   for (const value of origins) {
@@ -344,8 +352,8 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
   }
   // Même clé par avoir, qu'il soit découvert avec sa vente ou par l'import du jour de rendu.
   for (const refund of refunds) {
-      const input = object(refund.input), plan = object(refund.plan);
-      const occurredAt = input.occurredAt ? date(input.occurredAt) : refund.createdAt;
+      const input = object(refund.input), plan = object(refund.plan), doneAt = object(refund.outcome ?? {}).doneAt;
+      const occurredAt = typeof doneAt === "string" ? date(doneAt) : input.occurredAt ? date(input.occurredAt) : refund.createdAt;
       await appendDayFact(tx, b.tenantId, id, { kind: "PARTIAL_REFUND_DONE", sourceRef: refund.actionId,
         refundActionId: refund.id, deviceId: refund.deviceId ?? "legacy", occurredAt,
         snapshot: { payments: [{ method: input.refundMethod, amountXpf: String(xpfInteger(String(plan.amountXpf))) }],
