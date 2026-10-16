@@ -315,10 +315,10 @@ export async function attachLegacy(tx: CashTx, id: string, b: ActionInput) {
   }
   // Le tiroir suit le jour du rendu, même sans vente de ce jour dans origins. Rendu = confirmation
   // (outcome.doneAt) : un avoir réservé J puis confirmé J+1 sort du tiroir J+1, comme le compte la
-  // tablette. Borne basse large : la réservation peut précéder la confirmation de plusieurs jours.
-  const since = new Date(Date.parse(`${day.businessDay}T00:00:00Z`) - 31 * 24 * 3600000);
+  // tablette. Aucune borne sur createdAt : la réservation peut précéder la confirmation de plusieurs
+  // semaines. Volume borné : après bascule, tout avoir porte un cashDayId (route CashDay).
   const candidates = await tx.partialRefund.findMany({ where: { tenantId: b.tenantId, status: "DONE",
-    createdAt: { gte: since }, OR: [{ cashDayId: null }, { cashDayId: id }] } });
+    OR: [{ cashDayId: null }, { cashDayId: id }] } });
   // Un avoir déjà porté au journal d'un AUTRE jour (rejeu par la route CashDay) n'est jamais compté deux fois.
   const elsewhere = new Set((candidates.length ? await tx.cashDayEvent.findMany({ where: { tenantId: b.tenantId,
     kind: "PARTIAL_REFUND_DONE", refundActionId: { in: candidates.map(refund => refund.id) } } }) : [])

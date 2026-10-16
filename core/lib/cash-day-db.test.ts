@@ -1147,6 +1147,18 @@ test("avoir réservé J, confirmé J+1 : compté au jour de la confirmation, jam
   const facts = f.rows("cashDayEvent").filter(e => e.kind === "PARTIAL_REFUND_DONE");
   assert.equal(facts.length, 1); assert.equal(facts[0].cashDayId, second);
 });
+test("avoir réservé 6 semaines avant sa confirmation : compté au jour de la confirmation", async () => {
+  const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+  const id = f.rows("cashDay")[0].id;
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, sourceType: "synthetic", sourceId: "reserve-ancienne",
+    status: "PAID", paidAt: new Date("2026-09-01T01:00:00.000Z"), totalXpf: 1000n, lines: [{ lineXpf: 1000n }], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  await f.tx.partialRefund.create({ data: { tenantId: tenant, saleId: sale.id, status: "DONE", actionId: actor,
+    createdAt: new Date("2026-09-01T01:00:00.000Z"), input: { refundMethod: "CASH" }, outcome: { ok: true, doneAt: now.toISOString() },
+    plan: { amountXpf: 200, parTaux: [] } } });
+  for (let i = 0; i < 2; i++) await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, id, input({ cycle: 0 })));
+  const page = await f.withTenant(tenant, (tx: Row) => f.days.ledgerPage(tx, tenant, id, new URLSearchParams()));
+  assert.equal(page.projection.totauxCourants.expectedXpf, 24800n);
+});
 test("avoir déjà porté au journal d'un autre jour : jamais rattaché une seconde fois", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
   const first = f.rows("cashDay")[0].id;
