@@ -488,6 +488,7 @@ historique).
 - Reçu = endpoint Compta (pas de PDF local) → zéro duplication du moteur de rendu.
 
 ## Dernières actions
+- 17/10 — INCIDENT PC-0235 puis CORRECTIF DÉPLOYÉ. Après le déploiement de nuit `27f3fd6`, toute vente (POST /api/sales) et toute ouverture de session (POST /api/sessions) échouait : `$queryRaw`SELECT pg_advisory_xact_lock(...)`` renvoie `void`, que Prisma ne sait pas lire (P2010). V'Cut a été bloqué jusqu'à 11 h 49 (14 encaissements, 6 ouvertures). Correctif : cast `::text` dans `lib/caisse-sync.ts` et `lib/sale-lock.ts`, plus le test de garde `lib/verrou-void.test.ts` (PR 71 `47b5a3b`), déployé à 11 h 57 sur QCM. Les tests unitaires simulaient `$queryRaw` : aucun ne pouvait voir le défaut.
 - 16/10 : lecture `GET /api/cash-days/legacy/pending-closures` (sessions historiques rattachées, CLOSED, sans Z importé ; curseur exclusif closedAt/id, limit 1-200) pour que la reprise de la Rôtisserie retrouve un Z dont l'import a échoué après le rattachement. Lecture seule, 759 tests.
 
 - `2026-10-16` — Lot L4, quatorzième correctif (`bf7e2a3`) : posteId texte libre, références dérivées depuis l'id stocké. 733 tests. Non fusionné.
