@@ -131,13 +131,11 @@ test("d) lockVoidResource : timeout, autre ressource et validation", async () =>
 
 async function withSale(fn: (tenantId: string, saleId: string) => Promise<void>) {
   const tenantId = randomUUID(), saleId = randomUUID();
-  // SQL brut et non `tx.sale.create` : les migrations ne créent pas `Sale.posteId`
-  // (ajoutée en prod par prisma/manual/2026-08-15_postes_de_caisse.sql), que le client
-  // Prisma relirait. Seules colonnes sans défaut : id, tenantId, updatedAt.
-  await transaction(tenantId, tx => tx.$executeRaw`
-    INSERT INTO "Sale" (id, "tenantId", "updatedAt") VALUES (${saleId}::uuid, ${tenantId}::uuid, now())`);
+  // `Sale.posteId` vient de prisma/manual/2026-08-15_postes_de_caisse.sql, que le banc
+  // ci-local joue après les migrations (lot B2bis) : le client Prisma peut créer la vente.
+  await transaction(tenantId, tx => tx.sale.create({ data: { id: saleId, tenantId } }));
   try { await fn(tenantId, saleId); }
-  finally { await transaction(tenantId, tx => tx.$executeRaw`DELETE FROM "Sale" WHERE id = ${saleId}::uuid`); }
+  finally { await transaction(tenantId, tx => tx.sale.delete({ where: { id: saleId } })); }
 }
 
 test("e) lockSaleRow : existence et isolation RLS", async () => {

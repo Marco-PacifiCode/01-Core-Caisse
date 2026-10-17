@@ -1,3 +1,4 @@
+-- ci-local: ignorer reprise de données facultative (rôle BYPASSRLS), aucun schéma
 -- Reprise FACULTATIVE du registre des postes (2026-10-05) — à jouer APRÈS la migration
 -- 20261005130000_postes, sous un rôle BYPASSRLS (le propriétaire « nu » ne voit aucune ligne
 -- de "CashSession" ni de "Sale" sous FORCE ROW LEVEL SECURITY : il insérerait zéro ligne).
