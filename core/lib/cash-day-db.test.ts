@@ -251,7 +251,9 @@ test('annulerVente : référence fidélité historique uppercase retrouvée, ré
     const second = await native.annulerVente(tenant, receivedSaleId, { actionId: actor });
     const reversals = f.rows('loyaltyEntry').filter(e => e.kind === 'REVERSAL');
     assert.equal(first.alreadyVoid, false); assert.equal(second.ok, true);
-    assert.equal(creditKey, `caisse:${sale.id}:void:${actor}`); assert.equal(comptaCalls, 1);
+    // Avoir TOTAL : Compta refuse une creditKey sans montant (AMOUNT_REQUIRED_WITH_KEY, PC-0235 bis) ;
+    // son idempotence tient à l'index unique de l'avoir total de la facture.
+    assert.equal(creditKey, undefined); assert.equal(comptaCalls, 1);
     assert.equal(reversals.filter(e => e.ref === `unpoints:sale:${sale.id}`).length, 1);
     assert.equal(reversals.find(e => e.ref === `unpoints:sale:${sale.id}`)!.points, -27);
     assert.equal(reversals.filter(e => e.ref === `unredeem:sale:${sale.id}`).length, 1);

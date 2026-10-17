@@ -1726,7 +1726,7 @@ export async function annulerVente(
           return sale;
         });
       },
-      compta: { ...comptaClient(), creditNote: value => comptaClient().creditNote({ ...value, ...(voidCreditKey ? { creditKey: voidCreditKey } : {}) }) }, tenantId: safeTenantId, persist, reason: opts?.reason,
+      compta: { ...comptaClient(), creditNote: value => comptaClient().creditNote({ ...value, ...(voidCreditKey && (value.amountXpf != null || value.lineIds?.length) ? { creditKey: voidCreditKey } : {}) }) }, tenantId: safeTenantId, persist, reason: opts?.reason,
     });
     return savedOutcome ?? result;
   } catch (error) {
