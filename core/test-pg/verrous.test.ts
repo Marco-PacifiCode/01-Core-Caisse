@@ -52,18 +52,22 @@ function transaction<T>(tenantId: string, fn: (tx: Tx) => Promise<T>): Promise<T
 // même si une assertion échoue, avant de nettoyer les données ou déconnecter Prisma.
 async function whileHeld(
   tenantId: string, lock: (tx: Tx) => Promise<unknown>, holdMs: number,
-  contender: (committedAt: () => number) => Promise<void>,
+  contender: (releasingAt: () => number) => Promise<void>,
 ) {
   let signal!: () => void;
   let fail!: (error: unknown) => void;
   const ready = new Promise<void>((resolve, reject) => { signal = resolve; fail = reject; });
-  let committedAt = Number.POSITIVE_INFINITY;
+  // Heure où A cesse de tenir le verrou et lance son COMMIT. Pas l'heure où la promesse de
+  // A se résout : la base libère le verrou au commit, avant que le client n'en reçoive
+  // l'accusé, et B peut donc être servi avant (faux rouge observé sous ci-local).
+  let releasingAt = Number.POSITIVE_INFINITY;
   const holder = transaction(tenantId, async tx => {
     await lock(tx);
     signal();
     await sleep(holdMs);
-  }).then(() => { committedAt = performance.now(); }, error => { fail(error); throw error; });
-  const other = (async () => { await ready; await contender(() => committedAt); })();
+    releasingAt = performance.now();
+  }).catch(error => { fail(error); throw error; });
+  const other = (async () => { await ready; await contender(() => releasingAt); })();
   const results = await Promise.allSettled([holder, other]);
   for (const result of results) if (result.status === "rejected") throw result.reason;
 }
@@ -83,7 +87,7 @@ test("a) lockCashTenant termine la transaction", async () => {
 
 test("b) lockCashTenant sérialise le même tenant et laisse passer un autre", async () => {
   const tenantId = randomUUID(), otherTenant = randomUUID();
-  await whileHeld(tenantId, tx => sync.lockCashTenant(tx, tenantId), 1500, async committedAt => {
+  await whileHeld(tenantId, tx => sync.lockCashTenant(tx, tenantId), 1500, async releasingAt => {
     const sameStarted = performance.now();
     const same = transaction(tenantId, async tx => {
       await sync.lockCashTenant(tx, tenantId);
@@ -97,7 +101,7 @@ test("b) lockCashTenant sérialise le même tenant et laisse passer un autre", a
     const results = await Promise.allSettled([same, different]);
     for (const result of results) if (result.status === "rejected") throw result.reason;
     const acquiredAt = (results[0] as PromiseFulfilledResult<number>).value;
-    assert.ok(acquiredAt >= committedAt(), "B doit obtenir le verrou après le commit de A");
+    assert.ok(acquiredAt >= releasingAt(), "B doit obtenir le verrou après la fin de A");
     assert.ok(acquiredAt - sameStarted >= 1400, "B doit attendre la libération du verrou");
   });
 });
