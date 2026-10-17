@@ -112,7 +112,7 @@ export async function lockVoidResource(tx: Prisma.TransactionClient, tenantId: s
   const normalizedResource = `${resourceMatch[1]}:${uuid(resourceMatch[2])}`;
   try {
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${SALE_LOCK_TIMEOUT}, true)`;
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId + ':' + normalizedResource}, 0))`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId + ':' + normalizedResource}, 0))::text`;
   } catch (err) {
     if (isLockTimeout(err)) throw new SaleLockTimeoutError();
     throw err;

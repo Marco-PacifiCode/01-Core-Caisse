@@ -76,7 +76,7 @@ export function envelope(value: unknown, idempotencyKey: string | null): ActionI
 }
 export async function lockCashTenant(tx: CashTx, tenantId: string) {
   const normalized = uuid(tenantId);
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-l4:' + normalized}, 0))`;
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-l4:' + normalized}, 0))::text`;
 }
 export type ActionResponse = { status: number; body: JsonRecord };
 /** Les UUID intégrés dans les noms de route font partie du contenu canonique. */
