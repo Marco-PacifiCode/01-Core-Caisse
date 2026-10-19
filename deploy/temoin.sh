@@ -8,6 +8,8 @@
 #  2. mode journee de caisse (Rotisserie et futures caisses), caissedemo : ouverture, reouverture ou
 #     reprise de la journee, vente produit encaissee, prestation encaissee puis annulee avec avoir,
 #     cloture a ecart nul (00-Archi-NextGen/vps/tenants/caissedemo-seeds/README.md).
+# Chaque passage vend une unite de produit jamais rendue : avant chaque vente produit, le stock de demo
+# sous SEUIL est remonte a CIBLE par une entree IN Core-Stock idempotente (sourceType temoin-reassort).
 # Idempotent par TEMOIN_ID : identifiants, cles d'action et dates en derivent, un rejeu ne cree aucune
 # vente. Si la journee etait deja close, un rejeu la rouvre puis la referme sans vente (un Z vide).
 # La cle de service est LUE dans TEMOIN_ENV_FILE, jamais affichee (ni dans la sortie, ni dans `ps`).
@@ -35,28 +37,30 @@ QUAND = datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.ut
 ISO = QUAND.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 JOUR = (QUAND + timedelta(hours=11)).strftime("%Y-%m-%d")   # jour metier Noumea (UTC+11, sans heure d'ete)
 
-def lire_cle():
+def lire_env(nom):
     try:
         with open(os.environ["TEMOIN_ENV_FILE"], encoding="utf-8") as f:
             for ligne in f:
-                if ligne.startswith("CORE_CAISSE_API_KEY="):
+                if ligne.startswith(nom + "="):
                     return ligne.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
     return ""
 
-CLE = lire_cle()
+CLE = lire_env("CORE_CAISSE_API_KEY")
+STOCK_URL = lire_env("CORE_STOCK_URL").rstrip("/")   # Core-Stock, joint par core-caisse depuis le VPS
+STOCK_CLE = lire_env("CORE_STOCK_API_KEY")
 SECOURS = []   # (nom, action) : nettoyage si le parcours casse au milieu, rien ne doit rester ouvert
 
-def appel(methode, chemin, corps=None, idem=None):
+def appel(methode, chemin, corps=None, idem=None, base=None, cle=None):
     reste = BUDGET - (time.monotonic() - DEBUT)
     if reste < 2:
         return 0, {"error": "DELAI_DEPASSE"}
-    entetes = {"Content-Type": "application/json", "X-Core-Key": CLE}
+    entetes = {"Content-Type": "application/json", "X-Core-Key": CLE if cle is None else cle}
     if idem:
         entetes["Idempotency-Key"] = idem
     data = json.dumps(corps).encode() if corps is not None else None
-    req = urllib.request.Request(URL + chemin, data=data, method=methode, headers=entetes)
+    req = urllib.request.Request((base or URL) + chemin, data=data, method=methode, headers=entetes)
     try:
         with urllib.request.urlopen(req, timeout=min(20, reste)) as r:
             return r.status, json.loads(r.read() or b"{}")
@@ -80,6 +84,36 @@ def ko(raison, detail=None):
 
 def donnees(r):
     return r.get("data", r) if isinstance(r, dict) else {}
+
+# Reassort du stock de DEMONSTRATION. La vente produit n'est jamais annulee (STOCK_DECREMENTED) : sans
+# reassort, le stock seme tombe a 0 et le temoin passe au rouge sur INSUFFICIENT_STOCK, ancienne version
+# comprise (vecu le 19/10, Dissolvant de salondemo). Sous SEUIL, une entree IN remonte le produit a CIBLE
+# AVANT la vente : la preuve « stock decremente » reste entiere. Rejeu du meme TEMOIN_ID = aucun doublon
+# (Core-Stock deduplique sur sourceType + sourceId + sourceLineKey, index uniq_source_line).
+SEUIL, CIBLE = 5, 60
+
+def reassortir(tenant, produit, nom):
+    if not (STOCK_URL and STOCK_CLE):
+        print(f"{nom} : reassort saute, CORE_STOCK_URL ou CORE_STOCK_API_KEY absente de TEMOIN_ENV_FILE")
+        return
+    s, r = appel("GET", f"/api/stock/levels?tenantId={tenant}&productIds={produit}", base=STOCK_URL, cle=STOCK_CLE)
+    niveaux = r.get("levels") if s == 200 and isinstance(r, dict) else None
+    q = niveaux[0].get("qtyOnHand") if niveaux and isinstance(niveaux[0], dict) else None
+    if isinstance(q, bool) or not isinstance(q, (int, float)):
+        print(f"{nom} : reassort saute, lecture du stock HTTP {s}")
+        return
+    if q >= SEUIL:
+        return
+    s, r = appel("POST", "/api/movements", {"tenantId": tenant, "productId": produit, "type": "IN", "qty": CIBLE - q,
+                 "reason": "Reassort automatique du parcours temoin (demonstration)", "sourceType": "temoin-reassort",
+                 "sourceId": f"{ID}-{nom}", "sourceLineKey": produit, "billable": False}, base=STOCK_URL, cle=STOCK_CLE)
+    if s != 200 or not isinstance(r, dict) or not r.get("ok"):
+        if q < 1:
+            ko(f"{nom}, reassort du stock de demo ({q} en stock) : HTTP {s}", r)
+        print(f"{nom} : reassort refuse (HTTP {s}), {q} en stock suffit pour ce passage")
+        return
+    deja = " (deja pose)" if r.get("alreadyExisted") else ""
+    print(f"{nom} : stock de demo a {q}, reassort IN +{CIBLE - q}{deja} -> {r.get('qtyOnHand')}")
 
 if not CLE:
     ko("CORE_CAISSE_API_KEY absente de TEMOIN_ENV_FILE")
@@ -123,6 +157,7 @@ if s != 200 or not r.get("ok") or not r.get("creditNoteId"):
 SECOURS.pop()
 print(f"salondemo : prestation {vid} encaissee puis annulee, avoir {r.get('creditNoteId')}")
 
+reassortir(SALON, DISSOLVANT, "salondemo")
 vid, r = vente_classique("produit", {"kind": "PRODUCT", "label": "Dissolvant doux 500 ml", "productId": DISSOLVANT}, 1200)
 if r.get("stockDecremented") != 1:
     ko("salondemo, produit : stock non decremente", r)
@@ -207,6 +242,7 @@ def vente_journee(nom, ligne, prix):
         ko(f"caissedemo, encaissement {nom} : HTTP {s}", r)
     return vid
 
+reassortir(T, ARTICLE_A, "caissedemo")
 vente_journee("produit", {"kind": "PRODUCT", "label": "Article temoin A", "productId": ARTICLE_A}, 1200)
 vid = vente_journee("prestation", {"kind": "SERVICE", "label": "Prestation temoin", "productId": None}, 300)
 s, r = poster("journee-prestation-void", f"/api/cash-days/{jid}/sales/{vid}/void", f"cash-days:{jid}:sales:{vid}:void",
