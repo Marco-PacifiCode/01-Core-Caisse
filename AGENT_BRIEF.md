@@ -6,7 +6,7 @@
 - **Preuve** : un banc local (faux Core-Caisse et faux Core-Stock) fait passer l'ancien témoin, avec un stock à 0, au ROUGE sur la même erreur que le 19/10, et le nouveau au VERT (+60). Six autres cas sont couverts : stock à 10 sans réassort, deux tenants bas, clés absentes, IN refusée à 0 puis à 3. Aucune clé n'apparaît dans les sorties.
 - **Reste** : rien à déployer pour ce seul fichier. Il sera embarqué au prochain déploiement de core-caisse, qui demande l'accord de Marco et le feu vert de 00-Architecture.
 
-## 2026-10-19 — Une vente ne peut plus manquer au Z : branche `claude/caisse-session-ouverte`, NON LIVRÉE
+## 2026-10-19 — Une vente ne peut plus manquer au Z : ✅ LIVRÉ le 19/10 à 23 h 17 (main `ca3900d`, tag `deploy/core-caisse/20261019T121634Z-ca3900d2c38f`)
 - **Constat** (lecture du 19/10, sur 664a28a), en mode historique sans CashDay : le checkout se faisait en DEUX transactions, d'abord les paiements, puis le passage à PAID. Une clôture pouvait s'intercaler entre les deux ; la vente devenait alors PAID sur une session CLOSED, hors de son Z. Un ticket DRAFT laissé ouvert à la clôture, encaissé le lendemain, subissait le même sort.
 - **Décision de Marco** (QCM du 19/10) : « Oui, corriger (Recommandé) ». Règle technique posée par 00-Architecture : *une vente encaissée compte dans le Z de la session OUVERTE où elle est encaissée*.
 - **Correctif** (`core/lib/caisse.ts`) :
@@ -17,7 +17,7 @@
   - le mode CashDay et le VOID ne changent pas.
   Le contrat est décrit dans `core/API.md`.
 - **Tests** : `core/test-pg/session-open.test.ts`, joué par `test:pg` sur un vrai Postgres, couvre les cas (a) à (i), avec un entrelacement clôture/checkout constaté et deux sabotages. Les tests sans TypeScript passent : 622 sur 622. ⚠️ `core/lib/cash-day-db.test.ts` devra peut-être injecter le nouveau helper ; ci-local le dira.
-- **Reste** : CI locale verte, puis livraison sur accord de Marco. Toutes les caisses sont concernées (salons, Rôtisserie, démos) : on livre le soir ou sur un QCM dédié, avec le témoin caisse.
+- **Livraison** (accords QCM de Marco, tracés dans `_queue/reviews/`) : 1re tentative sur `2cc4a81` remise en arrière par le moteur — témoin rouge AUSSI sur l'ancienne version : produit de démo salondemo à 0 (`INSUFFICIENT_STOCK`), chaque témoin en consommant une unité. Réassort IN de 60 par l'API Core-Stock, puis correctif du témoin (`ca3900d`, réassort idempotent sous 5 unités). 2e livraison verte : salondemo et caissedemo (journée rouverte, Z écart 0) en 14 s. Partis avec : remboursement partiel refusé pendant la synchro (`168bde2`), migration `posteId` (déjà jouée), `id` en `dbgenerated` (DEFAULT vérifié en prod).
 
 ## En cours
 
