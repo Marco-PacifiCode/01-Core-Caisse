@@ -234,7 +234,7 @@ enum CashMovementKind {
 
 // Mouvement d'espèces rattaché à une session de caisse.
 model CashMovement {
-  id            String           @id @default(uuid()) @db.Uuid
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId      String           @db.Uuid
   // OBLIGATOIRE, et c'est le cœur du dispositif : un mouvement hors session serait invisible
   // de tout Z, donc inutile. La route refuse d'écrire s'il n'y a pas de session OUVERTE — c'est
@@ -508,7 +508,7 @@ model LoyaltyEntry {
 
 // Réservation durable avant appel externe lors d'une annulation avec actionId.
 model VoidAction {
-  id        String   @id @default(uuid()) @db.Uuid
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId  String   @db.Uuid
   actionId  String   @db.Uuid
   saleId    String   @db.Uuid
@@ -521,7 +521,7 @@ model VoidAction {
 }
 
 model PartialRefund {
-  id String @id @default(uuid()) @db.Uuid
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId String @db.Uuid
   actionId String @db.Uuid
   saleId String @db.Uuid
