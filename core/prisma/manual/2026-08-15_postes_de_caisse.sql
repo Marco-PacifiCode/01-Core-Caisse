@@ -1,4 +1,10 @@
+-- ci-local: ignorer redondant avec la migration 20261019120000_postes_colonnes
 -- 2026-08-15_postes_de_caisse.sql — core_caisse — plusieurs postes par marchand
+--
+-- 🗄️ GARDÉ POUR MÉMOIRE (2026-10-19) : ne plus le jouer. La migration Prisma
+-- 20261019120000_postes_colonnes crée les mêmes colonnes et index (mêmes noms, IF NOT
+-- EXISTS), plus "CashSession_tenantId_posteId_idx" que ce fichier oubliait. Une base neuve
+-- n'a besoin que de `prisma migrate deploy`.
 --
 -- À PASSER PAR MARCO (le rôle runtime n'a pas le DDL) :
 --     psql "$CORE_CAISSE_OWNER_URL" -v ON_ERROR_STOP=1 -f 2026-08-15_postes_de_caisse.sql
