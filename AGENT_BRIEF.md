@@ -5,6 +5,12 @@
 - **Caisse journalière unique de la Rôtisserie (lot L4)** : ✅ fusionnée et DÉPLOYÉE le 16/10 au soir avec `27f3fd6` (chantier « caisse unique »). Historique des 15 relectures : `AGENT_BRIEF_ARCHIVE.md` (section du 18/10).
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
+## 💸 2026-10-19 — REMBOURSEMENT PARTIEL : même garde de synchronisation que l'annulation (Marco, QCM du 19/10 : « Toi, les deux »)
+
+- `lib/partial-refund-db.ts` : sous le verrou de la vente, `syncBlocksVoid` (prise de synchro vivante, ou reprise inachevée sans règlements/stock confirmés) → refus `INVOICE_NOT_READY` (409), rien réservé ni émis. Code choisi parce qu'il est déjà REJOUABLE côté surface Rôtisserie (seule cliente du remboursement partiel : relais `lib/relay.ts` et `lib/legacy-avoir-partiel.ts`) ; un code nouveau y aurait été abandonné.
+- Preuve : test `partial-refund.test.ts` « synchro d'encaissement en cours… » rouge sans la garde (29/30), vert avec. NON déployé : mise en ligne à demander à Marco.
+- La migration `posteId` (colonnes créées à la main le 15/08) est traitée par une autre session (branche `claude/posteid-migration`).
+
 ## 🧪 2026-10-18 — PARCOURS TÉMOIN DU DÉPLOIEMENT (`deploy/temoin.sh`, lot B1 du moteur)
 
 - Joué par `ng-deploy.sh` SUR LE VPS après la bascule (contrat : `00-Archi-NextGen/_routine/deploy/README.md`, « Parcours témoin ») ; rouge = retour arrière automatique. LF obligatoire (`.gitattributes` : `*.sh text eol=lf`).
