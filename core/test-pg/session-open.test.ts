@@ -55,9 +55,9 @@ function functions(source: string) {
   // Aucun réseau. Le test vérifie exclusivement l'encaissement et la clôture locaux.
   globals.comptaClient = () => ({ receiptUrl: () => null });
   globals.syncLoadedSale = async () => ({ synced: true, invoiceId: null, invoiceNumber: null, stockDecremented: 0 });
-  globals.log = { error() {} };
+  globals.log = { error() {}, warn() {} };
   const context = vm.createContext(globals);
-  for (const name of ["getSale", "createSale", "checkoutSale", "closeSessionTx"]) {
+  for (const name of ["openSaleSession", "getSale", "createSale", "checkoutSale", "closeSessionTx"]) {
     const start = source.indexOf(`export async function ${name}(`);
     assert.ok(start >= 0);
     const end = source.indexOf("\nexport ", start + 10);
@@ -90,7 +90,7 @@ async function sale(tenant: string, sessionId: string | null, engine = api) {
 function closedError(error: unknown) {
   return error instanceof projection.CashContractError && error.message === "SESSION_NOT_OPEN" && error.status === 409;
 }
-async function race(engine: typeof api) {
+async function race(engine: typeof api, reopen = false) {
   await fixture(async (tenant, session, actor) => {
     const id = await sale(tenant, session);
     let ready!: () => void, release!: () => void;
@@ -98,10 +98,12 @@ async function race(engine: typeof api) {
     const gate = new Promise<void>(r => { release = r; });
     transactionName = `checkout-close-${randomUUID()}`;
     let closeReport: any;
+    let nextSession: string | undefined;
     const holder = transaction(tenant, async tx => {
       closeReport = await api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n });
       ready();
       await gate;
+      if (reopen) nextSession = (await tx.cashSession.create({ data: { tenantId: tenant, openedBy: actor } })).id;
     });
     // Un échec de la clôture ne laisse pas le concurrent suspendu.
     const heldOrFailed = Promise.race([held, holder.then(() => { throw Error("clôture terminée avant signal"); })]);
@@ -111,7 +113,7 @@ async function race(engine: typeof api) {
       await heldOrFailed;
       contender = engine.checkoutSale(tenant, id, payments);
       // Attacher immédiatement le rejet, pour éviter un unhandledRejection.
-      refused = assert.rejects(contender, closedError);
+      refused = reopen ? contender.then(result => { assert.equal((result as any).status, "PAID"); }) : assert.rejects(contender, closedError);
       void refused.catch(() => {});
       await sleep(200);
       const waiting = await prisma.$queryRaw<{ waiting: boolean }[]>`
@@ -123,8 +125,9 @@ async function race(engine: typeof api) {
       await Promise.all([holder, refused]);
       assert.equal(closeReport.report.salesCount, 0);
       const stored = await transaction(tenant, tx => tx.sale.findFirstOrThrow({ where: { id }, include: { payments: true } }));
-      assert.equal(stored.status, "DRAFT");
-      assert.equal(stored.payments.length, 0, "aucun paiement partiel après le 409");
+      assert.equal(stored.status, reopen ? "PAID" : "DRAFT");
+      assert.equal(stored.sessionId, reopen ? nextSession : session);
+      assert.equal(stored.payments.length, reopen ? 1 : 0, "aucun paiement partiel après le 409");
     } finally {
       release();
       await Promise.allSettled([holder, ...(contender ? [contender] : []), ...(refused ? [refused] : [])]);
@@ -145,6 +148,7 @@ test("a) OPEN : vente encaissée PAID et comptée au Z", async () => {
   });
 });
 test("b) clôture sous verrou : checkout attend puis 409, zéro paiement", async () => { await race(api); });
+test("b bis) clôture sous verrou puis nouvelle OPEN : checkout attend et rattache", async () => { await race(api, true); });
 test("c,d,e) CLOSED refuse la création ; sans session accepté ; nouvelle OPEN accepte", async () => {
   await fixture(async (tenant, session, actor) => {
     await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n }));
@@ -154,19 +158,73 @@ test("c,d,e) CLOSED refuse la création ; sans session accepté ; nouvelle OPEN 
     const next = await transaction(tenant, tx => tx.cashSession.create({ data: { tenantId: tenant, openedBy: actor } }));
     const id = await sale(tenant, next.id);
     assert.equal((await api.checkoutSale(tenant, id, payments)).status, "PAID");
+    const reattached = await sale(tenant, session);
+    assert.equal((await api.getSale(tenant, reattached)).sessionId, next.id);
   });
 });
-test("sabotage sur copie : retirer OPEN au checkout fait échouer b", async () => {
+test("f) rejeu source externe après clôture : vente existante, sans 409", async () => {
+  await fixture(async (tenant, session, actor) => {
+    const input = { sessionId: session, sourceType: "session-open-test", sourceId: randomUUID(), lines };
+    const first = await api.createSale(tenant, input);
+    await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n }));
+    const replay = await api.createSale(tenant, input);
+    assert.equal(replay.saleId, first.saleId);
+    assert.equal(replay.alreadyExisted, true);
+    assert.equal(await transaction(tenant, tx => tx.sale.count({ where: { tenantId: tenant } })), 1);
+  });
+});
+
+async function reattach(engine: typeof api, offline = false) {
+  await fixture(async (tenant, session, actor) => {
+    // Poste de l'ancienne session retrouvé même si Sale.posteId est absent.
+    await transaction(tenant, tx => tx.cashSession.update({ where: { id: session }, data: { posteId: "poste-temoin" } }));
+    const id = await sale(tenant, session, engine);
+    const oldZ = await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n }));
+    const paidAt = new Date(Date.now() - 86400_000);
+    const next = await transaction(tenant, tx => tx.cashSession.create({ data: { tenantId: tenant, openedBy: actor, posteId: "poste-temoin" } }));
+    // Une autre caisse OPEN ne doit pas recevoir ce ticket.
+    await transaction(tenant, tx => tx.cashSession.create({ data: { tenantId: tenant, openedBy: actor, posteId: "autre-poste" } }));
+    assert.equal((await engine.checkoutSale(tenant, id, payments, offline ? { paidAt } : undefined)).status, "PAID");
+    const stored = await api.getSale(tenant, id);
+    assert.equal(stored.sessionId, next.id);
+    assert.equal(stored.payments.length, 1);
+    if (offline) assert.equal(stored.paidAt.getTime(), paidAt.getTime());
+    const newZ = await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: next.id, closedBy: actor, closingCountedXpf: 1000n }));
+    assert.equal(newZ.report.salesCount, 1);
+    assert.equal(newZ.report.totalSalesXpf, 1000);
+    assert.equal(newZ.report.expectedXpf, 1000);
+    const reread = await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n }));
+    assert.deepEqual(reread.report, oldZ.report, "ancien Z inchangé et vente absente");
+  });
+}
+test("g) DRAFT CLOSED : PAID dans la nouvelle session du poste et son Z", async () => { await reattach(api); });
+test("h) DRAFT CLOSED sans OPEN : 409, vente et paiements inchangés", async () => {
+  await fixture(async (tenant, session, actor) => {
+    const id = await sale(tenant, session);
+    await transaction(tenant, tx => api.closeSessionTx(tx, tenant, { sessionId: session, closedBy: actor, closingCountedXpf: 0n }));
+    const before = await api.getSale(tenant, id);
+    await assert.rejects(() => api.checkoutSale(tenant, id, payments), closedError);
+    assert.deepEqual(await api.getSale(tenant, id), before);
+    await assert.rejects(() => api.createSale(tenant, { sessionId: session, lines }), closedError);
+    assert.equal(await transaction(tenant, tx => tx.sale.count({ where: { tenantId: tenant } })), 1);
+  });
+});
+test("i) paidAt hors ligne après clôture : accepté et rattaché", async () => { await reattach(api, true); });
+
+test("sabotages sur copie : garde seule échoue g ; sans garde échoue b", async () => {
   const directory = mkdtempSync(join(dirname(fileURLToPath(import.meta.url)), ".session-sabotage-"));
   const copy = join(directory, "caisse.ts");
   try {
     writeFileSync(copy, readFileSync(sourcePath));
     assert.equal(Buffer.compare(readFileSync(sourcePath), readFileSync(copy)), 0, "cmp avant sabotage");
     const source = readFileSync(copy, "utf8");
-    const start = source.indexOf("export async function checkoutSale(");
-    const guard = 'if (session?.status !== "OPEN") throw new CashContractError("SESSION_NOT_OPEN", 409);';
-    assert.ok(source.slice(start).includes(guard));
-    writeFileSync(copy, source.slice(0, start) + source.slice(start).replace(guard, "/* sabotage OPEN */"));
+    const start = source.indexOf("export async function openSaleSession(");
+    const end = source.indexOf("\nexport ", start + 10);
+    const signature = source.slice(start, source.indexOf('  // Appelé', start));
+    const replaceBody = (body: string) => source.slice(0, start) + signature + body + "\n}\n" + source.slice(end);
+    writeFileSync(copy, replaceBody('  const session = await tx.cashSession.findFirst({ where: { tenantId, id: sessionId } });\n  if (session?.status !== "OPEN") throw new CashContractError("SESSION_NOT_OPEN", 409);\n  return sessionId;'));
+    await assert.rejects(() => reattach(functions(readFileSync(copy, "utf8"))), closedError);
+    writeFileSync(copy, replaceBody("  return sessionId;"));
     await assert.rejects(() => race(functions(readFileSync(copy, "utf8"))), /Missing expected rejection/);
     assert.equal(readFileSync(sourcePath, "utf8"), original, "production intacte");
   } finally { rmSync(directory, { recursive: true, force: true }); }

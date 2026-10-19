@@ -527,6 +527,22 @@ export type CreateSaleInput = {
   occurredAt?: Date | null;
 };
 
+/** Session d'encaissement classique ; le parcours CashDay conserve ses propres règles. */
+export async function openSaleSession(
+  tx: Prisma.TransactionClient, tenantId: string, sessionId: string, posteId?: string | null,
+): Promise<string> {
+  // Appelé sous lockCashTenant : la clôture ne peut pas invalider cette décision.
+  const session = await tx.cashSession.findFirst({ where: { tenantId, id: sessionId }, select: { status: true, posteId: true } });
+  if (session?.status === "OPEN") return sessionId;
+  const poste = posteId ?? session?.posteId;
+  const replacement = await tx.cashSession.findFirst({
+    where: { tenantId, status: "OPEN", ...(poste != null ? { posteId: poste } : {}) },
+    orderBy: [{ openedAt: "desc" }, { id: "asc" }], select: { id: true },
+  });
+  if (!replacement) throw new CashContractError("SESSION_NOT_OPEN", 409);
+  return replacement.id;
+}
+
 /**
  * Crée un ticket (statut DRAFT) avec ses lignes et calcule les totaux (figés).
  * Idempotent sur (sourceType, sourceId) quand fournis (ex : un RDV honoré ne crée qu'un ticket).
@@ -576,10 +592,6 @@ export async function createSale(
 
   return withTenant(tenantId, async (tx) => {
     await assertLegacyWriteAllowed(tx, tenantId);
-    if (input.sessionId) {
-      const session = await tx.cashSession.findFirst({ where: { tenantId, id: input.sessionId }, select: { status: true } });
-      if (session?.status !== "OPEN") throw new CashContractError("SESSION_NOT_OPEN", 409);
-    }
     // Idempotence source externe
     if (input.sourceType && input.sourceId) {
       const existing = await readSource(tx);
@@ -588,11 +600,12 @@ export async function createSale(
       }
     }
 
+    const sessionId = input.sessionId ? await openSaleSession(tx, tenantId, input.sessionId, input.posteId) : null;
     try {
       const sale = await tx.sale.create({
         data: {
           tenantId,
-          sessionId: input.sessionId ?? null,
+          sessionId,
           cashierId: input.cashierId ?? null,
           clientName: input.clientName ?? null,
           sourceType: input.sourceType ?? null,
@@ -607,6 +620,7 @@ export async function createSale(
         },
         select: { id: true, totalXpf: true },
       });
+      if (sessionId !== (input.sessionId ?? null)) log.warn("vente_rattachee", { tenantId, saleId: sale.id, ancienneSession: input.sessionId, nouvelleSession: sessionId });
       return { ok: true as const, saleId: sale.id, totalXpf: Number(sale.totalXpf), alreadyExisted: false };
     } catch (e) {
       // Course sur l'index unique partiel uniq_sale_external_source → retomber sur l'existant.
@@ -1323,10 +1337,8 @@ export async function checkoutSale(
     if (current.cashDayId !== beforeLock?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
     if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
     if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-    if (current.sessionId) {
-      const session = await tx.cashSession.findFirst({ where: { tenantId, id: current.sessionId }, select: { status: true } });
-      if (session?.status !== "OPEN") throw new CashContractError("SESSION_NOT_OPEN", 409);
-    }
+    const sessionId = current.sessionId && current.status === "DRAFT" && !current.cashDayId
+      ? await openSaleSession(tx, tenantId, current.sessionId, current.posteId) : current.sessionId;
     const storedSaleId = current.id;
     if (toPersist.length > 0) {
       if (current.cashDayId && current.payments.length && !samePayments(current.payments, toPersist)) {
@@ -1385,7 +1397,8 @@ export async function checkoutSale(
     // hors de cette requête (cf. lib/sync.ts#SyncSaleSnapshot.dueAt).
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
-    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", sessionId, paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    if (sessionId !== current.sessionId) log.warn("vente_rattachee", { tenantId, saleId, ancienneSession: current.sessionId, nouvelleSession: sessionId });
     if (current.cashDayId) {
       await consumePickupOrder(tx, tenantId, saleId);
       await recordSharedSale(tx, tenantId, saleId);
