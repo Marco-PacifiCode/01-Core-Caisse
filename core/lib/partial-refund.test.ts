@@ -7,6 +7,7 @@ import { partialRefundWithPorts } from "./partial-refund-db.ts";
 import { runVoidSale } from "./void-sale.ts";
 import { expectedCashXpf } from "./cash-movement.ts";
 import type { ComptaClient, CreditNoteInput, InvoiceDetail } from "./clients.ts";
+import { SYNC_A_REPRENDRE_MARKER, syncClaimFor } from "./sync.ts";
 
 const TENANT = "00000000-0000-4000-8000-000000000001";
 const FOREIGN = "00000000-0000-4000-8000-000000000002";
@@ -139,6 +140,19 @@ test("clôture pendant Compta: aucun REFUND, même action rejouable sur une sess
   assert.equal(f.state.movements.length, 0); assert.equal(f.state.refunds[0].status, "PENDING");
   f.onCredit(() => {}); f.state.sessions[0].status = "OPEN";
   assert.ok((await f.run(value)).ok); assert.equal(f.emitted.size, 1); assert.equal(f.state.movements.length, 1);
+});
+// Constat du 19/10 : l'annulation refuse SYNC_IN_PROGRESS pendant l'envoi des règlements ou du stock,
+// le remboursement partiel non. Même garde ; refus rejouable déjà connu de la surface.
+test("synchro d'encaissement en cours : refus rejouable, aucune réservation ni avoir, puis remboursement possible", async () => {
+  const f = fixture();
+  Object.assign(f.state.sale, { syncError: syncClaimFor(2, new Date(), 8000, "prise"), comptaSyncedAt: null, stockSyncedAt: null });
+  assert.deepEqual(await f.run(), { ok: false, error: "INVOICE_NOT_READY", status: 409 });
+  assert.equal(f.calls.length, 0); assert.equal(f.state.refunds.length, 0);
+  Object.assign(f.state.sale, { syncError: `${SYNC_A_REPRENDRE_MARKER} règlement interrompu` });
+  assert.deepEqual(await f.run(), { ok: false, error: "INVOICE_NOT_READY", status: 409 });
+  assert.equal(f.calls.length, 0); assert.equal(f.state.refunds.length, 0);
+  Object.assign(f.state.sale, { syncError: null, comptaSyncedAt: new Date() });
+  const r = await f.run(); assert.ok(r.ok); assert.equal(f.emitted.size, 1);
 });
 test("tenant étranger refuse sans lecture Compta ni réservation", async () => {
   const f = fixture(); assert.deepEqual(await f.run(input(), FOREIGN), { ok: false, error: "SALE_NOT_FOUND", status: 404 });

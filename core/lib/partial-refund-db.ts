@@ -3,6 +3,7 @@ import type { ComptaClient } from "./clients";
 import { partialRefundMovementRef } from "./cash-movement.ts";
 import { planPartialRefund, refundFingerprint, refuse, runPartialRefund, type RefundInput, type RefundPlan, type RefundResult, type RefundSuccess, type RefundReservation } from "./partial-refund.ts";
 import { findHistoricalKey, normalizeActionId, normalizeActionInput, uuid } from "./caisse-sync.ts";
+import { syncBlocksVoid } from "./sync.ts";
 
 type Tx = Prisma.TransactionClient;
 // Même adaptateur exécuté en production et par les tests avec transactions simulées.
@@ -74,6 +75,11 @@ export async function partialRefundWithPorts(tenantId: string, saleId: string, i
         if (!input.cashDayId && (current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId)) return refuse("CASHDAY_ROUTE_REQUIRED", 409);
         const refunds = await tx.partialRefund.findMany({ where: { tenantId, saleId } });
         if (refunds.some(r => r.status === "PENDING")) return refuse("REFUND_IN_PROGRESS");
+        // Même garde que l'annulation (caisse.ts, SYNC_IN_PROGRESS) : tant que l'encaissement envoie
+        // encore règlements ou stock (prise de synchro vivante, ou reprise inachevée), aucun avoir.
+        // Refus rejouable : INVOICE_NOT_READY est déjà rejoué par la surface (relais et avoir partiel),
+        // alors qu'un code nouveau y serait abandonné. Rien n'est réservé ni émis.
+        if (syncBlocksVoid(current, new Date())) return refuse("INVOICE_NOT_READY");
         const plan = planPartialRefund(current, invoice, input, refunds.map(r => r.plan as unknown as RefundPlan));
         if ("ok" in plan) return plan;
         const coreDrawer = input.refundMethod === "CASH" && input.cashDrawer !== "EXTERNAL";
