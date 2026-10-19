@@ -773,7 +773,8 @@ for (const operation of ["checkout", "void"] as const) {
       : await operationNative.annulerVente(tenant.toUpperCase(), sale.id.toUpperCase(), { sharedActionId: actor.toUpperCase(), actionId: actor.toUpperCase() });
     assert.equal(result.ok, true);
     const transactions = f.lockTraces.slice(start).filter(t => t.includes(`Sale:${sale.id}`));
-    assert.equal(transactions.length, 2, "les deux transactions prennent le verrou Sale");
+    // Depuis le 19/10, le checkout paie et passe PAID dans UNE transaction ; l'annulation en garde deux.
+    assert.equal(transactions.length, operation === "checkout" ? 1 : 2, "chaque transaction prend le verrou Sale");
     for (const locks of transactions) {
       assert.ok(locks.indexOf(`Tenant:cash-l4:${tenant}`) >= 0);
       assert.ok(locks.indexOf(`Tenant:cash-l4:${tenant}`) < locks.indexOf(`Day:${day.id}`));
@@ -783,7 +784,8 @@ for (const operation of ["checkout", "void"] as const) {
     assert.equal(f.rows("cashDayEvent").filter(e => e.kind === (operation === "checkout" ? "SALE_PAID" : "SALE_VOID")).length, 1);
   });
 
-  for (const phase of [1, 2]) {
+  // Checkout en une transaction : plus de phase 2 où un rattachement concurrent pourrait apparaître.
+  for (const phase of operation === "checkout" ? [1] : [1, 2]) {
     test(`septième relecture : ${operation} phase ${phase}, rattachement changé sous verrou refusé même en voie partagée`, async () => {
       const f = fixture(true); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
       const day = f.rows("cashDay")[0];
@@ -800,7 +802,7 @@ for (const operation of ["checkout", "void"] as const) {
         : native.annulerVente(tenant, sale.id, { sharedActionId: actor }), routeRequired);
       assert.equal(f.rows("sale")[0].status, "DRAFT");
       assert.equal(f.rows("sale")[0].cashDayId, day.id, "transaction annulée");
-      assert.equal(f.rows("sale")[0].payments.length, operation === "checkout" && phase === 2 ? 1 : 0);
+      assert.equal(f.rows("sale")[0].payments.length, 0);
       assert.equal(f.rows("cashDayEvent").filter(e => e.saleId === sale.id).length, 0);
       assert.ok(f.lockTraces.every(t => !t.includes(`Day:${actor}`)), "aucun nouveau Day après Sale");
     });
@@ -1509,7 +1511,9 @@ test("createSale garde posteId texte exact et normalise les autres UUID avant ac
   };
   const globals = { withTenant: async (_tenantId: string, fn: (tx: Row) => Promise<unknown>) => fn(tx),
     assertLegacyWriteAllowed: async () => {}, validateGiftCard: (input: Row) => { giftInput = input; return { ok: true, data: { ...input } }; },
-    GIFT_CARD_SELECT: {}, toGiftCardView: (row: Row) => row, Prisma: { PrismaClientKnownRequestError: class extends Error {} } };
+    GIFT_CARD_SELECT: {}, toGiftCardView: (row: Row) => row, Prisma: { PrismaClientKnownRequestError: class extends Error {} },
+    // Session OPEN : renvoyée telle quelle ; elle doit déjà être normalisée.
+    openSaleSession: async (_tx: Row, _tenantId: string, sessionId: string) => { assert.equal(sessionId, ids.session); return sessionId; } };
   const createSale = caisseFunction("createSale", { ...globals, uuid: activeSync.uuid, normalizeActionInput: activeSync.normalizeActionInput, receivedActionInput: activeSync.receivedActionInput });
   const upper = (id: string) => id.toUpperCase();
   assert.notEqual(ids.session, upper(ids.session));

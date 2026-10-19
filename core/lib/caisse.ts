@@ -527,6 +527,22 @@ export type CreateSaleInput = {
   occurredAt?: Date | null;
 };
 
+/** Session d'encaissement classique ; le parcours CashDay conserve ses propres règles. */
+export async function openSaleSession(
+  tx: Prisma.TransactionClient, tenantId: string, sessionId: string, posteId?: string | null,
+): Promise<string> {
+  // Appelé sous lockCashTenant : la clôture ne peut pas invalider cette décision.
+  const session = await tx.cashSession.findFirst({ where: { tenantId, id: sessionId }, select: { status: true, posteId: true } });
+  if (session?.status === "OPEN") return sessionId;
+  const poste = posteId ?? session?.posteId;
+  const replacement = await tx.cashSession.findFirst({
+    where: { tenantId, status: "OPEN", ...(poste != null ? { posteId: poste } : {}) },
+    orderBy: [{ openedAt: "desc" }, { id: "asc" }], select: { id: true },
+  });
+  if (!replacement) throw new CashContractError("SESSION_NOT_OPEN", 409);
+  return replacement.id;
+}
+
 /**
  * Crée un ticket (statut DRAFT) avec ses lignes et calcule les totaux (figés).
  * Idempotent sur (sourceType, sourceId) quand fournis (ex : un RDV honoré ne crée qu'un ticket).
@@ -584,11 +600,12 @@ export async function createSale(
       }
     }
 
+    const sessionId = input.sessionId ? await openSaleSession(tx, tenantId, input.sessionId, input.posteId) : null;
     try {
       const sale = await tx.sale.create({
         data: {
           tenantId,
-          sessionId: input.sessionId ?? null,
+          sessionId,
           cashierId: input.cashierId ?? null,
           clientName: input.clientName ?? null,
           sourceType: input.sourceType ?? null,
@@ -603,6 +620,7 @@ export async function createSale(
         },
         select: { id: true, totalXpf: true },
       });
+      if (sessionId !== (input.sessionId ?? null)) log.warn("vente_rattachee", { tenantId, saleId: sale.id, ancienneSession: input.sessionId, nouvelleSession: sessionId });
       return { ok: true as const, saleId: sale.id, totalXpf: Number(sale.totalXpf), alreadyExisted: false };
     } catch (e) {
       // Course sur l'index unique partiel uniq_sale_external_source → retomber sur l'existant.
@@ -1282,63 +1300,10 @@ export async function checkoutSale(
     toPersist = norm.payments as PaymentInput[];
   }
 
-  // Persiste les nouveaux paiements (avec settleRef déterministe) s'il y en a.
-  if (toPersist.length > 0) {
-    await withTenant(tenantId, async (tx) => {
-      await lockCashTenant(tx, tenantId);
-      if (!options?.sharedActionId && !options?.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
-      const beforeLock = await lockSharedSale(tx, tenantId, saleId);
-      if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
-      const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
-      const storedSaleId = current.id;
-      if (current.cashDayId !== beforeLock?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-      if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-      if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-      if (current.cashDayId) {
-        // Course perdue contre un autre moyen de paiement : refus explicite (409), pas de faux succès.
-        if (current.payments.length && !samePayments(current.payments, toPersist)) {
-          throw new CashContractError("SALE_ALREADY_PAID", 409,
-            { payments: current.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
-        }
-        if (current.status !== "DRAFT") return;
-      }
-      // On (re)crée les paiements uniquement si aucun n'est encore enregistré (évite les doublons au rejeu).
-      const already = await tx.salePayment.count({ where: { tenantId, saleId: storedSaleId } });
-      if (already === 0) {
-        for (let i = 0; i < toPersist.length; i++) {
-          const p = toPersist[i];
-          await tx.salePayment.create({
-            data: {
-              tenantId,
-              saleId: storedSaleId,
-              method: p.method,
-              amountXpf: p.amountXpf,
-              tenderedXpf: p.tenderedXpf ?? null,
-              settleRef: `${CAISSE_SOURCE_TYPE}:${storedSaleId}:${i}`,
-            },
-          });
-        }
-      }
-    });
-  }
-
-  // Relire les paiements persistés (source de vérité pour le montant à solder).
-  const persisted = await withTenant(tenantId, (tx) =>
-    tx.salePayment.findMany({ where: { tenantId, saleId }, orderBy: { createdAt: "asc" } }),
-  );
-  const paidTotal = persisted.reduce((t, p) => t + p.amountXpf, 0n);
-  const guard = checkoutUnderpaidGuard(sale.totalXpf, paidTotal, options?.credit);
-  if (!guard.ok) {
-    if (guard.error === "UNDERPAID") {
-      return { ok: false, error: "UNDERPAID", totalXpf: Number(sale.totalXpf), paidXpf: Number(paidTotal) };
-    }
-    return { ok: false, error: guard.error };
-  }
-  const change = Number(computeChange(persisted.map((p) => ({
-    method: p.method,
-    amountXpf: p.amountXpf,
-    tenderedXpf: p.tenderedXpf ?? undefined,
-  }))));
+  // Paiements et passage a PAID : une transaction sous le verrou tenant.
+  let paidTotal = 0n;
+  let change = 0;
+  const paymentRefusal: { value: CheckoutError | null } = { value: null };
 
   // 2. ENCAISSEMENT ACTÉ : le ticket passe PAID AVANT la synchro (l'argent est dans le tiroir).
   //
@@ -1368,10 +1333,51 @@ export async function checkoutSale(
     if (!options?.sharedActionId && !options?.cashDayId) await assertLegacyWriteAllowed(tx, tenantId);
     const beforeLock = await lockSharedSale(tx, tenantId, saleId);
     if (!await lockSaleRow(tx, saleId, tenantId)) throw new CashContractError("SALE_NOT_FOUND", 404);
-    const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId } });
+    const current = await tx.sale.findFirstOrThrow({ where: { tenantId, id: saleId }, include: { payments: true } });
     if (current.cashDayId !== beforeLock?.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
     if ((current.cashDayId !== sale.cashDayId || current.sessionId !== sale.sessionId) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
     if (!current.cashDayId && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } }) && !options?.sharedActionId && options?.cashDayId !== current.cashDayId) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+    const sessionId = current.sessionId && current.status === "DRAFT" && !current.cashDayId
+      ? await openSaleSession(tx, tenantId, current.sessionId, current.posteId) : current.sessionId;
+    const storedSaleId = current.id;
+    if (toPersist.length > 0) {
+      if (current.cashDayId && current.payments.length && !samePayments(current.payments, toPersist)) {
+        throw new CashContractError("SALE_ALREADY_PAID", 409,
+          { payments: current.payments.map(p => ({ method: p.method, amountXpf: String(p.amountXpf) })) });
+      }
+      // Rejeu : aucun doublon si les paiements existent deja.
+      const already = await tx.salePayment.count({ where: { tenantId, saleId: storedSaleId } });
+      if (already === 0) {
+        for (let i = 0; i < toPersist.length; i++) {
+          const p = toPersist[i];
+          const data = {
+            tenantId,
+            saleId: storedSaleId,
+            method: p.method,
+            amountXpf: p.amountXpf,
+            tenderedXpf: p.tenderedXpf ?? null,
+            settleRef: `${CAISSE_SOURCE_TYPE}:${storedSaleId}:${i}`,
+          };
+          await tx.salePayment.create({ data });
+        }
+      }
+    }
+    // Relire les paiements persistés (source de vérité pour le montant à solder).
+    const persisted = await tx.salePayment.findMany({ where: { tenantId, saleId }, orderBy: { createdAt: "asc" } });
+    paidTotal = persisted.reduce((t, p) => t + p.amountXpf, 0n);
+    const guard = checkoutUnderpaidGuard(sale.totalXpf, paidTotal, options?.credit);
+    if (!guard.ok) {
+      paymentRefusal.value = guard.error === "UNDERPAID"
+        ? { ok: false, error: "UNDERPAID", totalXpf: Number(sale.totalXpf), paidXpf: Number(paidTotal) }
+        : { ok: false, error: guard.error };
+      return [] as GiftCardIssued[];
+    }
+    change = Number(computeChange(persisted.map((p) => ({
+      method: p.method,
+      amountXpf: p.amountXpf,
+      tenderedXpf: p.tenderedXpf ?? undefined,
+    }))));
+
     if (current.cashDayId && !await prepareSharedCheckout(tx, tenantId, saleId)) return [] as GiftCardIssued[];
     // `paidAt` fourni = encaissement rejoué depuis une caisse hors ligne.
     // Une date future est ignorée plutôt que refusée : le ticket est déjà
@@ -1391,7 +1397,8 @@ export async function checkoutSale(
     // hors de cette requête (cf. lib/sync.ts#SyncSaleSnapshot.dueAt).
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
-    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", sessionId, paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    if (sessionId !== current.sessionId) log.warn("vente_rattachee", { tenantId, saleId, ancienneSession: current.sessionId, nouvelleSession: sessionId });
     if (current.cashDayId) {
       await consumePickupOrder(tx, tenantId, saleId);
       await recordSharedSale(tx, tenantId, saleId);
@@ -1517,6 +1524,7 @@ export async function checkoutSale(
     if (orderRace.id) return [] as GiftCardIssued[];
     throw e;
   });
+  if (paymentRefusal.value) return paymentRefusal.value;
   if (race.id) {
     return { ok: false, error: "GIFT_CARD_NOT_REDEEMABLE", giftCardId: race.id, reason: "ALREADY_REDEEMED" };
   }

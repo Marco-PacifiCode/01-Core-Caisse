@@ -1,5 +1,18 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 2026-10-19 — Une vente ne peut plus manquer au Z : branche `claude/caisse-session-ouverte`, NON LIVRÉE
+- **Constat** (lecture du 19/10, sur 664a28a), en mode historique sans CashDay : le checkout se faisait en DEUX transactions, d'abord les paiements, puis le passage à PAID. Une clôture pouvait s'intercaler entre les deux ; la vente devenait alors PAID sur une session CLOSED, hors de son Z. Un ticket DRAFT laissé ouvert à la clôture, encaissé le lendemain, subissait le même sort.
+- **Décision de Marco** (QCM du 19/10) : « Oui, corriger (Recommandé) ». Règle technique posée par 00-Architecture : *une vente encaissée compte dans le Z de la session OUVERTE où elle est encaissée*.
+- **Correctif** (`core/lib/caisse.ts`) :
+  - paiements et PAID dans UNE transaction, sous le verrou tenant `cash-l4`, celui de la clôture ;
+  - `openSaleSession()` rattache une vente dont la session est fermée à la session OPEN du même poste (sinon à la plus récente du tenant), avec un journal WARN `vente_rattachee` ;
+  - sans aucune session OPEN, réponse 409 `SESSION_NOT_OPEN`, et rien n'est écrit ;
+  - l'idempotence passe AVANT la garde, si bien que les rejeux et la file hors ligne continuent de fonctionner ;
+  - le mode CashDay et le VOID ne changent pas.
+  Le contrat est décrit dans `core/API.md`.
+- **Tests** : `core/test-pg/session-open.test.ts`, joué par `test:pg` sur un vrai Postgres, couvre les cas (a) à (i), avec un entrelacement clôture/checkout constaté et deux sabotages. Les tests sans TypeScript passent : 622 sur 622. ⚠️ `core/lib/cash-day-db.test.ts` devra peut-être injecter le nouveau helper ; ci-local le dira.
+- **Reste** : CI locale verte, puis livraison sur accord de Marco. Toutes les caisses sont concernées (salons, Rôtisserie, démos) : on livre le soir ou sur un QCM dédié, avec le témoin caisse.
+
 ## En cours
 
 - **Caisse journalière unique de la Rôtisserie (lot L4)** : ✅ fusionnée et DÉPLOYÉE le 16/10 au soir avec `27f3fd6` (chantier « caisse unique »). Historique des 15 relectures : `AGENT_BRIEF_ARCHIVE.md` (section du 18/10).
