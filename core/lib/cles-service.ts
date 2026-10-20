@@ -5,7 +5,7 @@ import { NextResponse } from "next/server.js";
 export type Appelant = { nom: string; tenants: string[] };
 export type ContexteAppel = {
   appelant: string; tenants: string[]; historique: boolean; route: string;
-  compte: boolean; journalises: Set<string>;
+  compte: boolean; journalises: Set<string>; empreinte: Buffer;
 };
 type Entree = Appelant & { empreinte: Buffer };
 type Requete = { nextUrl?: { pathname: string }; url: string };
@@ -72,12 +72,13 @@ export function routeNormalisee(chemin: string): string {
   } catch { return ""; }
 }
 
-export function entrerAppel(req: Requete, appelant: Appelant | null): void {
+export function entrerAppel(req: Requete, appelant: Appelant | null, cle: string): void {
   let route = "";
   try { route = routeNormalisee(req.nextUrl?.pathname ?? new URL(req.url).pathname); } catch { /* URL illisible */ }
   const ctx: ContexteAppel = {
     appelant: appelant?.nom ?? "historique", tenants: [...(appelant?.tenants ?? ["*"])],
     historique: appelant === null, route, compte: false, journalises: new Set(),
+    empreinte: createHash("sha256").update(cle, "utf8").digest(),
   };
   als.enterWith(ctx);
   contextes.set(req, ctx);
@@ -108,9 +109,12 @@ export function viderJournal(): void {
   compteurs.clear();
   total = 0;
 }
-export function verifierPortee(tenantId: string): void {
+export async function verifierPortee(tenantId: string, lireCle: () => Promise<string | null>): Promise<void> {
   const ctx = als.getStore();
   if (!ctx || !tenantId || !clesNominativesPosees()) return;
+  const cle = await lireCle();
+  // Node 20/22 : enterWith déborde sur le contexte parent ; un contexte ne vaut que pour la requête qui porte la même clé.
+  if (!cle || !timingSafeEqual(createHash("sha256").update(cle, "utf8").digest(), ctx.empreinte)) return;
   if (!dansPortee(ctx, tenantId)) {
     journaliserHorsPortee(ctx, tenantId);
     if (modeCles() === "applique") throw new HorsPorteeError();
@@ -119,10 +123,10 @@ export function verifierPortee(tenantId: string): void {
   if (ctx.compte) return;
   ctx.compte = true;
   const verdict = ctx.historique ? "historique" : "ok";
-  const cle = JSON.stringify([ctx.appelant, tenantId, ctx.route, verdict]);
-  const compteur = compteurs.get(cle);
+  const cleCompteur = JSON.stringify([ctx.appelant, tenantId, ctx.route, verdict]);
+  const compteur = compteurs.get(cleCompteur);
   if (compteur) compteur.n++;
-  else compteurs.set(cle, { contexte: ctx, tenant: tenantId, verdict, n: 1 });
+  else compteurs.set(cleCompteur, { contexte: ctx, tenant: tenantId, verdict, n: 1 });
   total++;
   minuterie ??= setInterval(viderJournal, 60_000).unref();
   if (total >= 1_000) viderJournal();
