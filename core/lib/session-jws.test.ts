@@ -4,7 +4,7 @@
 // et le chemin du module (« ./session-jws » ou « ./session-jws.ts »). Rien d'autre ne change.
 import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { exportJWK, generateKeyPair, SignJWT, type CryptoKey } from "jose";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { decode, encode, type JWT, type JWTDecodeParams, type JWTEncodeParams } from "next-auth/jwt";
 import {
   AUDIENCE_SESSION,
@@ -18,7 +18,11 @@ import {
 } from "./session-jws.ts";
 
 const SEL = "authjs.session-token";
-const SECRET_FACTICE = "secret-factice-de-test-0123456789abcdef0123456789";
+// Type de clé privée sans dépendre de la version de jose (5 : KeyLike, 6 : CryptoKey).
+type ClePrivee = Awaited<ReturnType<typeof generateKeyPair>>["privateKey"];
+// Secrets factices à faible entropie : rien qui ressemble à une vraie clé (gitleaks).
+const SECRET_FACTICE = "factice-".repeat(6);
+const AUTRE_SECRET_FACTICE = "autre-factice-".repeat(4);
 
 let journal: string[] = [];
 beforeEach(() => {
@@ -26,14 +30,14 @@ beforeEach(() => {
   __pourTests((ligne) => journal.push(ligne));
 });
 
-async function paireFactice(): Promise<{ x: string; privee: CryptoKey }> {
+async function paireFactice(): Promise<{ x: string; privee: ClePrivee }> {
   const { publicKey, privateKey } = await generateKeyPair("EdDSA", { extractable: true });
   const { x } = await exportJWK(publicKey);
   return { x: x as string, privee: privateKey };
 }
 
 type Options = { iss?: string | null; aud?: string | null; exp?: number | string | null };
-async function signer(privee: CryptoKey, claims: Record<string, unknown> = {}, o: Options = {}): Promise<string> {
+async function signer(privee: ClePrivee, claims: Record<string, unknown> = {}, o: Options = {}): Promise<string> {
   let j = new SignJWT({ sub: "u1", tenantId: "t1", role: "ADMIN", ...claims })
     .setProtectedHeader({ alg: "EdDSA", typ: "JWT" })
     .setIssuedAt();
@@ -178,7 +182,7 @@ describe("avec AUTH_PUBLIC_KEY : la clé publique d'abord", () => {
     assert.equal(r.role, "PRO");
     assert.deepEqual(journal, ["[auth-jws] chemin=secret n=1"]);
     // Mauvais secret : le décodage d'aujourd'hui lève, il lève encore (NextAuth le traite en refus).
-    await assert.rejects(dec({ token: jwe, salt: SEL, secret: "un-autre-secret-factice-0123456789abcdef" }));
+    await assert.rejects(dec({ token: jwe, salt: SEL, secret: AUTRE_SECRET_FACTICE }));
     assert.equal(journal.at(-1), "[auth-jws] chemin=refus n=1");
     journalPropre(x, jwe, SECRET_FACTICE);
   });
