@@ -48,10 +48,10 @@ afterEach(() => {
   Object.assign(console, consoleInitiale);
 });
 
-test("1. Sans configuration : acceptation historique, refus et silence inchangés", () => {
+test("1. Sans configuration : acceptation historique, refus et silence inchangés", async () => {
   process.env.SERVICE_KEYS_MODE = "applique";
   assert.equal(hasServiceKey(requete(LEGACY)), true);
-  assert.doesNotThrow(() => verifierPortee(T2));
+  await assert.doesNotReject(async () => await verifierPortee(T2, async () => LEGACY));
   assert.equal(hasServiceKey(requete("factice-invalide")), false);
   assert.equal(hasServiceKey(requete(null)), false);
   delete process.env.CORE_CAISSE_API_KEY;
@@ -80,31 +80,31 @@ test("3. Hors portée : journal par défaut, déduplication et application", asy
   assert.ok(hasServiceKey(req));
   assert.equal(horsPortee(req, T2), null);
   assert.equal(horsPortee(req, T2), null);
-  verifierPortee(T2);
+  await verifierPortee(T2, async () => CLE_A);
   assert.deepEqual(warns, [`[cles-service] HORS_PORTEE appelant=A tenant=${T2} route=/api/sales/:id/lines`]);
   process.env.SERVICE_KEYS_MODE = " ApPlIqUe ";
   const refus = horsPortee(req, T2);
   assert.equal(refus?.status, 403);
   assert.deepEqual(await refus!.json(), { error: "HORS_PORTEE" });
-  assert.throws(() => verifierPortee(T2), (e: unknown) => e instanceof HorsPorteeError && e.name === "HORS_PORTEE" && e.message === "HORS_PORTEE");
+  await assert.rejects(async () => await verifierPortee(T2, async () => CLE_A), (e: unknown) => e instanceof HorsPorteeError && e.name === "HORS_PORTEE" && e.message === "HORS_PORTEE");
   assert.equal(warns.length, 1);
 });
 
-test("4. Portée étoile : tous les tenants sont autorisés", () => {
+test("4. Portée étoile : tous les tenants sont autorisés", async () => {
   config(["*"]);
   process.env.SERVICE_KEYS_MODE = "applique";
   const req = requete();
   assert.ok(hasServiceKey(req));
   assert.equal(horsPortee(req, T2), null);
-  assert.doesNotThrow(() => verifierPortee(T2));
+  await assert.doesNotReject(async () => await verifierPortee(T2, async () => CLE_A));
   assert.deepEqual(warns, []);
 });
 
-test("5. Historique comptée avec clés nominatives, désactivable", () => {
+test("5. Historique comptée avec clés nominatives, désactivable", async () => {
   config();
   assert.ok(hasServiceKey(requete(LEGACY)));
-  verifierPortee(T2);
-  verifierPortee(T2);
+  await verifierPortee(T2, async () => LEGACY);
+  await verifierPortee(T2, async () => LEGACY);
   viderJournal();
   assert.deepEqual(infos, [`[cles-service] SYNTHESE appelant=historique tenant=${T2} route=/api/sales/:id/lines verdict=historique n=1`]);
   process.env.SERVICE_KEY_LEGACY_OK = "0";
@@ -134,11 +134,11 @@ test("7. Longueurs différentes : refus sans exception", () => {
   assert.doesNotThrow(() => assert.equal(hasServiceKey(requete("x")), false));
 });
 
-test("8. Compteurs agrégés, une fois par requête, vidage explicite et seuil 1000", () => {
+test("8. Compteurs agrégés, une fois par requête, vidage explicite et seuil 1000", async () => {
   config();
   for (let i = 0; i < 3; i++) {
     assert.ok(hasServiceKey(requete()));
-    verifierPortee(T1); verifierPortee(T1);
+    await verifierPortee(T1, async () => CLE_A); await verifierPortee(T1, async () => CLE_A);
   }
   assert.deepEqual(infos, []);
   viderJournal();
@@ -147,7 +147,7 @@ test("8. Compteurs agrégés, une fois par requête, vidage explicite et seuil 1
   assert.equal(infos.length, 1);
   for (let i = 0; i < 1000; i++) {
     assert.ok(hasServiceKey(requete()));
-    verifierPortee(T1);
+    await verifierPortee(T1, async () => CLE_A);
   }
   assert.equal(infos.length, 2);
   assert.match(infos[1], /verdict=ok n=1000$/);
@@ -167,20 +167,21 @@ test("10. NON-FUITE : requêtes entrelacées, portée et contexte parent isolés
   process.env.SERVICE_KEYS_JSON = JSON.stringify(obj);
   const reqA = requete(CLE_A);
   const reqB = requete(CLE_B);
+  assert.ok(hasServiceKey(reqA));
   const a = (async () => {
     await Promise.resolve();
     assert.ok(hasServiceKey(reqA));
     await new Promise((r) => setTimeout(r, 5));
-    verifierPortee(T1);
+    await verifierPortee(T1, async () => CLE_A);
     assert.equal(horsPortee(reqA, T1), null);
     await new Promise((r) => setTimeout(r, 20));
-    verifierPortee(T2);
+    await verifierPortee(T2, async () => CLE_A);
   })();
   const b = (async () => {
     await Promise.resolve();
     assert.ok(hasServiceKey(reqB));
     await new Promise((r) => setTimeout(r, 15));
-    verifierPortee(T2);
+    await verifierPortee(T2, async () => CLE_B);
     assert.equal(horsPortee(reqB, T2), null);
     assert.deepEqual(warns, []);
   })();
@@ -188,13 +189,15 @@ test("10. NON-FUITE : requêtes entrelacées, portée et contexte parent isolés
   assert.deepEqual(warns, [`[cles-service] HORS_PORTEE appelant=A tenant=${T2} route=/api/sales/:id/lines`]);
   const avant = [...warns];
   process.env.SERVICE_KEYS_MODE = "applique";
-  assert.doesNotThrow(() => verifierPortee(T1));
-  assert.doesNotThrow(() => verifierPortee(T2));
+  await assert.doesNotReject(async () => await verifierPortee(T1, async () => null));
+  await assert.doesNotReject(async () => await verifierPortee(T2, async () => CLE_B));
   assert.deepEqual(warns, avant);
+  assert.deepEqual(infos, []);
   viderJournal();
   assert.equal(infos.length, 2);
   assert.ok(infos.some((ligne) => ligne.includes(`appelant=A tenant=${T1}`)));
   assert.ok(infos.some((ligne) => ligne.includes(`appelant=B tenant=${T2}`)));
+  assert.ok(infos.every((ligne) => ligne.endsWith(" n=1")));
 });
 
 test("11. RUNTIME : aucune déclaration edge dans app, middleware ou proxy", () => {
@@ -209,4 +212,20 @@ test("11. RUNTIME : aucune déclaration edge dans app, middleware ou proxy", () 
   for (const fichier of fichiers) {
     assert.doesNotMatch(readFileSync(fichier, "utf8"), /\bruntime\s*(?:=|:)\s*["']edge["']/, fichier);
   }
+});
+
+test("12. Contexte périmé ignoré", async (t) => {
+  config();
+  assert.ok(hasServiceKey(requete(CLE_A)));
+  process.env.SERVICE_KEYS_MODE = "applique";
+  await assert.doesNotReject(async () => await verifierPortee(T2, async () => CLE_B));
+  await assert.doesNotReject(async () => await verifierPortee(T2, async () => null));
+  viderJournal();
+  assert.deepEqual([warns, infos, erreurs], [[], [], []]);
+  await assert.rejects(async () => await verifierPortee(T2, async () => CLE_A), HorsPorteeError);
+  assert.deepEqual(warns, [`[cles-service] HORS_PORTEE appelant=A tenant=${T2} route=/api/sales/:id/lines`]);
+  delete process.env.SERVICE_KEYS_JSON;
+  const lireCle = t.mock.fn(async () => CLE_A);
+  await verifierPortee(T2, lireCle);
+  assert.equal(lireCle.mock.callCount(), 0);
 });

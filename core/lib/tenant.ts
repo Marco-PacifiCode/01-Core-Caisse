@@ -4,6 +4,11 @@ import { log } from "./log";
 import { prisma } from "./prisma";
 import { verifierPortee } from "./cles-service.ts";
 
+/** X-Core-Key de la requête en cours ; null hors requête (cron, script, test). */
+async function cleServiceCourante(): Promise<string | null> {
+  try { return (await headers()).get("x-core-key"); } catch { return null; }
+}
+
 /** Type local — reflète le payload de core_auth GET /api/tenant */
 export type TenantConfig = {
   id: string;
@@ -79,7 +84,7 @@ export async function withTenant<T>(
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
   const safeTenantId = assertTenantId(tenantId);
-  verifierPortee(safeTenantId);
+  await verifierPortee(safeTenantId, cleServiceCourante);
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
     return fn(tx);

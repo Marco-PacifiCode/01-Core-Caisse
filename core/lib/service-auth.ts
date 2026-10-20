@@ -7,11 +7,11 @@ export function hasServiceKey(req: NextRequest): boolean {
   if (!apiKey) return false;
   const appelant = identifierCle(apiKey);
   if (appelant) {
-    entrerAppel(req, appelant);
+    entrerAppel(req, appelant, apiKey);
     return true;
   }
   const attendue = process.env.CORE_CAISSE_API_KEY;
   if (!attendue || !egalTempsConstant(apiKey, attendue) || !cleHistoriqueAcceptee()) return false;
-  entrerAppel(req, null);
+  entrerAppel(req, null, apiKey);
   return true;
 }
