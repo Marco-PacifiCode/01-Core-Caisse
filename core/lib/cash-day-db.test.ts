@@ -269,7 +269,7 @@ function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
   return load(`../app/api/${path}`, {
     "@/lib/cash-shared-http": http, "@/lib/caisse-sync": f.sync, "@/lib/cash-day-sales": f.sales, "@/lib/cash-days": f.days,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
-    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": native,
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
     "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
     "@/lib/tenant": { withTenant: f.withTenant }, "@/lib/serialize": { xpf: Number },
@@ -1011,7 +1011,7 @@ test("avoir historique : collision checkout PENDING refusée en HTTP 409 avant C
   });
   const route = load("../app/api/sales/[id]/partial-refund/route.ts", {
     "next/server": { NextResponse: { json: (body: unknown, options: Row) => ({ body, status: options.status }) } },
-    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": { rembourserPartiellement: native },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": { rembourserPartiellement: native },
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
     "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection,
   });
@@ -1330,7 +1330,7 @@ test("route remboursement partiel : métadonnées transmises au ledger et rejeu 
   });
   const route = load("../app/api/sales/[id]/partial-refund/route.ts", {
     "next/server": { NextResponse: { json: (body: unknown, options: Row) => ({ body, status: options.status }) } },
-    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": { rembourserPartiellement: native },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": { rembourserPartiellement: native },
     "@/lib/partial-refund": refundPolicy,
       "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
       "@/lib/cash-day-projection": projection,

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { getLoyaltyProgram, upsertLoyaltyProgram } from "@/lib/caisse";
 import { serializeProgram } from "@/lib/loyalty-serialize";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -18,6 +19,7 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const tenantId = (url.searchParams.get("tenantId") ?? "").trim();
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   try {
     const program = await getLoyaltyProgram(tenantId);
@@ -52,6 +54,7 @@ export async function PUT(req: NextRequest) {
 
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const rewardAmountXpf =
     body.rewardAmountXpf === undefined || body.rewardAmountXpf === null

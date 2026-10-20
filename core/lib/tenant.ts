@@ -2,6 +2,7 @@ import { headers } from "next/headers";
 import type { Prisma } from "@prisma/client";
 import { log } from "./log";
 import { prisma } from "./prisma";
+import { verifierPortee } from "./cles-service.ts";
 
 /** Type local — reflète le payload de core_auth GET /api/tenant */
 export type TenantConfig = {
@@ -78,6 +79,7 @@ export async function withTenant<T>(
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
   const safeTenantId = assertTenantId(tenantId);
+  verifierPortee(safeTenantId);
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
     return fn(tx);

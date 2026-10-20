@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { UUID_RE } from "@/lib/gift-card";
 import { serializeGiftCardOrder, validateGiftCardOrder } from "@/lib/gift-card-order";
 import { createGiftCardOrder, listGiftCardOrders } from "@/lib/gift-card-orders-db";
@@ -24,6 +25,7 @@ export async function GET(req: NextRequest) {
   if (!tenantId || !UUID_RE.test(tenantId)) {
     return NextResponse.json({ ok: false, error: "tenantId requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const rawStatus = url.searchParams.get("status");
   const status = STATUSES.includes(rawStatus as Status) ? (rawStatus as Status) : undefined;
@@ -64,6 +66,7 @@ export async function POST(req: NextRequest) {
   if (!tenantId || !UUID_RE.test(tenantId)) {
     return NextResponse.json({ ok: false, error: "tenantId requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const validated = validateGiftCardOrder(body);
   if (!validated.ok) return NextResponse.json({ ok: false, error: validated.error }, { status: 400 });

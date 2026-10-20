@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { withTenant } from "@/lib/tenant";
 import { createSale, type SaleLineInput } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -50,6 +51,7 @@ export async function POST(req: NextRequest) {
 
   const { tenantId, lines } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   if (!lines || lines.length === 0) return NextResponse.json({ error: "lines ne peut pas être vide" }, { status: 400 });
 
   const parsed: SaleLineInput[] = [];
@@ -169,6 +171,7 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const tenantId = searchParams.get("tenantId");
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const status = searchParams.get("status");
   const sessionId = searchParams.get("sessionId");

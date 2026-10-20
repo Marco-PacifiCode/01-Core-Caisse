@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { cancelGiftCard } from "@/lib/caisse";
 import { normalizeText } from "@/lib/gift-card";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -44,6 +45,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   let result;
   try {

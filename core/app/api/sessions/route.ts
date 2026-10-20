@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { withTenant } from "@/lib/tenant";
 import { openSession } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -29,6 +30,7 @@ export async function POST(req: NextRequest) {
   if (!tenantId || !openedBy) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   let result;
   try {
@@ -69,6 +71,7 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const tenantId = searchParams.get("tenantId");
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   const status = searchParams.get("status");
   const limit = Math.min(Number(searchParams.get("limit")) || 50, 200);
 

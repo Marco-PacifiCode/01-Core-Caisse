@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { UUID_RE } from "@/lib/gift-card";
 import { serializeGiftCardOrder } from "@/lib/gift-card-order";
 import { getGiftCardOrder } from "@/lib/gift-card-orders-db";
@@ -23,6 +24,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   if (!tenantId || !UUID_RE.test(tenantId)) {
     return NextResponse.json({ ok: false, error: "tenantId requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   if (!UUID_RE.test(id)) return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
 
   const order = await getGiftCardOrder(tenantId, id);

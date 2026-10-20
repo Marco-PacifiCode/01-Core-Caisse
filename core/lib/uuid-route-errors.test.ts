@@ -39,7 +39,7 @@ function route(file: string, calls: { compta: number; repair: number }) {
   const response = { NextResponse: { json: (body: unknown, init?: { status?: number }) => ({ status: init?.status ?? 200, body }) } };
   return load(file, {
     "next/server": response,
-    "@/lib/service-auth": { hasServiceKey: () => true },
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null },
     "@/lib/cash-day-guard": guard,
     "@/lib/cash-day-projection": projection,
     "@/lib/log": { log: { info() {} } },

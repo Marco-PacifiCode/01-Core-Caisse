@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { listerPostes, modifierPoste } from "@/lib/postes";
 
 export const dynamic = "force-dynamic";
@@ -14,6 +15,7 @@ export async function GET(req: NextRequest) {
   if (!hasServiceKey(req)) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const tenantId = new URL(req.url).searchParams.get("tenantId")?.trim();
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   return NextResponse.json(await listerPostes(tenantId));
 }
 
@@ -34,6 +36,7 @@ export async function PATCH(req: NextRequest) {
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   const posteId = typeof body.posteId === "string" ? body.posteId.trim() : "";
   if (!tenantId || !posteId) return NextResponse.json({ error: "tenantId et posteId sont requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   if (body.libelle !== undefined && body.libelle !== null && typeof body.libelle !== "string") {
     return NextResponse.json({ error: "libelle invalide" }, { status: 400 });
   }

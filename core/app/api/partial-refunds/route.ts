@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { withTenant } from "@/lib/tenant";
 import { listRefunds, parseRefundRange } from "@/lib/partial-refund-list";
 
@@ -14,6 +15,7 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const tenantId = searchParams.get("tenantId");
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   const range = parseRefundRange(searchParams.get("from"), searchParams.get("to"));
   if ("error" in range) return NextResponse.json({ error: range.error }, { status: 400 });
   const rows = await withTenant(tenantId, (tx) => tx.partialRefund.findMany({

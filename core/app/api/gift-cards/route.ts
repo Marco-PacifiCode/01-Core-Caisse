@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { createGiftCardWithoutSale, listGiftCards } from "@/lib/caisse";
 import { normalizeCode } from "@/lib/gift-card";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -29,6 +30,7 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const tenantId = (url.searchParams.get("tenantId") ?? "").trim();
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const rawCode = url.searchParams.get("code");
   const code = rawCode ? normalizeCode(rawCode) : undefined;
@@ -83,6 +85,7 @@ export async function POST(req: NextRequest) {
 
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   let result;
   try {
