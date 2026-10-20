@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { recordCashMovement } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
 import {
@@ -46,6 +47,7 @@ export async function POST(req: NextRequest) {
 
   const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   if (!isCashMovementKind(body.kind)) {
     return NextResponse.json({ error: "kind invalide (REFUND | CASH_OUT | CASH_IN)" }, { status: 400 });

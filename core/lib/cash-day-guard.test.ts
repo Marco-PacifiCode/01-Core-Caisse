@@ -44,7 +44,7 @@ function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "oth
   const imports = {
     "@/lib/cash-day-guard": guard,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
-    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/caisse": native,
+    "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": native,
     "@/lib/log": { log: { info() {} } }, "@/lib/postes": { noterPosteHorsLigne: async () => {} },
     "@/lib/tenant": {}, "@/lib/serialize": { xpf: Number }, "@/lib/partial-refund": refundPolicy,
     "@/lib/cash-day-projection": projection, "@/lib/credit": credit,

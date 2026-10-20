@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { checkoutSale, type PaymentInput } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
 import { parseDueAt } from "@/lib/credit";
@@ -80,6 +81,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { tenantId, payments } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const parsed: PaymentInput[] = [];
   for (const p of payments ?? []) {

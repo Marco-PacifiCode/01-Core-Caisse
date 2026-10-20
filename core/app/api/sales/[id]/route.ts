@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { withTenant } from "@/lib/tenant";
 import { xpf } from "@/lib/serialize";
 import { netLineTotals } from "@/lib/partial-refund";
@@ -21,6 +22,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const { searchParams } = new URL(req.url);
   const tenantId = searchParams.get("tenantId");
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const sale = await withTenant(tenantId, (tx) =>
     tx.sale.findFirst({

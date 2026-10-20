@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { rembourserPartiellement } from "@/lib/caisse";
 import { validRefundInput } from "@/lib/partial-refund";
 import { CashContractError } from "@/lib/cash-day-projection";
@@ -18,6 +19,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (typeof tenantId !== "string" || !uuid.test(tenantId) || !uuid.test(id) || !validRefundInput(body)) {
     return NextResponse.json({ error: "INVALID_REFUND_INPUT" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   if (await cashDayGuard(tenantId, { saleId: id, refundCashDayId: body.cashDayId })) return NextResponse.json(CASHDAY_ROUTE_REQUIRED, { status: 409 });
 
   // tenantId n'appartient pas à l'empreinte métier ni au JSON de réservation.

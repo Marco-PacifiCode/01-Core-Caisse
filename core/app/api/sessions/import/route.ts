@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { importerCloture } from "@/lib/caisse";
 import { noterPosteHorsLigne } from "@/lib/postes";
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
@@ -52,6 +53,7 @@ export async function POST(req: NextRequest) {
   if (!tenantId || !openedBy) {
     return NextResponse.json({ error: "tenantId et openedBy sont requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   let result;
   try {

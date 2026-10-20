@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { annulerVente } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
 
@@ -31,6 +32,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { tenantId, reason } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const headerActionId = req.headers.get("Idempotency-Key") ?? undefined;
   if (body.actionId !== undefined && (typeof body.actionId !== "string" || body.actionId.length === 0)) {

@@ -1,6 +1,7 @@
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { closeSession } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
 
@@ -28,6 +29,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!tenantId || !closedBy || closingCountedXpf === undefined || closingCountedXpf === null) {
     return NextResponse.json({ error: "tenantId, closedBy et closingCountedXpf sont requis" }, { status: 400 });
   }
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   let result;
   try {

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { listLoyaltyAccounts } from "@/lib/caisse";
 import { CashContractError } from "@/lib/cash-day-projection";
 
@@ -23,6 +24,7 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const tenantId = (url.searchParams.get("tenantId") ?? "").trim();
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
 
   const raw = (url.searchParams.get("clientFicheId") ?? "").trim();
   if (!raw) return NextResponse.json({ error: "clientFicheId requis" }, { status: 400 });

@@ -1,11 +1,17 @@
-import { NextRequest } from "next/server";
+import type { NextRequest } from "next/server";
+import { cleHistoriqueAcceptee, egalTempsConstant, entrerAppel, identifierCle } from "./cles-service.ts";
 
-/**
- * Authentification service-to-service : header X-Core-Key == CORE_CAISSE_API_KEY.
- * Renvoie true si la clé est valide. Même contrat que Core-Compta (COMPTA_API_KEY)
- * et Core-Stock (CORE_STOCK_API_KEY).
- */
+/** Authentification S2S nominative ou historique par en-tête X-Core-Key. */
 export function hasServiceKey(req: NextRequest): boolean {
   const apiKey = req.headers.get("x-core-key");
-  return !!apiKey && apiKey === process.env.CORE_CAISSE_API_KEY;
+  if (!apiKey) return false;
+  const appelant = identifierCle(apiKey);
+  if (appelant) {
+    entrerAppel(req, appelant);
+    return true;
+  }
+  const attendue = process.env.CORE_CAISSE_API_KEY;
+  if (!attendue || !egalTempsConstant(apiKey, attendue) || !cleHistoriqueAcceptee()) return false;
+  entrerAppel(req, null);
+  return true;
 }

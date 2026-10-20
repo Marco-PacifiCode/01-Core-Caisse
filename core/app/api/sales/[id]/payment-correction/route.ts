@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hasServiceKey } from "@/lib/service-auth";
+import { horsPortee } from "@/lib/cles-service";
 import { corrigerMoyenPaiement } from "@/lib/caisse";
 import { log } from "@/lib/log";
 import { cashDayGuard, CASHDAY_ROUTE_REQUIRED } from "@/lib/cash-day-guard";
@@ -46,6 +47,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const { tenantId, fromMethod, toMethod, amountXpf, correctedBy, correctedByName, reason } = body;
   if (!tenantId) return NextResponse.json({ error: "tenantId requis" }, { status: 400 });
+  const refus = horsPortee(req, tenantId); if (refus) return refus;
   if (!fromMethod || !toMethod) {
     return NextResponse.json({ error: "fromMethod et toMethod requis" }, { status: 400 });
   }
