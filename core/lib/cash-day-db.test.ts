@@ -510,6 +510,31 @@ test("huitième relecture : clôture refusée pendant Compta, rejeu de l'avoir 1
   assert.deepEqual(await finance.dayFinancial(day.id, sale.id, "partial-refund", b), replay);
 });
 
+for (const [error, state] of [["STOCK_DECREMENTED", "CONFLICT"], ["SYNC_IN_PROGRESS", "PENDING"],
+  ["PARTIAL_REFUND_EXISTS", "CONFLICT"], ["ACTION_ID_CONFLICT", "CONFLICT"], ["SALE_NOT_FOUND", "REJECTED"],
+  ["CREDIT_NOTE_FAILED", "PENDING"], ["VOID_RETRY_INVOICE_CHANGED", "PENDING"], ["VOID_RETRY_STATUS_CHANGED", "PENDING"]]) {
+  test(`dayFinancial : ${error} conserve ${state} et respecte le rejeu`, async () => {
+    const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
+    const day = f.rows("cashDay")[0];
+    const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, status: "PAID" } });
+    let calls = 0;
+    const refusal = { ok: false, error };
+    const finance = load("cash-day-finance.ts", { "./caisse": { annulerVente: async () => { calls++; return refusal; } },
+      "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-ledger": f.ledger,
+      "./cash-day-projection": projection, "./partial-refund": refundPolicy });
+    const b = input({ actionId: actor, entityKey: sale.id, reason: "Refus synthetique" });
+    assert.equal(await finance.dayFinancial(day.id, sale.id, "void", b), refusal);
+    const action = f.rows("caisseSyncAction")[0];
+    assert.equal(action.state, state);
+    // deepEqual, pas JSON.stringify : la reponse memorisee revient de la base avec ses cles
+    // reordonnees, et une comparaison de chaines echouerait sur l ordre seul.
+    if (state !== "PENDING") assert.deepEqual(action.response, refusal);
+    assert.deepEqual(await finance.dayFinancial(day.id, sale.id, "void", b), refusal);
+    assert.equal(calls, state === "PENDING" ? 2 : 1);
+    assert.equal(f.rows("caisseSyncAction")[0].state, state);
+  });
+}
+
 test("huitième relecture : ancienne réservation sur jour clos, refus explicite sans CONFLICT", async () => {
   const f = fixture(); await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input()));
   const day = f.rows("cashDay")[0];
