@@ -134,3 +134,20 @@ test("négatif réservé au couple équilibré de PAYMENT_CORRECTION", () => {
     { saleRef: "s", payments: [{ method: "CARD", amountXpf: "1000" }, payments[0]] },
   ]) assert.throws(() => factDelta("PAYMENT_CORRECTION", invalid));
 });
+
+test("OFFLINE : vente connue du même jour séquencée après cutoff incluse dans les totaux de clôture", () => {
+  // ÉCHOUE AUJOURD'HUI — défaut A (Mixy Truck, 2026-10-21), la décision sur le rapport figé appartient à Marco.
+  const c = closure({ closureMode: "OFFLINE", cutoffRevision: 1n,
+    legacySnapshot: { knownSourceRefs: ["SALE_PAID:a", "SALE_PAID:b"] } });
+  const out = project([sale(1, "a", 10000), sale(2, "b", 2000, 0, 0, "B")], [c]);
+  assert.equal(out.totauxCloture.totalSalesXpf, 12000n);
+});
+
+test("avoir carte 200 inclus dans le total des remboursements de clôture sans effet tiroir", () => {
+  // ÉCHOUE AUJOURD'HUI — défaut B (Mixy Truck, 2026-10-21), la décision sur le rapport figé appartient à Marco.
+  const facts = [sale(1, "refund-card", 0, 1000),
+    fact(2, "PARTIAL_REFUND_DONE", "refund-card-action", { payments: [{ method: "CARD", amountXpf: "200" }] })];
+  const out = project(facts, [closure({ cutoffRevision: 2n, countedXpf: 25000n, baselineExpectedXpf: 25000n })]);
+  assert.equal(out.totauxCloture.expectedXpf, 25000n);
+  assert.equal(out.totauxCloture.refundsXpf, 200n);
+});
