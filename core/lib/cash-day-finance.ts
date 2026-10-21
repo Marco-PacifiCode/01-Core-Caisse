@@ -26,18 +26,22 @@ export async function dayFinancial(cashDayId: string, saleId: string, operation:
     if (e instanceof CashContractError) {
       // Ancienne réservation sur jour clos : refus explicite, clé conservée rejouable.
       if (e.message === "REFUND_DAY_CLOSED_REOPEN_REQUIRED") return { ok: false, error: e.message, status: e.status, data: e.data };
-      const completed = await withTenant(b.tenantId, async tx => {
-        // Un appel concurrent de la même clé peut avoir terminé entre-temps.
-        const action = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: b.actionId } });
-        if (action?.state === "ACK") return action.response;
-        await tx.caisseSyncAction.updateMany({ where: { tenantId: b.tenantId, actionId: b.actionId, state: "PENDING" },
-          data: { state: e.status === 409 ? "CONFLICT" : "REJECTED", response: jsonValue({ ok: false, error: e.message, status: e.status, data: e.data }) as Prisma.InputJsonValue } });
-        return null;
-      });
+      const completed = await rememberFinancialRefusal(b, e.status === 409 ? "CONFLICT" : "REJECTED",
+        { ok: false, error: e.message, status: e.status, data: e.data });
       if (completed) return completed;
     }
     throw e;
   }
+}
+async function rememberFinancialRefusal(b: ActionInput, state: "CONFLICT" | "REJECTED", response: unknown) {
+  return withTenant(b.tenantId, async tx => {
+    // Un appel concurrent de la même clé peut avoir terminé entre-temps.
+    const action = await tx.caisseSyncAction.findFirst({ where: { tenantId: b.tenantId, actionId: b.actionId } });
+    if (action?.state === "ACK") return action.response;
+    await tx.caisseSyncAction.updateMany({ where: { tenantId: b.tenantId, actionId: b.actionId, state: "PENDING" },
+      data: { state, response: jsonValue(response) as Prisma.InputJsonValue } });
+    return null;
+  });
 }
 async function applyDayFinancial(cashDayId: string, saleId: string, operation: string, b: ActionInput) {
   // Revalidation après réservation, avant tout appel Compta/Stock.
@@ -90,7 +94,12 @@ async function applyDayFinancial(cashDayId: string, saleId: string, operation: s
     requireCash(validRefundInput(input));
     result = await rembourserPartiellement(b.tenantId, saleId, input);
   }
-  if (!result.ok) return result;
+  if (!result.ok) {
+    const state = result.error === "SALE_NOT_FOUND" ? "REJECTED"
+      : ["STOCK_DECREMENTED", "PARTIAL_REFUND_EXISTS", "ACTION_ID_CONFLICT"].includes(result.error as string) ? "CONFLICT" : null;
+    if (state) await rememberFinancialRefusal(b, state, { ok: false, error: result.error });
+    return result;
+  }
   // PAID/VOID/DONE déjà connus (notamment perte d'accusé sur un ancien chemin) :
   // aucun nouvel effet, l'ACK manquant est complété sous le même verrou.
   return withTenant(b.tenantId, async tx => {
