@@ -19,7 +19,7 @@
 //   Ed25519. Deux entrées = rotation en cours.
 // Contrôles ajoutés à l'étape 2 :
 //   1. L'en-tête typ doit être JWT, avec l'algorithme EdDSA.
-//   2. fs, si présent, doit être numérique et non dépassé au-delà de la tolérance.
+//   2. fs, si présent, doit être un nombre fini et non dépassé au-delà de la tolérance.
 //   3. Une clé cabinet sans AUTH_SECRET_CABINET non vide est ignorée et signalée.
 //   4. Une coordonnée x commune aux deux listes reste seulement dans le lot commun.
 //   5. Une clé cabinet n'accepte que les jetons dont tk vaut cabinet.
@@ -162,7 +162,8 @@ export async function verifierSessionJws(
         clockTolerance: TOLERANCE_HORLOGE_S,
       });
       if (payload.fs !== undefined && (
-        typeof payload.fs !== "number" || Math.floor(Date.now() / 1000) > payload.fs + TOLERANCE_HORLOGE_S
+        typeof payload.fs !== "number" || !Number.isFinite(payload.fs) ||
+        Math.floor(Date.now() / 1000) > payload.fs + TOLERANCE_HORLOGE_S
       )) continue;
       if (c.type === "cabinet" && payload.tk !== "cabinet") continue;
       return { payload: payload as Record<string, unknown>, type: c.type };
