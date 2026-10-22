@@ -138,3 +138,14 @@ test("LOT : le chemin historique est INCHANGÉ quand `sourceIds` est absent", ()
   assert.match(body, /const enLot = idsBruts\.length > 0/);
   assert.match(body, /sourceType && sourceId\s*\n?\s*\?\s*\{ sourceType, sourceId \}/);
 });
+
+test("ARTICLES : le rendu expose `lines` (libellé, quantité, montants en xpf, taux TGC)", () => {
+  // 2026-10-22 : un appareil qui n'a pas encaissé lui-même (PC du gérant) affichait au tableau
+  // de bord « TGC 0 F, détail de 0 ticket sur 19 » : la liste ne rendait pas les articles.
+  const body = getBody();
+  assert.match(body, /lines:\s*\{\s*select:\s*\{[^}]*label: true[^}]*tgcRatePpm: true/);
+  assert.match(body, /lines:\s*s\.lines\.map\(/);
+  // Montants BigInt : sans `xpf()`, NextResponse.json lève et la route rend 500.
+  assert.match(body, /unitXpf:\s*xpf\(l\.unitXpf\)/);
+  assert.match(body, /lineXpf:\s*xpf\(l\.lineXpf\)/);
+});

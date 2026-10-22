@@ -223,7 +223,10 @@ export async function GET(req: NextRequest) {
           ? { createdAt: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } }
           : {}),
       },
-      include: { payments: { select: { method: true, amountXpf: true } } },
+      include: {
+        payments: { select: { method: true, amountXpf: true } },
+        lines: { select: { kind: true, label: true, qty: true, unitXpf: true, lineXpf: true, tgcRatePpm: true }, orderBy: { createdAt: "asc" } },
+      },
       orderBy: { createdAt: "desc" },
       take,
     }),
@@ -260,6 +263,11 @@ export async function GET(req: NextRequest) {
       // `NextResponse.json` (« Do not know how to serialize a BigInt ») et la route rend
       // 500 — le journal de caisse deviendrait vide, sans message.
       payments: s.payments.map((p) => ({ method: p.method, amountXpf: xpf(p.amountXpf) })),
+      // ARTICLES DE LA VENTE — ajoutés le 2026-10-22 (PC Rôtisserie : tableau de bord à « TGC 0 F,
+      // détail de 0 ticket sur 19 » sur un appareil qui n'a pas encaissé lui-même). Même principe que
+      // `payments` : purement additif, une seule requête de plus pour toute la page (pas de N+1),
+      // `xpf()` obligatoire sur les montants BigInt.
+      lines: s.lines.map((l) => ({ kind: l.kind, label: l.label, qty: l.qty, unitXpf: xpf(l.unitXpf), lineXpf: xpf(l.lineXpf), tgcRatePpm: l.tgcRatePpm })),
       createdAt: s.createdAt,
       paidAt: s.paidAt,
     })),
