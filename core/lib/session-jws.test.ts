@@ -4,7 +4,7 @@
 // et le chemin du module (« ./session-jws » ou « ./session-jws.ts »). Rien d'autre ne change.
 import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { CompactSign, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { decode, encode, type JWT, type JWTDecodeParams, type JWTEncodeParams } from "next-auth/jwt";
 import {
   AUDIENCE_SESSION,
@@ -241,7 +241,7 @@ describe("étape 2 : contrôles ajoutés", () => {
     }
   });
 
-  it("fs : passé de 60 s refusé, passé de 5 s ou futur accepté, non numérique refusé", async () => {
+  it("fs : passé de 60 s refusé, passé de 5 s ou futur accepté, non numérique ou infini refusé", async () => {
     const { x, privee } = await paireFactice();
     const maintenant = Math.floor(Date.now() / 1000);
     for (const [fs, accepte] of [[maintenant - 60, false], [maintenant - 5, true], [maintenant + 60, true], ["x", false]] as const) {
@@ -249,6 +249,12 @@ describe("étape 2 : contrôles ajoutés", () => {
       assert.equal((await verifierSessionJws(jws, { AUTH_PUBLIC_KEY: x }))?.type ?? null, accepte ? "commun" : null);
       journalPropre(x, jws);
     }
+    // fs: 1e400 se lit Infinity en JSON : refusé (SignJWT ne sait pas l'écrire, on signe le texte brut).
+    const brut = `{"sub":"u1","iss":"${EMETTEUR_SESSION}","aud":"${AUDIENCE_SESSION}","exp":${maintenant + 3600},"fs":1e400}`;
+    const infini = await new CompactSign(new TextEncoder().encode(brut))
+      .setProtectedHeader({ alg: "EdDSA", typ: "JWT" })
+      .sign(privee);
+    assert.equal(await verifierSessionJws(infini, { AUTH_PUBLIC_KEY: x }), null);
   });
 
   it("clé cabinet seule : ignorée, repli inchangé et journal sans valeur", async () => {
