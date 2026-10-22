@@ -9,7 +9,9 @@ import { decode, encode, type JWT, type JWTDecodeParams, type JWTEncodeParams } 
 import {
   AUDIENCE_SESSION,
   EMETTEUR_SESSION,
+  TOLERANCE_HORLOGE_S,
   __pourTests,
+  clesPubliquesPosees,
   decodeurAvecRepli,
   encodeurAvecRepli,
   noterChemin,
@@ -36,10 +38,10 @@ async function paireFactice(): Promise<{ x: string; privee: ClePrivee }> {
   return { x: x as string, privee: privateKey };
 }
 
-type Options = { iss?: string | null; aud?: string | null; exp?: number | string | null };
+type Options = { iss?: string | null; aud?: string | null; exp?: number | string | null; typ?: string | null };
 async function signer(privee: ClePrivee, claims: Record<string, unknown> = {}, o: Options = {}): Promise<string> {
   let j = new SignJWT({ sub: "u1", tenantId: "t1", role: "ADMIN", ...claims })
-    .setProtectedHeader({ alg: "EdDSA", typ: "JWT" })
+    .setProtectedHeader({ alg: "EdDSA", ...(o.typ === null ? {} : { typ: o.typ ?? "JWT" }) })
     .setIssuedAt();
   if (o.iss !== null) j = j.setIssuer(o.iss ?? EMETTEUR_SESSION);
   if (o.aud !== null) j = j.setAudience(o.aud ?? AUDIENCE_SESSION);
@@ -89,6 +91,21 @@ describe("sans clé publique posée : exactement le comportement d'aujourd'hui",
       assert.equal(repli.appels.at(-1)?.[0], p);
     }
     assert.equal(repli.appels.length, 3);
+    assert.deepEqual(journal, []);
+  });
+
+  it("régime cabinet posé (AUTH_SECRET_CABINET), sans clé publique : idem, aucun contrôle ajouté", async () => {
+    const { privee } = await paireFactice();
+    const env = { AUTH_SECRET: SECRET_FACTICE, AUTH_SECRET_CABINET: AUTRE_SECRET_FACTICE };
+    const rendu = { sub: "legacy", tk: "cabinet", fs: 1 };
+    const repli = espion<[Dec], Promise<object>>(async () => rendu);
+    const dec = decodeurAvecRepli(repli, () => env);
+    for (const token of [await signer(privee, { tk: "cabinet", fs: 1 }), "a.b.c.d.e"]) {
+      const p = params(token);
+      assert.equal(await dec(p), rendu);
+      assert.equal(repli.appels.at(-1)?.[0], p);
+    }
+    assert.equal(await verifierSessionJws(await signer(privee), env), null);
     assert.deepEqual(journal, []);
   });
 
@@ -204,15 +221,88 @@ describe("avec AUTH_PUBLIC_KEY : la clé publique d'abord", () => {
   });
 });
 
+describe("étape 2 : contrôles ajoutés", () => {
+  it("typ : absent ou at+jwt refusé, JWT accepté", async () => {
+    const { x, privee } = await paireFactice();
+    for (const typ of [null, "at+jwt", "JWT"]) {
+      const jws = await signer(privee, {}, { typ });
+      assert.equal((await verifierSessionJws(jws, { AUTH_PUBLIC_KEY: x }))?.type ?? null, typ === "JWT" ? "commun" : null);
+      journalPropre(x, jws);
+    }
+  });
+
+  it("exp : expiré depuis 10 s accepté, depuis 20 s refusé", async () => {
+    const { x, privee } = await paireFactice();
+    const maintenant = Math.floor(Date.now() / 1000);
+    assert.equal(TOLERANCE_HORLOGE_S, 15);
+    for (const retard of [10, 20]) {
+      const jws = await signer(privee, {}, { exp: maintenant - retard });
+      assert.equal((await verifierSessionJws(jws, { AUTH_PUBLIC_KEY: x }))?.type ?? null, retard === 10 ? "commun" : null);
+    }
+  });
+
+  it("fs : passé de 60 s refusé, passé de 5 s ou futur accepté, non numérique refusé", async () => {
+    const { x, privee } = await paireFactice();
+    const maintenant = Math.floor(Date.now() / 1000);
+    for (const [fs, accepte] of [[maintenant - 60, false], [maintenant - 5, true], [maintenant + 60, true], ["x", false]] as const) {
+      const jws = await signer(privee, { fs }, { exp: maintenant + 3600 });
+      assert.equal((await verifierSessionJws(jws, { AUTH_PUBLIC_KEY: x }))?.type ?? null, accepte ? "commun" : null);
+      journalPropre(x, jws);
+    }
+  });
+
+  it("clé cabinet seule : ignorée, repli inchangé et journal sans valeur", async () => {
+    const { x, privee } = await paireFactice();
+    const jws = await signer(privee, { tk: "cabinet" });
+    for (const AUTH_SECRET_CABINET of [undefined, ""]) {
+      const env = { AUTH_PUBLIC_KEY_CABINET: x, AUTH_SECRET_CABINET };
+      assert.equal(regimeCabinetPose(env), false);
+      assert.equal(clesPubliquesPosees(env), false);
+      const rendu = { sub: "legacy" };
+      const repli = espion<[Dec], Promise<object>>(async () => rendu);
+      const p = params(jws);
+      assert.equal(await decodeurAvecRepli(repli, () => env)(p), rendu);
+      assert.deepEqual(repli.appels, [[p]]);
+      assert.equal(await verifierSessionJws(jws, env), null);
+      const enc = espion<[Enc], Promise<string>>(async () => "jwe-d-aujourd-hui");
+      const pe = { token: rendu, salt: SEL, secret: SECRET_FACTICE };
+      assert.equal(await encodeurAvecRepli(enc)(pe), "jwe-d-aujourd-hui");
+      assert.equal(enc.appels[0][0], pe);
+    }
+    assert.deepEqual(journal, ["[auth-jws] chemin=cle-cabinet-sans-secret n=1"]);
+    journalPropre(x, jws, SECRET_FACTICE);
+  });
+
+  it("clé cabinet avec secret : tk cabinet requis", async () => {
+    const { x, privee } = await paireFactice();
+    const env = { AUTH_PUBLIC_KEY_CABINET: x, AUTH_SECRET_CABINET: SECRET_FACTICE };
+    for (const claims of [{ tk: "cabinet" }, {}, { tk: "salon" }]) {
+      const jws = await signer(privee, claims);
+      assert.equal((await verifierSessionJws(jws, env))?.type ?? null, claims.tk === "cabinet" ? "cabinet" : null);
+      journalPropre(x, jws, SECRET_FACTICE);
+    }
+    assert.ok(journal.includes("[auth-jws] chemin=jws-refuse n=1"));
+  });
+
+  it("doublon : même x conservé en commun et signalé", async () => {
+    const { x, privee } = await paireFactice();
+    const env = { AUTH_PUBLIC_KEY: x, AUTH_PUBLIC_KEY_CABINET: x, AUTH_SECRET_CABINET: SECRET_FACTICE };
+    const jws = await signer(privee, { tk: "cabinet" });
+    assert.equal((await verifierSessionJws(jws, env))?.type, "commun");
+    assert.ok(journal.includes("[auth-jws] chemin=cle-doublon n=1"));
+    journalPropre(x, jws, SECRET_FACTICE);
+  });
+});
+
 describe("cabinet", () => {
   it("la clé cabinet donne le type cabinet, la clé commune le type commun", async () => {
     const commun = await paireFactice();
     const cabinet = await paireFactice();
-    const env = { AUTH_PUBLIC_KEY: commun.x, AUTH_PUBLIC_KEY_CABINET: cabinet.x };
-    assert.equal((await verifierSessionJws(await signer(cabinet.privee), env))?.type, "cabinet");
+    const env = { AUTH_PUBLIC_KEY: commun.x, AUTH_PUBLIC_KEY_CABINET: cabinet.x, AUTH_SECRET_CABINET: SECRET_FACTICE };
+    assert.equal((await verifierSessionJws(await signer(cabinet.privee, { tk: "cabinet" }), env))?.type, "cabinet");
     assert.equal((await verifierSessionJws(await signer(commun.privee), env))?.type, "commun");
     const dec = decodeurAvecRepli<Dec, object>(async () => null, () => env);
-    await dec(params(await signer(cabinet.privee)));
+    await dec(params(await signer(cabinet.privee, { tk: "cabinet" })));
     assert.deepEqual(journal, ["[auth-jws] chemin=publique-cabinet n=1"]);
   });
 
@@ -222,10 +312,10 @@ describe("cabinet", () => {
     assert.equal(await verifierSessionJws(await signer(cabinet.privee), { AUTH_PUBLIC_KEY: commun.x }), null);
   });
 
-  it("régime cabinet : secret OU clé publique cabinet", () => {
+  it("régime cabinet : secret cabinet non vide requis", () => {
     assert.equal(regimeCabinetPose({}), false);
-    assert.equal(regimeCabinetPose({ AUTH_SECRET_CABINET: "s" }), true);
-    assert.equal(regimeCabinetPose({ AUTH_PUBLIC_KEY_CABINET: "x" }), true);
+    assert.equal(regimeCabinetPose({ AUTH_SECRET_CABINET: SECRET_FACTICE }), true);
+    assert.equal(regimeCabinetPose({ AUTH_PUBLIC_KEY_CABINET: "x" }), false);
     assert.equal(regimeCabinetPose({ AUTH_PUBLIC_KEY: "x" }), false);
   });
 });
