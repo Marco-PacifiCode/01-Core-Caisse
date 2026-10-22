@@ -108,7 +108,7 @@ function totals(facts: DayFact[], fond: bigint) {
   const voided = new Set(facts.filter(f => f.kind === "SALE_VOID" || f.kind === "LOCAL_VOID").map(f => String(object(f.snapshot).saleRef ?? f.sourceRef)));
   const byMethod: Record<string, bigint> = {};
   const parTaux: Record<string, { ttcXpf: bigint; htXpf: bigint; tgcXpf: bigint }> = {};
-  let cash = 0n, refunds = 0n, movements = 0n, totalSales = 0n, gift = 0n, giftCount = 0;
+  let cash = 0n, refunds = 0n, refundsAllXpf = 0n, movements = 0n, totalSales = 0n, gift = 0n, giftCount = 0;
   let salesCount = 0, cashInXpf = 0n, cashOutXpf = 0n, movementRefundsXpf = 0n;
   for (const f of facts) {
     requireCash(factDelta(f.kind, f.snapshot) === f.cashDeltaXpf, "CORRUPT_CASH_FACT", 409);
@@ -124,7 +124,12 @@ function totals(facts: DayFact[], fond: bigint) {
         row.ttcXpf += BigInt(t.ttcXpf); row.htXpf += BigInt(t.htXpf); row.tgcXpf += BigInt(t.tgcXpf);
       }
     }
-    if (f.kind === "PARTIAL_REFUND_DONE") refunds -= f.cashDeltaXpf;
+    if (f.kind === "PARTIAL_REFUND_DONE") {
+      // Le tiroir ne voit que la part espèces ; le total des remboursements compte tous les moyens
+      // (avoir carte, virement…), sinon le Z les ignore (PC-0240, défaut B).
+      refunds -= f.cashDeltaXpf;
+      refundsAllXpf += Object.values(paymentParts(s.payments)).reduce((n, p) => n + p, 0n);
+    }
     if (f.kind === "PAYMENT_CORRECTION" && !voided.has(String(s.saleRef))) {
       const parts = paymentParts(s.payments, true);
       for (const [k, n] of Object.entries(parts)) byMethod[k] = (byMethod[k] ?? 0n) + n;
@@ -139,7 +144,7 @@ function totals(facts: DayFact[], fond: bigint) {
     if (f.kind === "GIFT_CARD_REDEEMED") { gift += xpfInteger(s.amountXpf); giftCount++; }
   }
   return { cashXpf: cash, refundCashXpf: refunds, movementNetXpf: movements, expectedXpf: fond + cash - refunds + movements,
-    salesCount, cashInXpf, cashOutXpf, refundsXpf: refunds + movementRefundsXpf,
+    salesCount, cashInXpf, cashOutXpf, refundsXpf: refundsAllXpf + movementRefundsXpf,
     totalSalesXpf: totalSales, byMethod, parTaux, cancelledCount: voided.size, giftCardRedeemedCount: giftCount, giftCardRedeemedXpf: gift };
 }
 export function projectCashDay(input: {
@@ -158,9 +163,12 @@ export function projectCashDay(input: {
   const current = totals(facts, input.fond);
   const known = closure && closure.closureMode !== "ONLINE" ? object(closure.legacySnapshot ?? {}).knownSourceRefs : null;
   const knownSet = Array.isArray(known) ? new Set(known) : null;
-  const atCutoff = closure ? facts.filter(f => f.sequence <= closure.cutoffRevision && (!knownSet || knownSet.has(`${f.kind}:${f.sourceRef}`))) : facts;
+  // Clôture hors ligne : ce que l'appareil connaissait en clôturant compte, même séquencé après le
+  // cutoff parce que synchronisé plus tard (PC-0240, défaut A). En ligne : le cutoff fait foi.
+  const dansCloture = (f: DayFact) => !!closure && (knownSet ? knownSet.has(`${f.kind}:${f.sourceRef}`) : f.sequence <= closure.cutoffRevision);
+  const atCutoff = closure ? facts.filter(dansCloture) : facts;
   const baseline = closure?.baselineExpectedXpf ?? current.expectedXpf;
-  const late = closure ? facts.filter(f => f.sequence > closure.cutoffRevision || !!knownSet && !knownSet.has(`${f.kind}:${f.sourceRef}`))
+  const late = closure ? facts.filter(f => !dansCloture(f))
     .filter(f => !["OPENING", "REOPEN", "CLOSURE"].includes(f.kind)) : [];
   const last = late.reduce<Date | null>((d, f) => !d || f.receivedAt > d ? f.receivedAt : d, null);
   const ecartCloture = closure ? closure.countedXpf - baseline : null;
