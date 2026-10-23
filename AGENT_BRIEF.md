@@ -1,5 +1,47 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🪵 2026-10-23 — AUTH_SECRET étape 1 : le journal du repli de session s'allume — ✅ FUSIONNÉ, ⛔ NON DÉPLOYÉ
+
+### État courant
+`core/lib/session-jws.ts` **journalise désormais le chemin pris par le repli même quand aucune clé
+publique n'est posée** : `[auth-jws] chemin=secret` quand l'ancien secret accepte la session,
+`chemin=refus` sinon. Avant, ce comptage était conditionné à `AUTH_PUBLIC_KEY` — donc muet, et on ne
+pouvait pas observer `chemin=secret` **non nul AVANT** la bascule, ce qui est précisément la preuve
+que l'étape 1 doit fournir.
+
+⚠️ **Le comportement de réponse n'a pas changé d'un iota** : mêmes appels au décodeur de repli, même
+valeur rendue, même exception relevée. Le format de ligne et l'agrégation 10 min sont inchangés, donc
+tout ce qui lit ces lignes continue de marcher. **Aucun cookie, jeton, identifiant de personne ni
+valeur de secret n'entre dans la ligne** : elle ne compte qu'un chemin.
+
+- Preuve rouge/vert : échecs sans le correctif, **26/26** avec. ⚠️ Le lanceur de CE dépôt est
+  `node --test --experimental-strip-types lib/session-jws.test.ts` — **pas** `vitest`, qui n'y est pas
+  installé (Core-RDV, lui, utilise vitest). Lire le `package.json` du dépôt, ne pas supposer.
+- `core/lib/session-jws.ts` est **identique à l'octet près** à la source
+  (`00-Archi-NextGen/_routine/ops/auth-jws/session-jws.ts`), `sha256 6d6468bd…` : on ne l'adapte
+  jamais sur place, on corrige la source puis on recopie.
+- 🪤 Trois tests existants du bloc « sans clé publique posée » affirmaient `deepEqual(journal, [])` et
+  gagnent maintenant une ligne. Ils ont été **complétés** (ligne ajoutée au `deepEqual`), **jamais
+  relâchés** en `includes`/`at(-1)` : un `deepEqual` complété vérifie encore l'absence de ligne
+  parasite. Si un futur report les trouve sous une forme permissive, c'est une régression.
+
+### En cours / ce qui reste
+- ⛔ **NON DÉPLOYÉ.** La livraison demande le créneau de 00-Architecture **puis** le QCM de Marco, qui
+  doit citer `jws-e2` (porté par `main`, inerte sans clé posée). La fusion sur ce dépôt a été
+  **annoncée en une ligne à 00-Architecture avant d'être faite**, puisque le moteur livre la tête de
+  `main`.
+- Le même report est fusionné sur **01-Core-RDV** (PR 188) et sur l'autre des deux Cores de ce lot.
+  Restent **core-comms** (branche seulement, après sa livraison `entree-mail-unique`) et
+  **core-location / core-rh**, dont la copie diverge de **46 lignes** non expliquées : mesurer sur un
+  `origin` frais avant tout report, jamais mécaniquement.
+- Étape 2 (bascule vers la clé publique) : c'est ce journal qui permettra de vérifier Core par Core
+  que `chemin=secret` décroît jusqu'à 0.
+
+### Dernières actions
+Run PM local du 2026-10-23 (`local-pm-20261023-160041`, identité `ng-pm (local)`) : branche
+`claude/authjws-journal-repli` poussée, preuve rouge/vert jouée, `ci-local` verte, fusion.
+Clone du poste rendu **propre sur `main`** après le run. Aucune migration, aucun geste serveur.
+
 ## 🔑 2026-10-20 — Clés de service nominatives avec portée tenant (vague 1) — ✅ LIVRÉ le 20/10, AUCUNE clé posée (code inerte)
 - **Livraison 20/10, 19 h 15** (accord de Marco par QCM : « Oui, les 3 dans l'ordre (Recommandé) », plus « Oui, stock, caisse et rdv (Recommandé) » pour `--confirm=secrets` dû à `.env.example`). `main` d8e9692 (v1 + v1d), tag `deploy/core-caisse/20261020T081541Z-d8e9692e3b16`, sans migration. Témoins core-caisse (salondemo, caissedemo : Z à écart 0) et rotisserie-surface OK. En base : vente PAID 1 200 et VOID 300 du témoin, session à écart 0. À +15 min : 0 ligne `[cles-service]`, health 200, aucun redémarrage.
 - **Correctif du 20/10 (soir)** : sous Node 20 (prod) et 22, `enterWith` déborde sur le contexte parent. Une requête sans garde (session, cron) héritait donc de l'appelant précédent. Désormais `verifierPortee(tenantId, lireCle)` compare l'empreinte de la clé de la requête en cours (`headers()` dans `withTenant`) à celle du contexte ; un contexte périmé est ignoré. Preuve sous Docker `node:20-bookworm` : les tests 10 (non-fuite) et 12 (contexte périmé) sont verts, et deviennent rouges si l'on retire la comparaison.
