@@ -80,6 +80,7 @@ export async function GET(req: NextRequest) {
       where: { tenantId, ...(status ? { status: status as never } : {}) },
       orderBy: { openedAt: "desc" },
       take: limit,
+      include: { reopens: { where: { tenantId }, orderBy: { reopenedAt: "asc" } } },
     }),
   );
 
@@ -97,6 +98,15 @@ export async function GET(req: NextRequest) {
       closingCountedXpf: xpf(s.closingCountedXpf),
       expectedXpf: xpf(s.expectedXpf),
       varianceXpf: xpf(s.varianceXpf),
+      reouvertures: s.reopens.map((r) => ({
+        closedAt: r.closedAt,
+        closedBy: r.closedBy,
+        closingCountedXpf: xpf(r.closingCountedXpf),
+        expectedXpf: xpf(r.expectedXpf),
+        varianceXpf: xpf(r.varianceXpf),
+        reopenedAt: r.reopenedAt,
+        reopenedBy: r.reopenedBy,
+      })),
     })),
   });
 }
