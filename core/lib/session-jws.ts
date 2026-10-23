@@ -1,8 +1,8 @@
 // session-jws.ts — vérification des sessions signées par Core-Auth (JWS EdDSA, Ed25519).
 //
 // Chantier AUTH_SECRET, étapes 1-2 (« double acceptation ») : la clé publique d'abord, l'ancien
-// secret partagé en repli. SANS AUTH_PUBLIC_KEY ni AUTH_PUBLIC_KEY_CABINET, ce module
-// n'intervient pas : décodage et encodage restent exactement ceux d'aujourd'hui, sans journal.
+// secret partagé en repli. SANS AUTH_PUBLIC_KEY ni AUTH_PUBLIC_KEY_CABINET, décodage et
+// encodage restent exactement ceux d'aujourd'hui ; le chemin (secret/refus) est journalisé.
 //
 // Source unique : 00-Archi-NextGen/_routine/ops/auth-jws/session-jws.ts. Chaque lecteur en garde
 // une COPIE IDENTIQUE (lib/session-jws.ts) : on ne l'adapte pas sur place, on corrige la source
@@ -214,14 +214,14 @@ export async function essayerClePublique(
   return verifie;
 }
 
-/** À appeler après le repli sur l'ancien secret : ne journalise que si une clé est posée. */
-export function noterRepli(accepte: boolean, env: Env = process.env): void {
-  if (clesPubliquesPosees(env)) noterChemin(accepte ? "secret" : "refus");
+/** À appeler après le repli sur l'ancien secret : journalise toujours, clé posée ou non. */
+export function noterRepli(accepte: boolean, _env: Env = process.env): void {
+  noterChemin(accepte ? "secret" : "refus");
 }
 
 /**
  * `jwt.decode` NextAuth : la clé publique d'abord, puis `repli` (le décodage d'aujourd'hui).
- * Sans clé publique posée, appelle `repli` tel quel, sans rien d'autre.
+ * Sans clé publique posée, appelle `repli` tel quel, en journalisant le chemin.
  */
 export function decodeurAvecRepli<P extends { token?: string }, J extends object>(
   repli: (p: P) => Promise<J | null>,
@@ -229,7 +229,17 @@ export function decodeurAvecRepli<P extends { token?: string }, J extends object
 ): (p: P) => Promise<J | null> {
   return async (p) => {
     const env = lireEnv();
-    if (!clesPubliquesPosees(env)) return repli(p);
+    if (!clesPubliquesPosees(env)) {
+      let r0: J | null;
+      try {
+        r0 = await repli(p);
+      } catch (e) {
+        noterRepli(false, env);
+        throw e;
+      }
+      noterRepli(Boolean(r0), env);
+      return r0;
+    }
     const verifie = await essayerClePublique(p.token, env);
     if (verifie) return verifie.payload as J;
     let r: J | null;
