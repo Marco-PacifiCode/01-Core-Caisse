@@ -99,6 +99,7 @@ model CashSession {
   dayAliases CashDaySession[]
   dayOpenings CashDayOpening[]
   dayClosures CashDayClosure[]
+  reopens CashSessionReopen[]
 
   @@unique([tenantId, id])
   @@index([tenantId])
@@ -739,4 +740,25 @@ model CashDayEvent {
   snapshot Json
   @@unique([tenantId, cashDayId, sequence])
   @@unique([tenantId, cashDayId, kind, sourceRef])
+}
+
+// Trace d'une fermeture de caisse ANNULÉE par réouverture (2026-10-23). Seule la dernière
+// session d'une portée peut être rouverte (lib/caisse.ts#reopenSessionTx) ; la clôture annulée
+// est figée ici telle qu'elle était, puis la session repasse OPEN.
+model CashSessionReopen {
+  id                String      @id @default(uuid()) @db.Uuid
+  tenantId          String      @db.Uuid
+  sessionId         String      @db.Uuid
+  session           CashSession @relation(fields: [sessionId], references: [id])
+  closedAt          DateTime?
+  closedBy          String?     @db.Uuid
+  closedByName      String?
+  closingCountedXpf BigInt?
+  expectedXpf       BigInt?
+  varianceXpf       BigInt?
+  reopenedAt        DateTime    @default(now())
+  reopenedBy        String?
+
+  @@index([tenantId])
+  @@index([tenantId, sessionId, reopenedAt])
 }

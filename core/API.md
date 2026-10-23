@@ -46,3 +46,29 @@ Cas de `test-pg/session-open.test.ts` :
 - (i) `paidAt` hors ligne → accepté, date conservée, nouvelle session et son Z.
 Sabotages sur copie comparée octet par octet : garde seule → (g) échoue ;
 sans garde ni rattachement → (b) échoue. Copie supprimée dans `finally`.
+
+## Réouverture de la dernière caisse fermée (2026-10-23)
+
+`POST /api/sessions/:id/reopen` (S2S, `X-Core-Key`, même portée de clé que la
+clôture). Corps `{ "tenantId": "...", "by"?: "staff/opérateur" }`.
+Autorisé seulement si la session est CLOSED, qu'elle est la plus récente
+(`openedAt`) de sa portée — même poste, ou marchand sans poste (`posteId` NULL),
+comme la garde « une seule session ouverte » — et qu'aucune session OPEN n'existe
+sur cette portée. Dès qu'une session plus récente existe, refus : les caisses
+précédentes restent figées.
+
+- 200 `{ ok: true, sessionId, reopenId }` ;
+- 404 `{ ok: false, error: "SESSION_NOT_FOUND" }` ;
+- 409 `{ ok: false, error, message }` avec `SESSION_NOT_CLOSED` (« Cette caisse
+  n'est pas fermée. »), `SESSION_ALREADY_OPEN` (« Une caisse est déjà ouverte. »),
+  `NOT_LAST_SESSION` (« Seule la dernière caisse fermée peut être rouverte. ») ;
+- 409 `CASHDAY_ROUTE_REQUIRED` sous CashDay (même garde que la clôture).
+
+Effet, dans une transaction sous RLS : la clôture annulée est copiée dans
+`CashSessionReopen`, puis la session repasse OPEN avec `closedAt`, `closedBy`,
+`closedByName`, `closingCountedXpf`, `expectedXpf`, `varianceXpf` remis à null.
+La clôture suivante (`POST /api/sessions/:id/close`) refait un Z complet.
+
+`GET /api/sessions` renvoie pour chaque session
+`reouvertures: [{ closedAt, closedBy, closingCountedXpf, expectedXpf, varianceXpf,
+reopenedAt, reopenedBy }]`, en ordre chronologique (vide si jamais rouverte).

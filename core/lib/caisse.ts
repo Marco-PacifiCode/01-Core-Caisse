@@ -392,6 +392,80 @@ export async function closeSessionTx(
     };
 }
 
+// ── Réouverture de la DERNIÈRE caisse fermée (décision Marco, 2026-10-23) ─────────────────────
+// Seule la session la plus récente de la portée (même poste, ou marchand sans poste — même portée
+// que « une seule session ouverte ») peut être rouverte, tant qu'aucune session plus récente
+// n'existe et qu'aucune n'est ouverte. Les précédentes restent figées. La fermeture annulée est
+// tracée dans `CashSessionReopen` ; la session repasse OPEN et sa prochaine clôture refait un Z
+// complet par closeSession, sans changement.
+
+export const REOPEN_MESSAGES = {
+  SESSION_NOT_CLOSED: "Cette caisse n'est pas fermée.",
+  SESSION_ALREADY_OPEN: "Une caisse est déjà ouverte.",
+  NOT_LAST_SESSION: "Seule la dernière caisse fermée peut être rouverte.",
+} as const;
+export type ReopenRefus = keyof typeof REOPEN_MESSAGES;
+
+/** Décision pure : null = réouverture autorisée. */
+export function refusReouverture(input: { status: string; newerExists: boolean; openExists: boolean }): ReopenRefus | null {
+  if (input.status !== "CLOSED") return "SESSION_NOT_CLOSED";
+  if (input.openExists) return "SESSION_ALREADY_OPEN";
+  if (input.newerExists) return "NOT_LAST_SESSION";
+  return null;
+}
+
+type ReopenResult =
+  | { ok: false; error: "SESSION_NOT_FOUND" }
+  | { ok: false; error: ReopenRefus; message: string }
+  | { ok: true; sessionId: string; reopenId: string };
+
+export async function reopenSession(tenantId: string, input: { sessionId: string; by?: string | null }): Promise<ReopenResult> {
+  tenantId = uuid(tenantId);
+  return withTenant(tenantId, async tx => {
+    await assertLegacyWriteAllowed(tx, tenantId);
+    return reopenSessionTx(tx, tenantId, input);
+  });
+}
+
+export async function reopenSessionTx(
+  tx: Prisma.TransactionClient, tenantId: string, input: { sessionId: string; by?: string | null },
+): Promise<ReopenResult> {
+  tenantId = uuid(tenantId);
+  await lockCashTenant(tx, tenantId);
+  await tx.$queryRaw`SELECT "id" FROM "CashSession" WHERE "id" = ${input.sessionId}::uuid AND "tenantId" = ${tenantId}::uuid FOR UPDATE`;
+  const session = await tx.cashSession.findFirst({ where: { id: input.sessionId, tenantId } });
+  if (!session) return { ok: false as const, error: "SESSION_NOT_FOUND" as const };
+  const posteId = session.posteId ?? null;
+  const open = await tx.cashSession.findFirst({ where: { tenantId, status: "OPEN", posteId }, select: { id: true } });
+  const newer = await tx.cashSession.findFirst({
+    where: { tenantId, posteId, id: { not: session.id }, openedAt: { gte: session.openedAt } }, select: { id: true },
+  });
+  const refus = refusReouverture({ status: session.status, newerExists: !!newer, openExists: !!open });
+  if (refus) return { ok: false as const, error: refus, message: REOPEN_MESSAGES[refus] };
+
+  const trace = await tx.cashSessionReopen.create({
+    data: {
+      tenantId,
+      sessionId: session.id,
+      closedAt: session.closedAt,
+      closedBy: session.closedBy,
+      closedByName: session.closedByName,
+      closingCountedXpf: session.closingCountedXpf,
+      expectedXpf: session.expectedXpf,
+      varianceXpf: session.varianceXpf,
+      reopenedBy: input.by ?? null,
+    },
+  });
+  await tx.cashSession.update({
+    where: { id: session.id },
+    data: {
+      status: "OPEN", closedAt: null, closedBy: null, closedByName: null,
+      closingCountedXpf: null, expectedXpf: null, varianceXpf: null,
+    },
+  });
+  return { ok: true as const, sessionId: session.id, reopenId: trace.id };
+}
+
 // ─── Import de clôture Z hors ligne (2026-08-23, Rôtisserie de Pouembout) ───
 
 export type ImporterClotureInput = ImportClotureInput & {
