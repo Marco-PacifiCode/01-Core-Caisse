@@ -78,8 +78,10 @@ const decodeNextAuth = (env: () => Record<string, string | undefined>) =>
 type Dec = { token?: string };
 type Enc = { token?: unknown; salt: string; secret: string };
 
-describe("sans clé publique posée : exactement le comportement d'aujourd'hui", () => {
-  it("decode appelle le repli avec les mêmes paramètres, rend son résultat, sans journal", async () => {
+// « comportement de RÉPONSE » et non « comportement » : depuis le 2026-10-23, cette branche
+// journalise le chemin du repli. Ce qu'elle rend, lève et appelle, lui, n'a pas bougé d'un iota.
+describe("sans clé publique posée : exactement le comportement de réponse d'aujourd'hui", () => {
+  it("decode appelle le repli avec les mêmes paramètres, rend son résultat, et journalise le chemin secret", async () => {
     const { privee } = await paireFactice();
     const jws = await signer(privee);
     const rendu = { sub: "legacy" };
@@ -91,7 +93,7 @@ describe("sans clé publique posée : exactement le comportement d'aujourd'hui",
       assert.equal(repli.appels.at(-1)?.[0], p);
     }
     assert.equal(repli.appels.length, 3);
-    assert.deepEqual(journal, []);
+    assert.deepEqual(journal, ["[auth-jws] chemin=secret n=1"]);
   });
 
   it("régime cabinet posé (AUTH_SECRET_CABINET), sans clé publique : idem, aucun contrôle ajouté", async () => {
@@ -106,7 +108,7 @@ describe("sans clé publique posée : exactement le comportement d'aujourd'hui",
       assert.equal(repli.appels.at(-1)?.[0], p);
     }
     assert.equal(await verifierSessionJws(await signer(privee), env), null);
-    assert.deepEqual(journal, []);
+    assert.deepEqual(journal, ["[auth-jws] chemin=secret n=1"]);
   });
 
   it("une exception du repli remonte telle quelle", async () => {
@@ -114,6 +116,21 @@ describe("sans clé publique posée : exactement le comportement d'aujourd'hui",
       throw new Error("panne base");
     }, () => ({}));
     await assert.rejects(dec(params("x")), /panne base/);
+  });
+
+  it("sans clé publique posée : le repli qui rend une charge utile journalise chemin=secret", async () => {
+    const rendu = { sub: "legacy" };
+    const dec = decodeurAvecRepli<Dec, object>(async () => rendu, () => ({}));
+    assert.equal(await dec(params("x")), rendu);
+    assert.deepEqual(journal, ["[auth-jws] chemin=secret n=1"]);
+    journalPropre();
+  });
+
+  it("sans clé publique posée : le repli qui rend null journalise chemin=refus", async () => {
+    const dec = decodeurAvecRepli<Dec, object>(async () => null, () => ({}));
+    assert.equal(await dec(params("x")), null);
+    assert.deepEqual(journal, ["[auth-jws] chemin=refus n=1"]);
+    journalPropre();
   });
 
   it("encode appelle le repli avec les mêmes paramètres", async () => {
@@ -275,7 +292,7 @@ describe("étape 2 : contrôles ajoutés", () => {
       assert.equal(await encodeurAvecRepli(enc)(pe), "jwe-d-aujourd-hui");
       assert.equal(enc.appels[0][0], pe);
     }
-    assert.deepEqual(journal, ["[auth-jws] chemin=cle-cabinet-sans-secret n=1"]);
+    assert.deepEqual(journal, ["[auth-jws] chemin=cle-cabinet-sans-secret n=1", "[auth-jws] chemin=secret n=1"]);
     journalPropre(x, jws, SECRET_FACTICE);
   });
 
