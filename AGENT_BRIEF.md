@@ -1,5 +1,10 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔓 2026-10-23 — Rouvrir la dernière caisse fermée (décision Marco) — ✅ EN LIGNE (cfed8cf, tag deploy/core-caisse/20261023T081027Z-cfed8cf783f0, migration additive CashSessionReopen jouée avant)
+
+- POST /api/sessions/:id/reopen : seulement la dernière session DU POSTE, aucune ouverte, aucune plus récente (« jusqu'à l'ouverture suivante ») ; 1re fermeture gardée dans CashSessionReopen (RLS) ; GET /api/sessions renvoie reouvertures. Refermer = nouveau Z. Prouvé ci-local + test:pg (session-reopen.test.ts).
+- Reste : prisma/rls.sql ne liste pas CashSessionReopen (politique posée par la migration ; l'ajouter déclenche la classe destructive → à faire avec QCM). Pas de réouverture CashDay (route propre déjà existante).
+
 ## 🪵 2026-10-23 — AUTH_SECRET étape 1 : le journal du repli de session s'allume — ✅ FUSIONNÉ, ⛔ NON DÉPLOYÉ
 
 ### État courant
