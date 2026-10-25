@@ -4,16 +4,24 @@ import { canChange, frozenLines, revisionOf } from "./cash-shared-policy";
 import { date, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 
 export async function changeSettings(tx: CashTx, b: ActionInput) {
-  const value = xpfInteger(b.defaultFloatXpf); requireCash(value <= 99999999n);
+  const hasFloat = b.defaultFloatXpf !== undefined;
+  const hasNegative = Object.prototype.hasOwnProperty.call(b, "allowNegativeStock");
+  requireCash(hasFloat || hasNegative);
+  if (hasNegative) requireCash(typeof b.allowNegativeStock === "boolean");
+  const value = hasFloat ? xpfInteger(b.defaultFloatXpf) : undefined;
+  if (value !== undefined) requireCash(value <= 99999999n);
+  const data = { ...(value !== undefined ? { defaultFloatXpf: value } : {}),
+    ...(hasNegative ? { allowNegativeStock: b.allowNegativeStock as boolean } : {}) };
   const baseRevision = revisionOf(b.baseRevision);
   const row = await tx.cashSettings.findUnique({ where: { tenantId: b.tenantId } });
-  if (row && b.importMode === true && row.defaultFloatXpf !== value) throw new CashContractError("REVISION_CONFLICT", 409, { server: row, proposal: b });
+  if (row && b.importMode === true && ((hasFloat && row.defaultFloatXpf !== value) ||
+    (hasNegative && row.allowNegativeStock !== b.allowNegativeStock))) throw new CashContractError("REVISION_CONFLICT", 409, { server: row, proposal: b });
   if (!row) {
     requireCash(baseRevision === 0, "REVISION_CONFLICT", 409);
-    return tx.cashSettings.create({ data: { tenantId: b.tenantId, defaultFloatXpf: value, revision: 1 } });
+    return tx.cashSettings.create({ data: { tenantId: b.tenantId, ...data, revision: 1 } });
   }
   const changed = await tx.cashSettings.updateMany({ where: { tenantId: b.tenantId, revision: baseRevision },
-    data: { defaultFloatXpf: value, revision: { increment: 1 } } });
+    data: { ...data, revision: { increment: 1 } } });
   requireCash(changed.count === 1, "REVISION_CONFLICT", 409);
   return tx.cashSettings.findUniqueOrThrow({ where: { tenantId: b.tenantId } });
 }

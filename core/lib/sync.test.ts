@@ -4,9 +4,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runSaleSync, type SyncSaleSnapshot, type SyncPersist } from "./sync.ts";
+import { runSaleSync, type SyncSaleSnapshot, type SyncPersist, type SyncGuard } from "./sync.ts";
 import { CoreClientError } from "./clients.ts";
-import type { ComptaClient, StockClient, CreateInvoiceResult, SettleResult, MovementResult } from "./clients.ts";
+import type { ComptaClient, StockClient, CreateInvoiceResult, SettleResult, MovementResult, MovementInput } from "./clients.ts";
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
@@ -88,14 +88,16 @@ function makeCompta(opts: { failCreate?: CoreClientError; failSettle?: CoreClien
 /** Stock fake : compte les appels ; peut échouer sur commande. */
 function makeStock(opts: { fail?: CoreClientError } = {}) {
   const calls = { recordSale: 0 };
+  const args: MovementInput[] = [];
   const client: StockClient = {
-    async recordSale(): Promise<MovementResult> {
+    async recordSale(input): Promise<MovementResult> {
       calls.recordSale++;
+      args.push(input);
       if (opts.fail) throw opts.fail;
       return { ok: true, movementId: "mv-1", productId: "prod-1", qtyOnHand: 1, alreadyExisted: false };
     },
   };
-  return { client, calls, opts };
+  return { client, calls, opts, args };
 }
 
 /** Snapshot rechargé « comme depuis la DB » après un premier passage (reprend l'état persisté). */
@@ -124,6 +126,7 @@ test("synchro complète : facture + settle + stock, état marqué convergé", as
   assert.equal(compta.calls.createInvoice, 1);
   assert.equal(compta.calls.settle, 1);
   assert.equal(stock.calls.recordSale, 1);
+  assert.equal(Object.hasOwn(stock.args[0], "allowNegative"), false);
   assert.ok(state.comptaSyncedAt);
   assert.ok(state.stockSyncedAt);
   assert.equal(state.syncError, null);
@@ -256,4 +259,36 @@ test("vente SANS crédit : dueAt absent du payload envoyé à Compta (comporteme
   await runSaleSync(sale, compta.client, stock.client, makePersist(state));
   const args = compta.createInvoiceArgs[0] as { dueAt?: string };
   assert.equal(args.dueAt, undefined);
+});
+
+test("stock négatif : option active au premier passage et au rejeu, avec et sans garde", async () => {
+  for (const guarded of [false, true]) {
+    for (const enabled of [false, true]) {
+      const state = emptyState();
+      state.invoiceId = "inv-1"; state.comptaSyncedAt = new Date();
+      const sale = makeSale({ status: "PAID", invoiceId: state.invoiceId, comptaSyncedAt: state.comptaSyncedAt });
+      const stock = makeStock({ fail: new CoreClientError("stock", "recordSale", 503, "retry", "http") });
+      const persist = makePersist(state);
+      const guard: SyncGuard = {
+        reread: async () => reload(sale, state),
+        claimSync: async () => ({ claimed: true, fresh: reload(sale, state) }),
+        completeSync: async () => { await persist.markStockSynced(); },
+        failSync: async (_claim, _phase, detail) => { await persist.recordFailure(detail); },
+        saveInvoiceRefIfLive: async () => { assert.fail("compta déjà faite"); },
+        attachOrphanInvoice: async () => { assert.fail("aucun orphelin"); },
+        attachNeutralization: async () => { assert.fail("aucune annulation"); },
+        failNeutralization: async () => { assert.fail("aucune annulation"); },
+      };
+      const run = () => runSaleSync(reload(sale, state), makeCompta().client, stock.client, persist,
+        guarded ? guard : undefined, 8000, enabled);
+      assert.equal((await run()).synced, false);
+      stock.opts.fail = undefined;
+      assert.equal((await run()).synced, true);
+      assert.equal(stock.args.length, 2);
+      for (const arg of stock.args) {
+        assert.equal(Object.hasOwn(arg, "allowNegative"), enabled);
+        if (enabled) assert.equal(arg.allowNegative, true);
+      }
+    }
+  }
 });

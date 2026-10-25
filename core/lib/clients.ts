@@ -136,6 +136,7 @@ export type MovementInput = {
   sourceType: string;
   sourceId: string;
   actorId?: string;
+  allowNegative?: boolean;
 };
 
 export type MovementResult = {
@@ -307,6 +308,7 @@ const httpStock: StockClient = {
       sourceType: input.sourceType,
       sourceId: input.sourceId,
       actorId: input.actorId,
+      ...(input.allowNegative !== undefined ? { allowNegative: input.allowNegative } : {}),
     });
     return (await res.json()) as MovementResult;
   },
@@ -427,7 +429,7 @@ const mockStock: StockClient = {
       ok: true,
       movementId: nextId("mv"),
       productId: input.productId,
-      qtyOnHand: 0,
+      qtyOnHand: input.allowNegative === true ? -input.qty : 0,
       alreadyExisted: false,
     };
     mockMovements.set(key, created);

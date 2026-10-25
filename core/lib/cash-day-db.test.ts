@@ -37,7 +37,8 @@ const tenantLock = syncForTests.lockCashTenant;
 let activeSync: Row;
 function caisseFunction(name: string, globals: Row) {
   const source = readFileSync(new URL("caisse.ts", import.meta.url), "utf8");
-  const start = source.indexOf(`export async function ${name}(`);
+  const exported = source.indexOf(`export async function ${name}(`);
+  const start = exported >= 0 ? exported : source.indexOf(`async function ${name}(`);
   assert.ok(start >= 0);
   const end = source.indexOf("\nexport ", start + 10);
   const js = ts.transpileModule(source.slice(start, end < 0 ? undefined : end).replace("export ", ""),
@@ -130,6 +131,7 @@ function fixture(enforceDayBeforeSale = false) {
           sessionId: null, posteId: null, deviceId: null, deviceName: null, ticketNumber: null, sellerId: null, sellerName: null, saleId: null, ...structuredClone(data) };
         if (name === "cashSession") Object.assign(row, { status: "OPEN", openedAt: data.openedAt ?? now, posteId: data.posteId ?? null, ...data });
         if (name === "cashDay") Object.assign(row, { scope: "rotisserie-caisse", ...data });
+        if (name === "cashSettings") Object.assign(row, { defaultFloatXpf: 25000n, allowNegativeStock: false, ...data });
         if (name === "parkedBasket") row.status = data.status ?? "WAITING";
         if (name === "pickupOrder") row.status = data.status ?? "A_PREPARER";
         if (name === "caisseSyncAction") row.state = data.state ?? "PENDING";
@@ -268,6 +270,7 @@ function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
     "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection });
   return load(`../app/api/${path}`, {
     "@/lib/cash-shared-http": http, "@/lib/caisse-sync": f.sync, "@/lib/cash-day-sales": f.sales, "@/lib/cash-days": f.days,
+    "@/lib/cash-shared-data": f.shared,
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": native,
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
@@ -1996,4 +1999,67 @@ test('correction PENDING avant 5d9e72c : cle Compta ancienne conservee, nouveau 
   await f.withTenant(tenant, (tx: Row) => f.days.attachLegacy(tx, day.id, input({ cycle: 0, sessionIds: [session.id],
     origins: [{ sourceType: 'synthetic', sourceId: 'old-correction' }] })));
   assert.equal(await expected(f, day.id), 25000n);
+});
+
+test("cash-settings : GET par défaut, PATCH partiel, booléen strict et révisions", async () => {
+  const f = fixture(), route = api(f, "cash-settings/route.ts", {});
+  const get = (tenantId = tenant) => route.GET({ url: `http://test/api/cash-settings?tenantId=${tenantId}` });
+  const patch = (fields: Row) => {
+    const body = input({ actionId: `settings-${++serial}`, entityKey: "settings", ...fields });
+    return route.PATCH({ headers: { get: () => body.actionId }, json: async () => body });
+  };
+  let serial = 0;
+  const initial = await get();
+  assert.equal(initial.status, 200);
+  assert.deepEqual(initial.body, { tenantId: tenant, defaultFloatXpf: "25000", allowNegativeStock: false, revision: 0 });
+  const first = await patch({ allowNegativeStock: true, baseRevision: 0 });
+  assert.equal(first.status, 200);
+  assert.equal((await get()).body.allowNegativeStock, true);
+  assert.equal((await get()).body.defaultFloatXpf, "25000");
+  const both = await patch({ defaultFloatXpf: "30000", allowNegativeStock: false, baseRevision: 1 });
+  assert.equal(both.status, 200);
+  assert.equal((await get()).body.defaultFloatXpf, "30000");
+  assert.equal((await get()).body.allowNegativeStock, false);
+  assert.equal((await patch({ allowNegativeStock: true, baseRevision: 1 })).status, 409);
+  assert.equal((await get()).body.revision, 2);
+  for (const value of ["true", "false", 0, 1, null, {}, []]) {
+    const bad = await patch({ allowNegativeStock: value, baseRevision: 2 });
+    assert.equal(bad.status, 400); assert.equal(bad.body.error, "INVALID_PAYLOAD");
+  }
+  assert.equal((await patch({ baseRevision: 2 })).status, 400);
+  assert.equal((await patch({ allowNegativeStock: true, defaultFloatXpf: null, baseRevision: 2 })).status, 400);
+  assert.equal((await patch({ defaultFloatXpf: "35000", baseRevision: 2 })).status, 200);
+  assert.equal((await get()).body.allowNegativeStock, false);
+  assert.equal((await get(tenantB)).body.allowNegativeStock, false);
+  await assert.rejects(f.shared.changeSettings(f.tx, input({ allowNegativeStock: true, baseRevision: 3, importMode: true })),
+    (e: Row) => e.message === "REVISION_CONFLICT");
+  // PATCH partiel du fond seul (forme envoyée par Rôtisserie) : le réglage déjà actif ne bouge pas.
+  assert.equal((await patch({ allowNegativeStock: true, baseRevision: 3 })).status, 200);
+  assert.equal((await patch({ defaultFloatXpf: "40000", baseRevision: 4 })).status, 200);
+  assert.equal((await get()).body.allowNegativeStock, true);
+  assert.equal((await get()).body.defaultFloatXpf, "40000");
+});
+
+test("repairSale : relit le réglage du commerce sous withTenant à chaque reprise", async () => {
+  const f = fixture();
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, status: "PAID", comptaSyncedAt: now, stockSyncedAt: null,
+    invoiceId: "synthetic-invoice", lines: [{ ...thousandLine(), kind: "PRODUCT", productId: tenantB }] } });
+  await f.tx.cashSettings.create({ data: { tenantId: tenantB, allowNegativeStock: true } });
+  const flags: boolean[] = [], reads: string[] = [];
+  const globals = {
+    withTenant: async (id: string, fn: (tx: Row) => Promise<unknown>) => { reads.push(id); return f.withTenant(id, fn); },
+    getSale: async () => sale, toSnapshot: (value: Row) => value,
+    comptaClient: () => ({}), stockClient: () => ({}), persistFor: () => ({}), guardFor: () => ({}), coreClientTimeoutMs: () => 8000,
+    runSaleSync: async (...args: any[]) => { flags.push(args[6]); return { synced: true, failure: null, invoiceId: sale.invoiceId, stockDecremented: 1 }; },
+    NEUTRALISATION_MARKER: "NEUTRALISATION_EN_ATTENTE",
+  };
+  const syncLoadedSale = caisseFunction("syncLoadedSale", globals);
+  const repair = caisseFunction("repairSale", { ...globals, syncLoadedSale });
+  assert.equal((await repair(tenant, sale.id)).synced, true);
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, allowNegativeStock: true } });
+  assert.equal((await repair(tenant, sale.id)).synced, true);
+  await f.tx.cashSettings.updateMany({ where: { tenantId: tenant }, data: { allowNegativeStock: false } });
+  assert.equal((await repair(tenant, sale.id)).synced, true);
+  assert.deepEqual(flags, [false, true, false]);
+  assert.deepEqual(reads, [tenant, tenant, tenant]);
 });

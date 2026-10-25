@@ -1009,6 +1009,8 @@ function persistFor(tenantId: string, saleId: string): SyncPersist {
 async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
   let outcome: SyncOutcome;
   try {
+    const allowNegativeStock = await withTenant(sale.tenantId, async (tx) =>
+      (await tx.cashSettings.findUnique({ where: { tenantId: sale.tenantId } }))?.allowNegativeStock === true);
     outcome = await runSaleSync(
       toSnapshot(sale),
       comptaClient(),
@@ -1016,6 +1018,7 @@ async function syncLoadedSale(sale: LoadedSale): Promise<SyncOutcome> {
       persistFor(sale.tenantId, sale.id),
       guardFor(sale.tenantId, sale.id),
       coreClientTimeoutMs(),
+      allowNegativeStock,
     );
   } catch (e) {
     if (e instanceof SaleLockTimeoutError) {
