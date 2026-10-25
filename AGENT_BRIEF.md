@@ -1,5 +1,11 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 📉 2026-10-25 — Stock négatif autorisé par commerce (Mixy Truck, QCM Marco « Vendre, stock négatif ») — ✅ FUSIONNÉ (FUSION OK 00-Architecture), ⛔ NON DÉPLOYÉ
+- `CashSettings.allowNegativeStock` (défaut false ; migration `20261025120000_cash_settings_allow_negative_stock`, ADD COLUMN additive, rls.sql intact). Actif : checkout, repair et cron envoient `allowNegative: true` à Core-Stock pour le décrément SALE. Absent ou false : aucune clé envoyée, 409 `INSUFFICIENT_STOCK` inchangé (Rôtisserie, démos).
+- PATCH `/api/cash-settings` partiel : `defaultFloatXpf` et/ou `allowNegativeStock` ; un PATCH du fond seul (forme Rôtisserie) ne touche pas le réglage (test dans `cash-day-db.test.ts`).
+- Livraison : QCM Marco (embarque aussi d58e546 auth-jws étape 1 et jws-e2), migrate-local AVANT ship, témoin core-caisse. Mixy à true = geste séparé, décision Marco, après livraison.
+- Sur le fond (00-Architecture) : si d'autres canaux que la caisse décrémentent un jour le stock d'un commerce, ce réglage relèvera de Core-Stock (donnée de son métier), pas de Core-Caisse. Pour la caisse seule, il est à sa place ici.
+
 ## 🔓 2026-10-23 — Rouvrir la dernière caisse fermée (décision Marco) — ✅ EN LIGNE (cfed8cf, tag deploy/core-caisse/20261023T081027Z-cfed8cf783f0, migration additive CashSessionReopen jouée avant)
 
 - POST /api/sessions/:id/reopen : seulement la dernière session DU POSTE, aucune ouverte, aucune plus récente (« jusqu'à l'ouverture suivante ») ; 1re fermeture gardée dans CashSessionReopen (RLS) ; GET /api/sessions renvoie reouvertures. Refermer = nouveau Z. Prouvé ci-local + test:pg (session-reopen.test.ts).

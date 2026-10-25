@@ -2033,6 +2033,11 @@ test("cash-settings : GET par défaut, PATCH partiel, booléen strict et révisi
   assert.equal((await get(tenantB)).body.allowNegativeStock, false);
   await assert.rejects(f.shared.changeSettings(f.tx, input({ allowNegativeStock: true, baseRevision: 3, importMode: true })),
     (e: Row) => e.message === "REVISION_CONFLICT");
+  // PATCH partiel du fond seul (forme envoyée par Rôtisserie) : le réglage déjà actif ne bouge pas.
+  assert.equal((await patch({ allowNegativeStock: true, baseRevision: 3 })).status, 200);
+  assert.equal((await patch({ defaultFloatXpf: "40000", baseRevision: 4 })).status, 200);
+  assert.equal((await get()).body.allowNegativeStock, true);
+  assert.equal((await get()).body.defaultFloatXpf, "40000");
 });
 
 test("repairSale : relit le réglage du commerce sous withTenant à chaque reprise", async () => {
