@@ -92,3 +92,38 @@ test("réponse 2xx → résultat parsé (chemin nominal HTTP réel)", async () =
   assert.equal(res.invoiceId, "inv-9");
   assert.equal(res.alreadyExisted, false);
 });
+
+test("stock HTTP : allowNegative transmis seulement quand fourni", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ""; for await (const chunk of req) body += chunk;
+    bodies.push(JSON.parse(body));
+    assert.equal(req.url, "/api/movements");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, movementId: "mv-test", productId: "product-test", qtyOnHand: -2, alreadyExisted: false }));
+  });
+  process.env.CORE_STOCK_URL = `http://127.0.0.1:${await listen(server)}`;
+  const { stockClient } = await import("./clients.ts");
+  const movement = { tenantId: input.tenantId, productId: "product-test", qty: 2, sourceType: "caisse", sourceId: "sale-http" };
+  await stockClient().recordSale(movement);
+  await stockClient().recordSale({ ...movement, allowNegative: true });
+  await stockClient().recordSale({ ...movement, allowNegative: false });
+  assert.deepEqual(bodies[0], { ...movement, type: "SALE" });
+  assert.deepEqual(bodies[1], { ...movement, type: "SALE", allowNegative: true });
+  assert.deepEqual(bodies[2], { ...movement, type: "SALE", allowNegative: false });
+});
+
+test("stock simulé : défaut inchangé, opt-in négatif et rejeu idempotent", async () => {
+  const { stockClient } = await import("./clients.ts");
+  process.env.CORE_CLIENTS_MOCK = "1";
+  try {
+    const movement = { tenantId: input.tenantId, productId: "product-test", qty: 2, sourceType: "caisse", sourceId: "sale-mock" };
+    assert.equal((await stockClient().recordSale(movement)).qtyOnHand, 0);
+    const negative = { ...movement, sourceId: "sale-mock-negative", allowNegative: true };
+    const first = await stockClient().recordSale(negative);
+    assert.equal(first.qtyOnHand, -2);
+    const replay = await stockClient().recordSale(negative);
+    assert.equal(replay.alreadyExisted, true); assert.equal(replay.movementId, first.movementId);
+    assert.equal(replay.qtyOnHand, -2);
+  } finally { process.env.CORE_CLIENTS_MOCK = ""; }
+});

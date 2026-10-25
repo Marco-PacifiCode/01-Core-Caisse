@@ -219,7 +219,7 @@ function stoppedFor(sale: SyncSaleSnapshot | null): SyncOutcome["stopped"] {
  * Fenêtres résiduelles signalées par settledOnVoidingSale / stockOnVoidingSale.
  */
 async function runGuardedSaleSync(
-  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard, timeoutMs: number,
+  compta: ComptaClient, stock: StockClient, persist: SyncPersist, guard: SyncGuard, timeoutMs: number, allowNegativeStock: boolean,
 ): Promise<SyncOutcome> {
   let invoiceId: string | null = null;
   let invoiceNumber: string | null = null;
@@ -321,7 +321,8 @@ async function runGuardedSaleSync(
       if (!cur.stockSyncedAt) {
         for (const l of productLines) {
           await stock.recordSale({ tenantId: cur.tenantId, productId: l.productId!, qty: l.qty,
-            sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined });
+            sourceType: CAISSE_SOURCE_TYPE, sourceId: `${cur.id}:${l.id}`, actorId: cur.cashierId ?? undefined,
+            ...(allowNegativeStock ? { allowNegative: true } : {}) });
           stockDecremented++;
         }
         const afterStock = await guard.reread();
@@ -363,8 +364,9 @@ export async function runSaleSync(
   persist: SyncPersist,
   guard?: SyncGuard,
   timeoutMs = 8000,
+  allowNegativeStock = false,
 ): Promise<SyncOutcome> {
-  if (guard) return runGuardedSaleSync(compta, stock, persist, guard, timeoutMs);
+  if (guard) return runGuardedSaleSync(compta, stock, persist, guard, timeoutMs, allowNegativeStock);
   let invoiceId = sale.invoiceId;
   let invoiceNumber = sale.invoiceNumber;
   const productLines = sale.lines.filter((l) => l.kind === "PRODUCT" && l.productId);
@@ -402,6 +404,7 @@ export async function runSaleSync(
           sourceType: CAISSE_SOURCE_TYPE,
           sourceId: `${sale.id}:${l.id}`,
           actorId: sale.cashierId ?? undefined,
+          ...(allowNegativeStock ? { allowNegative: true } : {}),
         });
         stockDecremented++;
       }

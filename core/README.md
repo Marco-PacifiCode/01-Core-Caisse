@@ -74,6 +74,9 @@ validation, dans l'**ordre robuste** :
    **settle par paiement** (`POST /api/settle`, `paymentRef` déterministe) → **décrément Stock**
    (`POST /api/movements` `{type:"SALE"}` par ligne PRODUCT, `sourceId:"<saleId>:<lineId>"`).
    Chaque étage convergé est daté sur la vente : `comptaSyncedAt` / `stockSyncedAt`.
+   `CashSettings.allowNegativeStock` (par commerce, défaut `false`) transmet `allowNegative:true` sur les décréments SALE, checkout et repair compris.
+
+`GET/PATCH /api/cash-settings` expose `allowNegativeStock` (booléen strict) ; PATCH exige `baseRevision` et au moins `defaultFloatXpf` ou `allowNegativeStock`, les champs absents restent inchangés.
 
 **Échec partiel APRÈS encaissement = vente PAID + reprise différée.** Un échec S2S (timeout 8 s,
 réseau, 5xx…) ne bloque plus le ticket : la vente **reste PAID**, l'étape manquante reste `NULL`,

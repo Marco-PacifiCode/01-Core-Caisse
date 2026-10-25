@@ -563,6 +563,7 @@ model Poste {
 model CashSettings {
   tenantId String @id @db.Uuid
   defaultFloatXpf BigInt @default(25000)
+  allowNegativeStock Boolean @default(false)
   revision Int @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
