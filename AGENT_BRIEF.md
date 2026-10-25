@@ -1,6 +1,6 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
-## 📉 2026-10-25 — Stock négatif autorisé par commerce (Mixy Truck, QCM Marco « Vendre, stock négatif ») — ✅ FUSIONNÉ (FUSION OK 00-Architecture), ⛔ NON DÉPLOYÉ
+## 📉 2026-10-25 — Stock négatif autorisé par commerce (Mixy Truck, QCM Marco « Vendre, stock négatif ») — ✅ FUSIONNÉ (PR 100, main `af7b171`, ci-local GREEN sur cd47990, FUSION OK 00-Architecture), ⛔ NON DÉPLOYÉ (livraison = QCM Marco puis créneau 00-Architecture)
 - `CashSettings.allowNegativeStock` (défaut false ; migration `20261025120000_cash_settings_allow_negative_stock`, ADD COLUMN additive, rls.sql intact). Actif : checkout, repair et cron envoient `allowNegative: true` à Core-Stock pour le décrément SALE. Absent ou false : aucune clé envoyée, 409 `INSUFFICIENT_STOCK` inchangé (Rôtisserie, démos).
 - PATCH `/api/cash-settings` partiel : `defaultFloatXpf` et/ou `allowNegativeStock` ; un PATCH du fond seul (forme Rôtisserie) ne touche pas le réglage (test dans `cash-day-db.test.ts`).
 - Livraison : QCM Marco (embarque aussi d58e546 auth-jws étape 1 et jws-e2), migrate-local AVANT ship, témoin core-caisse. Mixy à true = geste séparé, décision Marco, après livraison.
