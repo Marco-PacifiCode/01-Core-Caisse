@@ -60,7 +60,9 @@ function cashDayView(day: Prisma.CashDayGetPayload<{ include: { canonicalSession
     sessionId: day.currentSessionId, canonicalSessionId: day.canonicalSessionId, status: day.currentSession.status,
     revision: day.revision, fond: day.canonicalSession.openingFloatXpf, openedBy: day.currentSession.openedBy,
     openedByName: day.currentSession.openedByName, openedAt: day.currentSession.openedAt, closedBy: day.currentSession.closedBy,
-    closedByName: day.currentSession.closedByName, closedAt: day.currentSession.closedAt };
+    closedByName: day.currentSession.closedByName, closedAt: day.currentSession.closedAt,
+    closedLate: day.currentSession.status === "CLOSED" && day.currentSession.closedAt !== null
+      && businessDay(day.currentSession.closedAt) > day.businessDay };
 }
 
 function dayPage(q: URLSearchParams, fallback: number, max: number) {
@@ -181,7 +183,8 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
   requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
   const countedXpf = xpfInteger(b.countedXpf), occurredAt = date(b.occurredAt);
-  requireCash(businessDay(occurredAt) === day.businessDay, "DAY_MISMATCH", 409);
+  // La clôture conserve son heure réelle ; le Z reste rattaché au CashDay d'origine.
+  requireCash(businessDay(occurredAt) >= day.businessDay, "DAY_MISMATCH", 409);
   const closureMode = text(b.closureMode);
   requireCash(["ONLINE", "OFFLINE", "IMPORT"].includes(closureMode));
   const localExpectedXpf = xpfInteger(b.localExpectedXpf, true), localVarianceXpf = xpfInteger(b.localVarianceXpf, true);
