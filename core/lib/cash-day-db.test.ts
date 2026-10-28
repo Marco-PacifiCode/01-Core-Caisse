@@ -286,6 +286,124 @@ async function expected(f: ReturnType<typeof fixture>, id: string) {
 const routeRequired = (e: Row) => e.status === 409 && e.message === "CASHDAY_ROUTE_REQUIRED";
 const thousandLine = () => ({ id: tenantB, kind: "OTHER", label: "Article synthétique", qty: 1, unitXpf: 1000n, lineXpf: 1000n, tgcRatePpm: 0 });
 
+const lateOpening = () => input({ businessDay: "2026-10-24", occurredAt: "2026-10-24T01:00:00.000Z" });
+const lateClosing = (overrides: Row = {}) => input({ sourceKey: "late-z", cycle: 0, closureMode: "ONLINE",
+  occurredAt: "2026-10-28T01:00:00.000Z", countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0", ...overrides });
+async function lateFixture() {
+  const f = fixture();
+  const day = await f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, lateOpening()));
+  return { f, day, close: (overrides: Row = {}) => f.withTenant(tenant, (tx: Row) => f.days.closeCashDay(tx, day.id, lateClosing(overrides))) };
+}
+
+test("Fermeture tardive : 24/10 fermé le 28/10, heure réelle et closedLate en état et liste", async () => {
+  const { f, day, close } = await lateFixture();
+  assert.equal(day.closedLate, false);
+  await close();
+  const state = await f.withTenant(tenant, (tx: Row) => f.days.dayState(tx, tenant, day.id));
+  const list = await f.days.listCashDays(f.tx, tenant, new URLSearchParams());
+  for (const view of [state, list.days[0]]) {
+    assert.equal(view.businessDay, "2026-10-24");
+    assert.equal(view.closedLate, true);
+    assert.equal(view.closedAt.toISOString(), lateClosing().occurredAt);
+  }
+  assert.equal(f.rows("cashDayClosure")[0].occurredAt.toISOString(), lateClosing().occurredAt);
+});
+
+test("Fermeture tardive : 23/10 refusé pour le 24/10, jour même accepté sans closedLate", async () => {
+  const { f, day, close } = await lateFixture();
+  await assert.rejects(close({ occurredAt: "2026-10-23T01:00:00.000Z" }),
+    (e: Row) => e.message === "DAY_MISMATCH" && e.status === 409);
+  assert.equal(f.rows("cashDayClosure").length, 0);
+  await close({ occurredAt: lateOpening().occurredAt });
+  assert.equal((await f.days.dayState(f.tx, tenant, day.id)).closedLate, false);
+});
+
+test("Fermeture tardive : ouverture du 28/10 bloquée avant, acceptée après", async () => {
+  const { f, close } = await lateFixture();
+  const open = () => f.withTenant(tenant, (tx: Row) => f.days.openCashDay(tx, input({ businessDay: "2026-10-28",
+    occurredAt: "2026-10-28T02:00:00.000Z", sourceKey: "opening-28", localSessionKey: "local-28" })));
+  await assert.rejects(open(), (e: Row) => e.message === "PREVIOUS_SESSION_OPEN" && e.status === 409);
+  await close();
+  const next = await open();
+  assert.equal(next.businessDay, "2026-10-28");
+  assert.equal(next.status, "OPEN");
+  assert.equal(next.closedLate, false);
+});
+
+test("Fermeture tardive : rejeu identique idempotent", async () => {
+  const { f, close } = await lateFixture();
+  const first = await close(), before = f.rows("cashDayEvent"), session = f.rows("cashSession");
+  const replay = await close();
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.alreadyClosed, true);
+  assert.equal(projection.canonical(replay.report), projection.canonical(first.report));
+  assert.deepEqual(f.rows("cashDayEvent"), before);
+  assert.deepEqual(f.rows("cashSession"), session);
+  assert.equal(f.rows("cashDayClosure").length, 1);
+});
+
+test("Fermeture tardive : Z, totaux, faits, projection et alias restent au 24/10", async () => {
+  const { f, day, close } = await lateFixture();
+  const sale = await f.tx.sale.create({ data: { tenantId: tenant, cashDayId: day.id, sessionId: day.sessionId,
+    status: "PAID", paidAt: new Date(lateOpening().occurredAt), totalXpf: 1000n,
+    lines: [thousandLine()], payments: [{ method: "CASH", amountXpf: 1000n }] } });
+  await f.withTenant(tenant, (tx: Row) => f.ledger.recordSharedSale(tx, tenant, sale.id));
+  const result = await close({ countedXpf: "26000", localExpectedXpf: "26000" });
+  assert.equal(result.report.totalSalesXpf, 1000);
+  assert.equal(result.report.expectedXpf, 26000);
+  assert.equal(result.report.sessionId, day.sessionId);
+  const page = await f.days.ledgerPage(f.tx, tenant, day.id, new URLSearchParams());
+  assert.equal(page.businessDay, "2026-10-24");
+  assert.equal(page.projection.totauxCloture.totalSalesXpf, 1000n);
+  assert.equal(page.projection.totauxCourants.expectedXpf, 26000n);
+  assert.equal(page.projection.clotureLe.toISOString(), lateClosing().occurredAt);
+  const event = f.rows("cashDayEvent").find(e => e.kind === "CLOSURE")!;
+  assert.equal(event.cashDayId, day.id);
+  assert.equal(event.occurredAt.toISOString(), lateClosing().occurredAt);
+  assert.equal(projection.canonical(event.snapshot.report), projection.canonical(result.report));
+  assert.ok(f.rows("cashDayEvent").every(e => e.cashDayId === day.id));
+  assert.equal(f.rows("sale")[0].paidAt.toISOString(), lateOpening().occurredAt);
+  const pending = await f.days.listPendingLegacyClosures(f.tx, tenant, new URLSearchParams());
+  assert.equal(pending.items[0].businessDay, "2026-10-24");
+  // Une fermeture passée ne rend pas le jour éligible à une réouverture aujourd'hui.
+  await assert.rejects(f.days.reopenCashDay(f.tx, day.id, input({ administration: true, occurredAt: lateClosing().occurredAt })),
+    (e: Row) => e.message === "DAY_MISMATCH" && e.status === 409);
+});
+
+test("Fermeture tardive : une seule fermeture qui fait foi, une seconde fermeture distincte n'est qu'un recomptage", async () => {
+  const { f, close } = await lateFixture();
+  const first = await close();
+  const session = f.rows("cashSession")[0];
+  const second = await close({ sourceKey: "late-z-2", countedXpf: "24000", localVarianceXpf: "-1000",
+    occurredAt: "2026-10-28T02:00:00.000Z" });
+  assert.equal(first.recount, false);
+  assert.equal(second.recount, true);
+  assert.equal(f.rows("cashDayClosure").filter((c: Row) => c.authoritative).length, 1);
+  assert.equal(f.rows("cashDayClosure").find((c: Row) => c.authoritative).countedXpf, 25000n);
+  assert.equal(f.rows("cashSession")[0].closedAt.toISOString(), session.closedAt.toISOString());
+  assert.equal(f.rows("cashSession")[0].varianceXpf, session.varianceXpf);
+});
+
+test("Fermeture tardive : vente du 28/10 refusée sur le 24/10 avant et après clôture", async () => {
+  const { f, day, close } = await lateFixture();
+  const sell = () => f.withTenant(tenant, (tx: Row) => f.sales.createDaySale(tx, day.id,
+    input({ occurredAt: lateClosing().occurredAt, sourceType: "synthetic", sourceId: "sale-28", lines: basketLines })));
+  await assert.rejects(sell(), (e: Row) => e.message === "DAY_MISMATCH" && e.status === 409);
+  await close();
+  await assert.rejects(sell(), (e: Row) => e.message === "DAY_MISMATCH" && e.status === 409);
+  assert.equal(f.rows("sale").length, 0);
+});
+
+test("Fermeture tardive : OFFLINE accepté avec heure réelle et Z du 24/10", async () => {
+  const { f, day, close } = await lateFixture();
+  await close({ closureMode: "OFFLINE", legacySnapshot: { knownSourceRefs: ["OPENING:opening-A"] } });
+  const closure = f.rows("cashDayClosure")[0];
+  assert.equal(closure.closureMode, "OFFLINE");
+  assert.equal(closure.cashDayId, day.id);
+  assert.equal(closure.occurredAt.toISOString(), lateClosing().occurredAt);
+  assert.equal((await f.days.dayState(f.tx, tenant, day.id)).closedLate, true);
+});
+
 test("GET cash-days : ordre décroissant, curseur exclusif, dernier instantané et lecture sans verrou", async () => {
   const f = fixture();
   const created = [];
