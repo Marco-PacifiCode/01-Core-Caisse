@@ -1,5 +1,8 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ⛔ 2026-10-29 — MIGRATION CashDeposit NON JOUÉE EN PROD : pas de ship core-caisse avant elle
+main porte depuis les PR 103 (`bc276b7`) et 104 (`2213a9a`) le dépôt brut des actions d'appareil (table `CashDeposit`, routes POST/GET `/api/cash-deposits`, décision Marco 29/10 « rien ne reste bloqué sur la tablette »). La migration `20261029160000_cash_deposit` (additive) et l'ajout de `CashDeposit` à `prisma/rls.sql` ne sont PAS appliqués en prod. **Aucun ship core-caisse depuis main** avant `migrate-local.sh core-caisse` (après la question à Marco dédiée à `--confirm=destructive_operation`, déclenchée par le diff de rls.sql) ou une question à Marco ; prévenir 00-Architecture. Livraison portée par la session Rotisserie avec le côté caisse.
+
 ## 📉 2026-10-25 — Stock négatif autorisé par commerce (Mixy Truck, QCM Marco « Vendre, stock négatif ») — ✅ FUSIONNÉ (PR 100, main `af7b171`, ci-local GREEN sur cd47990, FUSION OK 00-Architecture), ⛔ NON DÉPLOYÉ (livraison = QCM Marco puis créneau 00-Architecture)
 - `CashSettings.allowNegativeStock` (défaut false ; migration `20261025120000_cash_settings_allow_negative_stock`, ADD COLUMN additive, rls.sql intact). Actif : checkout, repair et cron envoient `allowNegative: true` à Core-Stock pour le décrément SALE. Absent ou false : aucune clé envoyée, 409 `INSUFFICIENT_STOCK` inchangé (Rôtisserie, démos).
 - PATCH `/api/cash-settings` partiel : `defaultFloatXpf` et/ou `allowNegativeStock` ; un PATCH du fond seul (forme Rôtisserie) ne touche pas le réglage (test dans `cash-day-db.test.ts`).
@@ -83,6 +86,7 @@ Clone du poste rendu **propre sur `main`** après le run. Aucune migration, aucu
 
 ## En cours
 
+- **⛔ Dépôt CashDeposit (29/10)** : fusionné (PR 103/104), migration + RLS NON jouées en prod ⇒ pas de ship core-caisse avant (voir en tête).
 - **Caisse journalière unique de la Rôtisserie (lot L4)** : ✅ fusionnée et DÉPLOYÉE le 16/10 au soir avec `27f3fd6` (chantier « caisse unique »). Historique des 15 relectures : `AGENT_BRIEF_ARCHIVE.md` (section du 18/10).
 - **Tri des branches (29/09)** : `C:\dev\_backup\branches-inventaire-20260929\par-app\01-Core-Caisse.md` — 3 branche(s) `claude/*` à code unique, sommet antérieur au 08/09 (liste, fichiers divergents, couverture, colonne verdict). **Trier ces branches, puis QCM à Marco ; rien n'est supprimé avant.**
 
