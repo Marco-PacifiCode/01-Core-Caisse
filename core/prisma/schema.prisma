@@ -763,3 +763,28 @@ model CashSessionReopen {
   @@index([tenantId])
   @@index([tenantId, sessionId, reopenedAt])
 }
+
+model CashDeposit {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @db.Uuid
+  actionId String @db.Uuid
+  deviceId String
+  deviceName String?
+  kind String
+  operation String?
+  entityKey String?
+  payload Json
+  dependsOn Json @default("[]")
+  payloadHash String
+  clientCreatedAt DateTime? @db.Timestamptz(3)
+  clientState String?
+  clientErrorCode String?
+  receivedAt DateTime @default(now()) @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @db.Timestamptz(3)
+  status String @default("PENDING")
+  appliedAt DateTime? @db.Timestamptz(3)
+  conflictCount Int @default(0)
+
+  @@unique([tenantId, actionId])
+  @@index([tenantId, status, receivedAt])
+}
