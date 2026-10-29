@@ -54,9 +54,9 @@ STOCK_CLE = lire_env("CORE_STOCK_API_KEY")
 SECOURS = []   # (nom, action) : nettoyage si le parcours casse au milieu, rien ne doit rester ouvert
 HORLOGE = None   # Date HTTP du Core ; aucune ouverture tardive sur une horloge locale seule
 
-def appel(methode, chemin, corps=None, idem=None, base=None, cle=None):
+def appel(methode, chemin, corps=None, idem=None, base=None, cle=None, nettoyage=False):
     global HORLOGE
-    reste = BUDGET - (time.monotonic() - DEBUT)
+    reste = 3 if nettoyage else BUDGET - (time.monotonic() - DEBUT)
     if reste < 2:
         return 0, {"error": "DELAI_DEPASSE"}
     entetes = {"Content-Type": "application/json", "X-Core-Key": CLE if cle is None else cle}
@@ -271,7 +271,7 @@ print(f"caissedemo : journee {JOUR} {quoi}, produit encaisse, prestation annulee
 
 # 3. Ouverture tardive directe (voie ii). La voie i demanderait une veille encore OPEN au jour
 # serveur : impossible a fabriquer ici sans changer l'horloge ou la journee reelle de la demo.
-# J-6 laisse une marge de rejeu jusqu'a J+1 dans la fenetre de 7 jours. Une seule preuve par jour,
+# Premier jour libre entre J-7 et J-2. Une seule preuve par jour,
 # independante du SHA/TEMOIN_ID : les livraisons suivantes relisent le Z, sans rouvrir ni revendre.
 def temoin_to_close():
     s, settings = appel("GET", f"/api/cash-settings?tenantId={T}")
@@ -284,13 +284,33 @@ def temoin_to_close():
         ko("TO_CLOSE, horloge serveur absente")
     serveur = HORLOGE.astimezone(timezone.utc)
     jour_serveur = (serveur + timedelta(hours=11)).date()
-    fictif = datetime.strptime(JOUR, "%Y-%m-%d").date() - timedelta(days=6)
-    if not 1 <= (jour_serveur - fictif).days <= 7 or QUAND > serveur + timedelta(seconds=60):
-        ko("TO_CLOSE, jour fictif hors fenetre serveur (1 a 7 jours) ou horloge future")
-    business = fictif.isoformat()
+    if QUAND > serveur + timedelta(seconds=60):
+        ko("TO_CLOSE, horloge future")
+    device, auteur = "temoin-to-close", "Parcours temoin TO_CLOSE"
+    jour = None
+    for recul in range(7, 1, -1):
+        fictif = jour_serveur - timedelta(days=recul)
+        business = fictif.isoformat()
+        query = f"/api/cash-days?tenantId={T}&businessDay={business}"
+        s, r = appel("GET", query)
+        if s != 200:
+            ko(f"TO_CLOSE, recherche du jour libre : HTTP {s}")
+        jour = r.get("day")
+        if jour is None:
+            break
+        propre = jour.get("openedByName") == auteur and jour.get("openedBy") == ACTEUR
+        if propre and jour.get("status") == "CLOSED" and jour.get("closedByName") != "Secours temoin TO_CLOSE":
+            print(f"caissedemo TO_CLOSE : {business}, deja prouve (CLOSED, meme auteur)")
+            return "TO_CLOSE vert (deja prouve)"
+        # Reprendre seulement un reste de notre propre parcours interrompu.
+        if propre and jour.get("status") == "TO_CLOSE":
+            break
+        print(f"TO_CLOSE : {business} occupe, saute (aucune ecriture)")
+    else:
+        print("TO_CLOSE non joué (aucun jour libre)")
+        return "TO_CLOSE non joué (aucun jour libre)"
     ouverture = business + "T01:00:00.000Z"  # midi Noumea, toujours strictement avant le serveur
     fermeture = (fictif + timedelta(days=1)).isoformat() + "T01:00:00.000Z"
-    device, auteur = "temoin-to-close", "Parcours temoin TO_CLOSE"
     def cle(etape):
         return str(uuid.uuid5(NS, f"to-close:{business}:{etape}"))
     def lire(chemin):
@@ -307,11 +327,37 @@ def temoin_to_close():
         if s != 200:
             ko(f"TO_CLOSE, {etape} : HTTP {s}")
         return donnees(r)
-    query = f"/api/cash-days?tenantId={T}&businessDay={business}"
-    jour = lire(query).get("day")
-    if jour is not None and (jour.get("openedByName") != auteur or jour.get("openedBy") != ACTEUR):
-        ko(f"TO_CLOSE, jour fictif {business} occupe par un autre auteur (aucune ecriture)")
     source = cle("open")
+    def secours_tc():
+        # Pas de ko/ecrire ici : un echec du secours doit garder le verdict KO initial.
+        s, r = appel("GET", query, nettoyage=True)
+        etat = r.get("day") or {}
+        if s != 200:
+            return f"lecture HTTP {s}"
+        if etat.get("status") != "TO_CLOSE":
+            return "journee deja close ou non TO_CLOSE"
+        if etat.get("openedBy") != ACTEUR or etat.get("openedByName") != auteur:
+            return "autre auteur, aucune ecriture"
+        jid_sec = etat.get("cashDayId")
+        s, led_sec = appel("GET", f"/api/cash-days/{jid_sec}/ledger?tenantId={T}&afterSequence=0", nettoyage=True)
+        ouvertures = led_sec.get("openings", [])
+        if s != 200 or len(ouvertures) != 1 or any(o.get("sourceKey") != source or o.get("deviceId") != device
+                or o.get("actorId") != ACTEUR or o.get("actorName") != auteur for o in ouvertures):
+            return "propriete non prouvee, aucune ecriture"
+        if led_sec.get("hasMore") or any(f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "CLOSURE")
+                or f.get("deviceId") != ("core" if f.get("kind") == "TO_CLOSE" else device)
+                for f in led_sec.get("data", [])):
+            return "usage concurrent, aucune ecriture"
+        att = str(led_sec.get("projection", {}).get("totauxCourants", {}).get("expectedXpf"))
+        if not re.fullmatch(r"-?\d+", att):
+            return "attendu introuvable"
+        a = cle("close-secours")
+        corps = {"tenantId": T, "actionId": a, "deviceId": device, "entityKey": jid_sec,
+                 "occurredAt": fermeture, "actorId": ACTEUR, "actorName": "Secours temoin TO_CLOSE", "receivedById": ACTEUR,
+                 "deviceName": auteur, "sourceKey": a, "countedXpf": att, "closureMode": "ONLINE",
+                 "localExpectedXpf": att, "localVarianceXpf": "0", "cycle": etat.get("cycle", 0)}
+        return appel("POST", f"/api/cash-days/{jid_sec}/close", corps, a, nettoyage=True)[0]
+    SECOURS.append((f"cloture TO_CLOSE {business}", secours_tc))
     if jour is None:
         jour = ecrire("open", "/api/cash-days", source, businessDay=business, sourceKey=source,
                       localSessionKey=source, openingFloatXpf="10000")
@@ -388,6 +434,7 @@ def temoin_to_close():
                  "refundCashXpf": "0", "movementNetXpf": "0"}
     if any(str(z.get(k)) != v for k, v in attendu_z.items()) or z.get("parTaux") != {"0": {"ttcXpf": 100, "htXpf": 100, "tgcXpf": 0}}:
         ko("TO_CLOSE, Z fige incorrect ou champs 4b absents")
+    SECOURS.pop()
     print(f"caissedemo TO_CLOSE : {business}, evenement unique, conflit APPLIED unique, vente acceptee, CLOSED tardif, Z fige 10100 F ecart 0")
     return "TO_CLOSE vert"
 

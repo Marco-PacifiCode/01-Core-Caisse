@@ -2256,7 +2256,10 @@ test("ouverture tardive CashDay : J-7 est créée TO_CLOSE ; J-8 est refusée av
   assert.equal(refused.status, 409); assert.equal(refused.body.error, "OUVERTURE_TROP_ANCIENNE");
   assert.equal(f.rows("cashDay").length, 1); assert.equal(f.rows("cashSession").length, 1);
   assert.equal(f.rows("cashDeposit").filter(d => d.operation === "OUVERTURE_TROP_ANCIENNE").length, 1);
-  assert.deepEqual((await tooOld()).body, refused.body);
+  // Le premier corps est un littéral de la VM ; le port Prisma simulé renvoie
+  // une structuredClone dans le contexte hôte. Comparer le contrat JSON,
+  // y compris le statut, sans comparer les prototypes des deux contextes.
+  assert.deepEqual(JSON.parse(JSON.stringify(await tooOld())), JSON.parse(JSON.stringify(refused)));
   assert.equal(f.rows("cashDeposit").length, 2, "conflit persistant après rollback, sans doublon au rejeu");
 });
 

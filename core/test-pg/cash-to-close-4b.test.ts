@@ -119,6 +119,24 @@ test("4b pg : éteint garde le corps 409 ; même ouverture PENDING réussit apr�
   assert.equal(conflict.operation, "PREVIOUS_SESSION_OPEN"); assert.equal(conflict.entityKey, old.businessDay);
   assert.ok(logged.some(line => line.includes("[conflit]") && line.includes(tenant) && line.includes(old.businessDay)));
   assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 1);
+  // Même parcours réel : vente datée de la veille après la bascule, puis Z tardif.
+  const saleLines = [{ kind: "OTHER", label: "Recette", qty: 1, unitXpf: "106", lineXpf: "106", tgcRatePpm: 60000 }];
+  const saleInput = input(tenant, -1, { sourceType: "recette-4b", sourceId: randomUUID(), ticketNumber: "synthetic-transition-1",
+    lines: saleLines });
+  const sale = await sales.createDaySale(tx, old.id, saleInput);
+  await ledger.appendDayFact(tx, tenant, old.id, { kind: "SALE_PAID", sourceRef: sale.id, saleId: sale.id,
+    deviceId: saleInput.deviceId, occurredAt: new Date(saleInput.occurredAt),
+    snapshot: { lines: saleLines, totalXpf: "106", payments: [{ method: "CASH", amountXpf: "106" }], parTaux: projection.taxes(saleLines) } });
+  const closed = await days.closeCashDay(tx, old.id, closeInput(tenant, { countedXpf: "1106", localExpectedXpf: "1106" }));
+  assert.equal(closed.report.totalSalesXpf, 106);
+  assert.equal(closed.report.expectedXpf, 1106); assert.equal(closed.report.varianceXpf, 0);
+  assert.equal(closed.report.cancelledCount, 0); assert.equal(closed.report.refundCashXpf, 0);
+  assert.equal(closed.report.movementNetXpf, 0);
+  assert.deepEqual(JSON.parse(json(closed.report.parTaux)), { "60000": { ttcXpf: 106, htXpf: 100, tgcXpf: 6 } });
+  const state = await days.dayState(tx, tenant, old.id);
+  assert.equal(state.status, "CLOSED"); assert.equal(state.closedLate, true);
+  assert.equal(await tx.cashDayEvent.count({ where: { tenantId: tenant, cashDayId: old.id, kind: "TO_CLOSE" } }), 1);
+  assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 1);
 }));
 
 test("4b pg : +61 s refusé et jour serveur jamais basculé, même tablette en avance à minuit", async () => fixture(async (tenant, tx) => {
