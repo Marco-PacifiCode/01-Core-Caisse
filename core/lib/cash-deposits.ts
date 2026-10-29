@@ -44,8 +44,10 @@ export function validateDepositInput(input: unknown) {
   let bodySize = 0;
   try { bodySize = Buffer.byteLength(JSON.stringify(input)); } catch { throw new CashContractError("INVALID_PAYLOAD"); }
   requireCash(bodySize <= MAX_BODY_BYTES, "BODY_TOO_LARGE", 413);
-  requireCash(Array.isArray(b.actions) && b.actions.length >= 1 && b.actions.length <= 200, "INVALID_ACTIONS");
+  requireCash(Array.isArray(b.actions) && b.actions.length <= 200, "INVALID_ACTIONS");
   requireCash(b.applied === undefined || (Array.isArray(b.applied) && b.applied.length <= 1000), "INVALID_APPLIED");
+  // Une file vidée après accusés n'a plus que des « applied » à dire : lot d'actions vide permis, corps vide refusé.
+  requireCash(b.actions.length + (b.applied?.length ?? 0) >= 1, "INVALID_ACTIONS");
   return { tenantId, actions: b.actions.map(action), applied: (b.applied ?? []).map(uuid) };
 }
 export async function depositActions(tx: CashDepositTx, input: unknown) {
