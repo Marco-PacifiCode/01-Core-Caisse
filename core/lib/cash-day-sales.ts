@@ -10,7 +10,8 @@ export async function createDaySale(tx: CashTx, cashDayId: string, b: ActionInpu
   b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), occurredAt = date(b.occurredAt);
   requireCash(businessDay(occurredAt) === day.businessDay, "DAY_MISMATCH", 409);
-  requireCash(day.currentSession.status === "OPEN" || b.offlineCompleted === true || b.importMode === true, "DAY_CLOSED", 409);
+  requireCash(day.currentSession.status === "OPEN" || day.currentSession.status === "TO_CLOSE"
+    || b.offlineCompleted === true || b.importMode === true, "DAY_CLOSED", 409);
   if (b.sessionId !== undefined) {
     const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId: b.tenantId, sessionId: uuid(b.sessionId) } } });
     requireCash(alias?.cashDayId === day.id, "DAY_MISMATCH", 409);

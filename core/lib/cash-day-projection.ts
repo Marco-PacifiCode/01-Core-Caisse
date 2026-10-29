@@ -101,7 +101,7 @@ export function factDelta(kind: string, snapshot: unknown): bigint {
     requireCash(s.refundActionId === undefined);
     return xpfInteger(s.amountXpf) * (s.kind === "CASH_IN" ? 1n : -1n);
   }
-  requireCash(["SALE_VOID", "LOCAL_VOID", "GIFT_CARD_REDEEMED", "REOPEN", "OPENING", "CLOSURE"].includes(kind));
+  requireCash(["SALE_VOID", "LOCAL_VOID", "GIFT_CARD_REDEEMED", "REOPEN", "OPENING", "CLOSURE", "TO_CLOSE"].includes(kind));
   return 0n;
 }
 function totals(facts: DayFact[], fond: bigint) {

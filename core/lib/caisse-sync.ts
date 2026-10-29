@@ -3,6 +3,35 @@ import type { Prisma } from "@prisma/client";
 import { canonical, CashContractError, jsonValue, object, requireCash, type JsonRecord } from "./cash-day-projection.ts";
 
 export type CashTx = Prisma.TransactionClient;
+// Namespace UUID propre à Core-Caisse (v5 RFC 4122), figé pour stabiliser les dépôts de conflit.
+const CASH_CONFLICT_NAMESPACE = "9f3f68b4-6f19-5a2d-9c87-01c455d11740";
+function uuidV5(name: string) {
+  const namespace = Buffer.from(CASH_CONFLICT_NAMESPACE.replace(/-/g, ""), "hex");
+  const hash = createHash("sha1").update(namespace).update(name, "utf8").digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+export class CashConflictAfterRollback extends CashContractError {
+  readonly conflict: { actionName: string; tenantId: string; scope: string; businessDay: string; code: string };
+  constructor(code: string, conflict: { actionName: string; tenantId: string; scope: string; businessDay: string }) {
+    super(code, 409); this.conflict = { ...conflict, code };
+  }
+}
+/** Dépose un signal APPLIED, hors file d'application. actionId rend l'écriture idempotente. */
+export async function recordCashConflict(tx: CashTx, conflict: { actionName: string; tenantId: string; scope: string; businessDay: string; code: string }) {
+  const actionId = uuidV5(conflict.actionName);
+  const existing = await tx.cashDeposit.findFirst({ where: { tenantId: conflict.tenantId, actionId } });
+  if (existing) return existing;
+  const payload = {};
+  const row = await tx.cashDeposit.create({ data: { tenantId: conflict.tenantId, actionId, deviceId: "core", kind: "conflit",
+    operation: conflict.code, entityKey: conflict.businessDay, payload,
+    payloadHash: createHash("sha256").update(canonical(payload)).digest("hex"), status: "APPLIED", appliedAt: new Date() } });
+  console.warn(`[conflit] tenant=${conflict.tenantId} code=${conflict.code} businessDay=${conflict.businessDay}`);
+  return row;
+}
 async function withTenant<T>(tenantId: string, fn: (tx: CashTx) => Promise<T>): Promise<T> {
   const tenant = await import("./tenant.ts");
   return tenant.withTenant(tenantId, fn as never) as Promise<T>;
@@ -119,6 +148,7 @@ export async function cashAction(kind: string, b: ActionInput, mutate: (tx: Cash
     } catch (e) {
       if (!(e instanceof CashContractError)) throw e;
       await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT cash_l4_business");
+      if (e instanceof CashConflictAfterRollback) await recordCashConflict(tx, e.conflict);
       result = { status: e.status, body: { ok: false, error: e.message, ...(e.data === undefined ? {} : { data: jsonValue(e.data) }) } };
     }
     // Refus dus à un état passager (reprise en cours, autre session encore ouverte) : jamais mémorisés,

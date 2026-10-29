@@ -28,7 +28,8 @@ function load(file: string, imports: Record<string, unknown>) {
   const source = readFileSync(new URL(file, import.meta.url), "utf8");
   const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const module = { exports: {} as any };
-  const run = vm.runInNewContext(`(function(require,module,exports){${js}\n})`, { Date: fixedDate, Map, Set, BigInt, JSON, Error, Number, String, Object, Array, URL, URLSearchParams });
+  const run = vm.runInNewContext(`(function(require,module,exports){${js}\n})`, { Date: fixedDate, Map, Set, BigInt, JSON, Error, Number, String, Object, Array, URL, URLSearchParams,
+    Buffer: require("node:buffer").Buffer, console: { warn() {} } });
   run((name: string) => name in imports ? imports[name] : require(name), module, module.exports);
   return module.exports;
 }
@@ -61,7 +62,7 @@ function fixture(enforceDayBeforeSale = false) {
     if (enforceDayBeforeSale) assert.ok(heldDays.size, "Day doit être verrouillé avant Sale");
     trace.push(`Sale:${id}`);
   };
-  const names = ["voidAction", "partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement", "loyaltyProgram", "loyaltyAccount", "loyaltyEntry"];
+  const names = ["voidAction", "partialRefund", "cashDay", "cashDaySession", "cashDayOpening", "cashDayClosure", "cashDayEvent", "cashSession", "cashDeposit", "caisseSyncAction", "cashSettings", "parkedBasket", "pickupOrder", "sale", "giftCard", "cashMovement", "loyaltyProgram", "loyaltyAccount", "loyaltyEntry"];
   names.forEach(n => state[n] = []);
   function match(row: Row, where: Row = {}): boolean {
     return Object.entries(where).every(([k, v]) => {
@@ -95,6 +96,8 @@ function fixture(enforceDayBeforeSale = false) {
       out.currentSession = structuredClone(state.cashSession.find(s => s.id === row.currentSessionId));
       if (include.events) out.events = structuredClone(state.cashDayEvent.filter(e => e.cashDayId === row.id && match(e, include.events.where))
         .sort((a, b) => a.sequence > b.sequence ? -1 : a.sequence < b.sequence ? 1 : 0).slice(0, include.events.take));
+      if (include.closures) out.closures = structuredClone(state.cashDayClosure.filter(c => c.cashDayId === row.id && match(c, include.closures.where))
+        .sort((a, b) => b.cycle - a.cycle || b.receivedAt.getTime() - a.receivedAt.getTime()).slice(0, include.closures.take));
     }
     if (name === "cashDaySession" && include) {
       out.cashDay = structuredClone(state.cashDay.find(d => d.tenantId === row.tenantId && d.id === row.cashDayId));
@@ -131,7 +134,7 @@ function fixture(enforceDayBeforeSale = false) {
           sessionId: null, posteId: null, deviceId: null, deviceName: null, ticketNumber: null, sellerId: null, sellerName: null, saleId: null, ...structuredClone(data) };
         if (name === "cashSession") Object.assign(row, { status: "OPEN", openedAt: data.openedAt ?? now, posteId: data.posteId ?? null, ...data });
         if (name === "cashDay") Object.assign(row, { scope: "rotisserie-caisse", ...data });
-        if (name === "cashSettings") Object.assign(row, { defaultFloatXpf: 25000n, allowNegativeStock: false, ...data });
+        if (name === "cashSettings") Object.assign(row, { defaultFloatXpf: 25000n, allowNegativeStock: false, toCloseEnabled: false, ...data });
         if (name === "parkedBasket") row.status = data.status ?? "WAITING";
         if (name === "pickupOrder") row.status = data.status ?? "A_PREPARER";
         if (name === "caisseSyncAction") row.state = data.state ?? "PENDING";
@@ -2180,4 +2183,146 @@ test("repairSale : relit le réglage du commerce sous withTenant à chaque repri
   assert.equal((await repair(tenant, sale.id)).synced, true);
   assert.deepEqual(flags, [false, true, false]);
   assert.deepEqual(reads, [tenant, tenant, tenant]);
+});
+
+test("ouverture CashDay : interrupteur éteint conserve l'acceptation historique de +61 s", async () => {
+  const f = fixture();
+  const b = input({ occurredAt: "2026-10-15T01:01:01.000Z" });
+  const result = await f.sync.cashAction("open", b, tx => f.days.openCashDay(tx, b));
+  assert.equal(result.status, 200);
+  assert.equal(f.rows("cashSession")[0].status, "OPEN");
+});
+
+test("ouverture CashDay : +61 s refusé seulement quand toCloseEnabled est actif", async () => {
+  const f = fixture();
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const b = input({ actionId: "future-enabled", occurredAt: "2026-10-15T01:01:01.000Z" });
+  const result = await f.sync.cashAction("open", b, tx => f.days.openCashDay(tx, b));
+  assert.equal(result.status, 409); assert.equal(result.body.error, "FUTURE_DATE");
+  assert.equal(f.rows("cashSession").length, 0);
+});
+
+test("ouverture CashDay : bascule la veille liée sous verrou et dépose un conflit APPLIED idempotent", async () => {
+  const f = fixture();
+  const veille = input({ actionId: "open-eve", businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00.000Z",
+    sourceKey: "opening-eve", localSessionKey: "local-eve" });
+  await f.sync.cashAction("open", veille, tx => f.days.openCashDay(tx, veille));
+  const oldDay = f.rows("cashDay")[0];
+  const today = input({ actionId: "open-today", sourceKey: "opening-today", localSessionKey: "local-today" });
+  const openToday = () => f.sync.cashAction("open", today, tx => f.days.openCashDay(tx, today));
+  const pending = await openToday();
+  assert.equal(pending.body.error, "PREVIOUS_SESSION_OPEN");
+  assert.equal(f.rows("caisseSyncAction").find(a => a.actionId === today.actionId)!.state, "PENDING");
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const first = await openToday();
+  assert.equal(first.status, 200);
+  assert.equal(f.rows("cashSession").find(s => s.id === oldDay.currentSessionId)!.status, "TO_CLOSE");
+  assert.equal(f.rows("cashDayEvent").filter(e => e.cashDayId === oldDay.id && e.kind === "TO_CLOSE").length, 1);
+  const conflict = f.rows("cashDeposit")[0];
+  assert.equal(conflict.status, "APPLIED"); assert.equal(conflict.deviceId, "core"); assert.equal(conflict.kind, "conflit");
+  assert.equal(conflict.actionId[14], "5");
+  assert.equal(conflict.operation, "PREVIOUS_SESSION_OPEN"); assert.deepEqual(conflict.payload, {});
+  assert.equal(conflict.payloadHash, require("node:crypto").createHash("sha256").update("{}").digest("hex"));
+  assert.equal((await openToday()).status, 200, "rejeu même actionId/corps ACK sans mutation ni second conflit");
+  assert.equal(f.rows("cashDeposit").length, 1);
+  assert.equal(f.rows("cashDay").length, 2);
+});
+
+test("ouverture CashDay : une session OPEN non liée garde PREVIOUS_SESSION_OPEN", async () => {
+  const f = fixture();
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  await f.tx.cashSession.create({ data: { tenantId: tenant, openedBy: actor, openedAt: new Date("2026-10-14T01:00:00Z"), status: "OPEN" } });
+  const b = input({ actionId: "no-alias", sourceKey: "no-alias-open" });
+  const result = await f.sync.cashAction("open", b, tx => f.days.openCashDay(tx, b));
+  assert.equal(result.status, 409); assert.equal(result.body.error, "PREVIOUS_SESSION_OPEN");
+  assert.equal(f.rows("cashDeposit").length, 0);
+});
+
+test("ouverture tardive CashDay : J-7 est créée TO_CLOSE ; J-8 est refusée avec conflit rejoué idempotent", async () => {
+  const f = fixture();
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const atJ7 = input({ actionId: "late-j7", businessDay: "2026-10-08", occurredAt: "2026-10-08T01:00:00.000Z",
+    sourceKey: "opening-j7", localSessionKey: "local-j7" });
+  const accepted = await f.sync.cashAction("open", atJ7, tx => f.days.openCashDay(tx, atJ7));
+  assert.equal(accepted.status, 200);
+  const j7 = f.rows("cashDay")[0];
+  assert.equal(f.rows("cashSession")[0].status, "TO_CLOSE");
+  assert.equal(f.rows("cashDayEvent").filter(e => e.cashDayId === j7.id && e.kind === "TO_CLOSE").length, 1);
+  assert.equal(f.rows("cashDeposit")[0].operation, "OUVERTURE_TARDIVE");
+  const atJ8 = input({ actionId: "late-j8", businessDay: "2026-10-07", occurredAt: "2026-10-07T01:00:00.000Z",
+    sourceKey: "opening-j8", localSessionKey: "local-j8" });
+  const tooOld = () => f.sync.cashAction("open", atJ8, tx => f.days.openCashDay(tx, atJ8));
+  const refused = await tooOld();
+  assert.equal(refused.status, 409); assert.equal(refused.body.error, "OUVERTURE_TROP_ANCIENNE");
+  assert.equal(f.rows("cashDay").length, 1); assert.equal(f.rows("cashSession").length, 1);
+  assert.equal(f.rows("cashDeposit").filter(d => d.operation === "OUVERTURE_TROP_ANCIENNE").length, 1);
+  assert.deepEqual((await tooOld()).body, refused.body);
+  assert.equal(f.rows("cashDeposit").length, 2, "conflit persistant après rollback, sans doublon au rejeu");
+});
+
+test("ouverture tardive CashDay : sourceKey réutilisée sur un autre jour reste SOURCE_CONFLICT sans écriture", async () => {
+  const f = fixture();
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const first = input({ actionId: "late-source-a", businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00.000Z",
+    sourceKey: "shared-late-source", localSessionKey: "local-source-a" });
+  assert.equal((await f.sync.cashAction("open", first, tx => f.days.openCashDay(tx, first))).status, 200);
+  const second = input({ actionId: "late-source-b", businessDay: "2026-10-13", occurredAt: "2026-10-13T01:00:00.000Z",
+    sourceKey: "shared-late-source", localSessionKey: "local-source-b" });
+  const refused = await f.sync.cashAction("open", second, tx => f.days.openCashDay(tx, second));
+  assert.equal(refused.status, 409); assert.equal(refused.body.error, "SOURCE_CONFLICT");
+  assert.equal(f.rows("cashDay").length, 1); assert.equal(f.rows("cashSession").length, 1);
+  assert.equal(f.rows("cashDayOpening").length, 1); assert.equal(f.rows("cashDeposit").length, 1);
+});
+
+test("ouverture CashDay : TO_CLOSE est un marqueur nul et une journée du jour serveur reste OPEN", async () => {
+  assert.equal(projection.factDelta("TO_CLOSE", { sessionId: actor }), 0n);
+  const f = fixture();
+  const old = input({ actionId: "old-open", sourceKey: "old-opening", localSessionKey: "old-local" });
+  await f.sync.cashAction("open", old, tx => f.days.openCashDay(tx, old));
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const sameDay = input({ actionId: "today-open", occurredAt: now.toISOString(), sourceKey: "today-opening", localSessionKey: "today-local" });
+  const result = await f.sync.cashAction("open", sameDay, tx => f.days.openCashDay(tx, sameDay));
+  assert.equal(result.status, 200);
+  assert.equal(f.rows("cashSession").find(s => s.id === f.rows("cashDay")[0].currentSessionId)!.status, "OPEN");
+  assert.equal(f.rows("cashDeposit").length, 0);
+  assert.equal(f.rows("cashDay").length, 1, "une demande pour le jour métier serveur n'ouvre pas un second CashDay");
+  const advance = input({ actionId: "clock-ahead", businessDay: "2026-10-16", occurredAt: "2026-10-15T13:00:30.000Z",
+    sourceKey: "clock-ahead-opening", localSessionKey: "clock-ahead-local" });
+  const refused = await f.sync.cashAction("open", advance, tx => f.days.openCashDay(tx, advance));
+  assert.equal(refused.body.error, "FUTURE_DATE");
+  assert.equal(f.rows("cashSession").find(s => s.id === f.rows("cashDay")[0].currentSessionId)!.status, "OPEN");
+  assert.equal(f.rows("cashDeposit").length, 0);
+});
+
+test("clôture CashDay : REFUND_IN_PROGRESS reste éteint ; rapport enrichi et recomptage ne masquent pas le Z", async () => {
+  const f = fixture();
+  await f.withTenant(tenant, tx => f.days.openCashDay(tx, input()));
+  const day = f.rows("cashDay")[0];
+  await f.tx.partialRefund.create({ data: { tenantId: tenant, cashDayId: day.id, status: "PENDING", actionId: actor } });
+  const close = input({ sourceKey: "to-close-z", cycle: 0, closureMode: "ONLINE", countedXpf: "25950", localExpectedXpf: "25950", localVarianceXpf: "0" });
+  await assert.rejects(f.withTenant(tenant, tx => f.days.closeCashDay(tx, day.id, close)), (e: Row) => e.message === "REFUND_IN_PROGRESS");
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  await f.tx.cashSession.update({ where: { id: day.currentSessionId }, data: { status: "TO_CLOSE" } });
+  const lines = [{ lineXpf: "1000", tgcRatePpm: 60000 }];
+  await f.withTenant(tenant, tx => f.ledger.appendDayFact(tx, tenant, day.id, { kind: "SALE_PAID", sourceRef: "report-sale", deviceId: "A", occurredAt: now,
+    snapshot: { totalXpf: "1000", lines, payments: [{ method: "CASH", amountXpf: "1000" }], parTaux: projection.taxes(lines) } }));
+  await f.withTenant(tenant, tx => f.ledger.appendDayFact(tx, tenant, day.id, { kind: "SALE_VOID", sourceRef: "void-report", deviceId: "A", occurredAt: now,
+    snapshot: { saleRef: "cancelled-sale" } }));
+  await f.withTenant(tenant, tx => f.ledger.appendDayFact(tx, tenant, day.id, { kind: "PARTIAL_REFUND_DONE", sourceRef: "report-refund", deviceId: "A", occurredAt: now,
+    snapshot: { payments: [{ method: "CASH", amountXpf: "150" }] } }));
+  await f.withTenant(tenant, tx => f.ledger.appendDayFact(tx, tenant, day.id, { kind: "MOVEMENT", sourceRef: "report-in", deviceId: "A", occurredAt: now,
+    snapshot: { kind: "CASH_IN", amountXpf: "100" } }));
+  const counted = "25950";
+  const first = await f.withTenant(tenant, tx => f.days.closeCashDay(tx, day.id, { ...close, countedXpf: counted, localExpectedXpf: counted }));
+  assert.equal(first.report.parTaux[60000].ttcXpf, 1000);
+  assert.equal(first.report.cancelledCount, 1); assert.equal(first.report.refundCashXpf, 150); assert.equal(first.report.movementNetXpf, 100);
+  const recount = await f.withTenant(tenant, tx => f.days.closeCashDay(tx, day.id, { ...close, sourceKey: "to-close-recount", countedXpf: counted, localExpectedXpf: counted }));
+  assert.equal(recount.recount, true);
+  const listed = await f.days.listCashDays(f.tx, tenant, new URLSearchParams());
+  assert.deepEqual(listed.days[0].closure, f.rows("cashDayEvent").find(e => e.kind === "CLOSURE" && e.sourceRef === "to-close-z")!.snapshot);
+  const fFalse = fixture();
+  await fFalse.withTenant(tenant, tx => fFalse.days.openCashDay(tx, input()));
+  const oldReport = await fFalse.withTenant(tenant, tx => fFalse.days.closeCashDay(tx, fFalse.rows("cashDay")[0].id,
+    input({ sourceKey: "legacy-report", cycle: 0, closureMode: "ONLINE", countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0" })));
+  assert.equal("parTaux" in oldReport.report, false); assert.equal("cancelledCount" in oldReport.report, false);
 });

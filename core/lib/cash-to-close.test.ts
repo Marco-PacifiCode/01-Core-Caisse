@@ -1,4 +1,4 @@
-// Lot 4a : ports simulés, code de production exécuté sans Prisma ni TypeScript installé.
+// Lots 4a/4b : ports simulés, code de production exécuté sans dépendance installée.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
@@ -11,24 +11,24 @@ import * as projection from "./cash-day-projection.ts";
 // Lectures de l'inventaire confirmées une par une (lignes du lot 4a, avant → après).
 // prisma/schema.prisma:25,69 : enum binaire → troisième valeur connue par le client livré.
 // cash-day-ledger.ts:14 : relations Prisma → mêmes relations, statut transmis ; test ci-dessous.
-// cash-days.ts:30,32,33 : ouverture/sélection/rejet veille OPEN → inchangés (transition en 4b).
+// cash-days.ts : ouverture/sélection/rejet veille OPEN → transition sous interrupteur en 4b.
 // cash-days.ts:60 : statut brut → statut brut TO_CLOSE ; :64 CLOSED/closedLate → false pour TO_CLOSE.
-// cash-days.ts:79,82,85,86 : relations/liste/dernier CLOSURE → inchangés, pas de coercition CLOSED.
+// cash-days.ts : liste → clôture authoritative du dernier cycle sous interrupteur.
 // cash-days.ts:116 : sessions legacy avec statut → transmission brute inchangée.
 // cash-days.ts:159,164,172 : pièces CLOSED uniquement → TO_CLOSE exclu, inchangé.
 // cash-days.ts:262 : réouverture seulement CLOSED → TO_CLOSE non fermé, refus DAY_ALREADY_OPEN.
 // cash-days.ts:274,285 : lockDay/rapport ledger → projection sans branche de statut, inchangée.
-// cash-day-sales.ts:13 : OPEN/offline/import → inchangé, garde de vente à élargir en 4b.
+// cash-day-sales.ts : OPEN/TO_CLOSE/offline/import → vente acceptée ; CLOSED inchangé.
 // cash-day-sales.ts:59,61 : mouvement sans garde statut/date stricte → inchangé (y compris CLOSED).
-// cash-day-guard.ts:44 : remboursement historique avec jour OPEN → inchangé, reprise en 4b.
+// cash-day-guard.ts : remboursement historique → existence du jour sous interrupteur.
 // caisse.ts:143 : unicité OPEN par poste → inchangée, TO_CLOSE n'est pas le tiroir actif.
 // caisse.ts:191 : session courante OPEN → inchangée (/sessions).
 // caisse.ts:358,376 : seul CLOSED figé, sinon comptage → TO_CLOSE clôturable, inchangé.
 // caisse.ts:411,439,443 : réouverture CLOSED/recherche OPEN → inchangée (/sessions).
 // caisse.ts:610,613 : remplacement par session OPEN → inchangé (/sessions).
-// caisse.ts:1841,1843,1866 : gardes remboursement OPEN → inchangées, reprise en 4b.
+// caisse.ts : remboursement réservé PENDING/DONE permis après clôture sous interrupteur.
 // caisse.ts:2074 : statut transmis à correction → type élargi dans payment-correction.ts:37.
-// caisse.ts:2180,2182,2188,2202 : mouvement historique OPEN → inchangé (/sessions).
+// caisse.ts : mouvement CashDay → OPEN du jour serveur, ordre businessDay ; legacy inchangé.
 // partial-refund-db.ts:35,36,86,110,113,117 : tiroir historique OPEN → inchangé, CashDay EXTERNAL.
 // postes.ts:172 : session active OPEN → inchangé, TO_CLOSE n'est pas une session active.
 // z-report.ts:22,28 : type binaire/figé si CLOSED → type élargi/recalcul pour TO_CLOSE.
@@ -70,6 +70,7 @@ function dayPorts() {
     cashDayEvent: { findMany: async () => [] },
     cashDayClosure: { findMany: async () => [] },
     cashDayOpening: { findMany: async () => [] },
+    cashSettings: { findUnique: async () => ({ toCloseEnabled: false }) },
   };
   const sync = { uuid: (value: string) => value, lockCashTenant: async () => {} };
   const ledger = load("cash-day-ledger.ts", ["lockDay", "readFacts"], { ...projection, ...sync });
@@ -132,26 +133,20 @@ test("cash-settings : GET false, PATCH seul refusé, clé ignorée avec un champ
   assert.equal(row, before);
 });
 
-test("4a : aucun usage runtime de TO_CLOSE et aucun écrivain de toCloseEnabled", () => {
+test("4b : aucune route ni réglage partagé ne permet d'allumer toCloseEnabled", () => {
   const roots = [new URL("./", import.meta.url), new URL("../app/api/", import.meta.url)];
-  let statusTypes = 0;
   function scan(dir: URL) {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const file = new URL(entry.name + (entry.isDirectory() ? "/" : ""), dir);
       if (entry.isDirectory()) { scan(file); continue; }
       if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
       const source = readFileSync(file, "utf8");
-      for (const line of source.split(/\r?\n/).filter(line => line.includes("TO_CLOSE"))) {
-        assert.ok(["z-report.ts", "payment-correction.ts"].includes(entry.name), file.pathname);
-        assert.match(line, /^\s*(session: \{ status|sessionStatus):?\s*:?.*"OPEN" \| "TO_CLOSE" \| "CLOSED"/);
-        statusTypes++;
-      }
-      if (source.includes("toCloseEnabled")) {
+      if (source.includes("toCloseEnabled") && file.pathname.includes("/app/api/")) {
         assert.ok(file.pathname.endsWith("/app/api/cash-settings/route.ts"), file.pathname);
         assert.ok(!source.slice(source.indexOf("export function PATCH")).includes("toCloseEnabled"));
       }
     }
   }
   roots.forEach(scan);
-  assert.equal(statusTypes, 2);
+  assert.ok(!readFileSync(new URL("cash-shared-data.ts", import.meta.url), "utf8").includes("toCloseEnabled"));
 });

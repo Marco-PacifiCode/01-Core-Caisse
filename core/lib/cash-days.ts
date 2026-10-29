@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
-import { date, findHistoricalSource, receivedActionInput, lockCashTenant, normalizeActionId, normalizeActionInput, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
+import { date, findHistoricalSource, receivedActionInput, lockCashTenant, normalizeActionId, normalizeActionInput, recordCashConflict, CashConflictAfterRollback, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
 import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
@@ -11,6 +11,12 @@ export function sourceAuthor(b: ActionInput) {
   requireCash(b.importMode === true || !!b.actorId);
   return { actorId: b.actorId == null ? null : uuid(b.actorId), actorName: b.actorId == null ? "auteur non enregistré" : text(b.actorName), receivedById };
 }
+type CashDayReport = ZReport & {
+  parTaux?: Record<string, { ttcXpf: number; htXpf: number; tgcXpf: number }>;
+  cancelledCount?: number;
+  refundCashXpf?: number;
+  movementNetXpf?: number;
+};
 function dayOf(b: ActionInput) {
   const day = validDay(b.businessDay);
   requireCash(businessDay(date(b.occurredAt)) === day, "DAY_MISMATCH", 409);
@@ -24,15 +30,52 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
   const business = dayOf(b), tenantId = b.tenantId, author = sourceAuthor(b);
   const sourceKey = normalizeActionId(text(b.sourceKey, 300)), localSessionKey = normalizeActionId(text(b.localSessionKey, 300));
   const openingFloatXpf = xpfInteger(b.openingFloatXpf);
-  const deviceName = text(b.deviceName);
+  const deviceName = text(b.deviceName), occurredAt = date(b.occurredAt);
+  const toCloseEnabled = (await tx.cashSettings.findUnique({ where: { tenantId } }))?.toCloseEnabled === true;
+  const serverDay = businessDay(new Date());
+  if (toCloseEnabled) requireCash(occurredAt.getTime() <= Date.now() + 60_000, "FUTURE_DATE", 409);
   let day = await tx.cashDay.findUnique({ where: { tenantId_scope_businessDay: { tenantId, scope: "rotisserie-caisse", businessDay: business } } });
+  const conflicts: Array<{ actionName: string; tenantId: string; scope: string; businessDay: string; code: string }> = [];
   if (!day) {
-    const native = await openSessionTx(tx, tenantId, { openedBy: author.actorId ?? author.receivedById,
-      openedByName: author.actorName, openingFloatXpf, occurredAt: date(b.occurredAt) });
-    const session = native.ok ? native.session : await tx.cashSession.findFirst({ where: { tenantId, id: native.sessionId } });
-    if (!session || businessDay(session.openedAt) !== business) throw new CashContractError("PREVIOUS_SESSION_OPEN", 409, native);
-    day = await tx.cashDay.create({ data: { tenantId, businessDay: business, canonicalSessionId: session.id, currentSessionId: session.id } });
-    await tx.cashDaySession.create({ data: { tenantId, cashDayId: day.id, sessionId: session.id, cycle: 0 } });
+    if (toCloseEnabled && business < serverDay) {
+      const ageDays = (Date.parse(`${serverDay}T00:00:00Z`) - Date.parse(`${business}T00:00:00Z`)) / 86_400_000;
+      if (ageDays > 7) throw new CashConflictAfterRollback("OUVERTURE_TROP_ANCIENNE", {
+        actionName: `${tenantId}:rotisserie-caisse:${business}:OUVERTURE_TROP_ANCIENNE`, tenantId, scope: "rotisserie-caisse", businessDay: business,
+      });
+      const session = await tx.cashSession.create({ data: { tenantId, openedBy: author.actorId ?? author.receivedById,
+        openedByName: author.actorName, openingFloatXpf, openedAt: occurredAt, posteId: null, status: "TO_CLOSE" } });
+      day = await tx.cashDay.create({ data: { tenantId, businessDay: business, canonicalSessionId: session.id, currentSessionId: session.id } });
+      await tx.cashDaySession.create({ data: { tenantId, cashDayId: day.id, sessionId: session.id, cycle: 0 } });
+      await appendDayFact(tx, tenantId, day.id, { kind: "TO_CLOSE", sourceRef: session.id, deviceId: "core", occurredAt,
+        snapshot: { sessionId: session.id } });
+      conflicts.push({ actionName: `${day.id}to-close`, tenantId, scope: "rotisserie-caisse", businessDay: business,
+        code: "OUVERTURE_TARDIVE" });
+    } else {
+      if (toCloseEnabled) {
+        const open = await tx.cashSession.findFirst({ where: { tenantId, status: "OPEN", posteId: null }, orderBy: { openedAt: "desc" } });
+        if (open) {
+          const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId: open.id } } });
+          if (alias) {
+            const previousDay = await lockDay(tx, tenantId, alias.cashDayId);
+            const reread = await tx.cashSession.findFirst({ where: { tenantId, id: open.id, status: "OPEN", posteId: null } });
+            if (reread && previousDay.currentSessionId === reread.id && previousDay.businessDay < serverDay && previousDay.businessDay < business) {
+              const changed = await tx.cashSession.updateMany({ where: { tenantId, id: reread.id, status: "OPEN" }, data: { status: "TO_CLOSE" } });
+              requireCash(changed.count === 1, "PREVIOUS_SESSION_OPEN", 409);
+              await appendDayFact(tx, tenantId, previousDay.id, { kind: "TO_CLOSE", sourceRef: reread.id, deviceId: "core", occurredAt,
+                snapshot: { sessionId: reread.id } });
+              conflicts.push({ actionName: `${previousDay.id}to-close`, tenantId, scope: previousDay.scope,
+                businessDay: previousDay.businessDay, code: "PREVIOUS_SESSION_OPEN" });
+            }
+          }
+        }
+      }
+      const native = await openSessionTx(tx, tenantId, { openedBy: author.actorId ?? author.receivedById,
+        openedByName: author.actorName, openingFloatXpf, occurredAt });
+      const session = native.ok ? native.session : await tx.cashSession.findFirst({ where: { tenantId, id: native.sessionId } });
+      if (!session || businessDay(session.openedAt) !== business) throw new CashContractError("PREVIOUS_SESSION_OPEN", 409, native);
+      day = await tx.cashDay.create({ data: { tenantId, businessDay: business, canonicalSessionId: session.id, currentSessionId: session.id } });
+      await tx.cashDaySession.create({ data: { tenantId, cashDayId: day.id, sessionId: session.id, cycle: 0 } });
+    }
   }
   const locked = await lockDay(tx, tenantId, day.id);
   const prior = await tx.cashDayOpening.findFirst({ where: { tenantId, sourceKey: sourceKey } });
@@ -40,13 +83,14 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
     requireCash(prior.cashDayId === day.id && prior.openingFloatXpf === openingFloatXpf && normalizeActionId(prior.localSessionKey) === localSessionKey,
       "SOURCE_CONFLICT", 409);
     requireCash(prior.deviceId === b.deviceId && prior.deviceName === deviceName && prior.actorId === author.actorId
-      && prior.actorName === author.actorName && prior.occurredAt.getTime() === date(b.occurredAt).getTime(), "SOURCE_CONFLICT", 409);
+      && prior.actorName === author.actorName && prior.occurredAt.getTime() === occurredAt.getTime(), "SOURCE_CONFLICT", 409);
   } else {
     await tx.cashDayOpening.create({ data: { tenantId, cashDayId: day.id, sourceKey, localSessionKey, deviceId: b.deviceId, deviceName,
-      ...author, occurredAt: date(b.occurredAt), openingFloatXpf } });
+      ...author, occurredAt, openingFloatXpf } });
     await appendDayFact(tx, tenantId, day.id, { kind: "OPENING", sourceRef: sourceKey, deviceId: b.deviceId,
-      occurredAt: date(b.occurredAt), snapshot: { ...author, localSessionKey, openingFloatXpf, deviceName } });
+      occurredAt, snapshot: { ...author, localSessionKey, openingFloatXpf, deviceName } });
   }
+  for (const conflict of conflicts) await recordCashConflict(tx, conflict);
   return { ...(await dayState(tx, tenantId, day.id)), fondRetenu: String(locked.canonicalSession.openingFloatXpf),
     fondNonRetenu: openingFloatXpf !== locked.canonicalSession.openingFloatXpf };
 }
@@ -76,14 +120,26 @@ function dayPage(q: URLSearchParams, fallback: number, max: number) {
 export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchParams) {
   tenantId = uuid(tenantId);
   const { limit, cursor } = dayPage(q, 31, 100);
+  const toCloseEnabled = (await tx.cashSettings.findUnique({ where: { tenantId } }))?.toCloseEnabled === true;
   // Index (tenantId, scope, businessDay), sans passer par dayState/lockDay.
   const rows = await tx.cashDay.findMany({
     where: { tenantId, scope: "rotisserie-caisse", ...(cursor ? { businessDay: { lt: cursor } } : {}) },
     orderBy: { businessDay: "desc" }, take: limit + 1,
     include: { canonicalSession: true, currentSession: true,
+      ...(toCloseEnabled ? { closures: { where: { tenantId, authoritative: true }, orderBy: [{ cycle: "desc" }, { receivedAt: "desc" }], take: 1 } } : {}),
       events: { where: { tenantId, kind: "CLOSURE" }, orderBy: { sequence: "desc" }, take: 1 } },
   });
-  return { days: rows.slice(0, limit).map(day => ({ ...cashDayView(day), closure: day.events[0]?.snapshot ?? null })),
+  const days = [];
+  for (const day of rows.slice(0, limit)) {
+    let closure = day.events[0]?.snapshot ?? null;
+    if (toCloseEnabled) {
+      const authoritative = day.closures?.[0];
+      const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
+      closure = event?.snapshot ?? null;
+    }
+    days.push({ ...cashDayView(day), closure });
+  }
+  return { days,
     nextCursor: rows.length > limit ? rows[limit - 1].businessDay : null };
 }
 
@@ -181,7 +237,8 @@ export async function listPendingLegacyClosures(tx: CashTx, tenantId: string, q:
 export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput) {
   cashDayId = uuid(cashDayId); b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
-  requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
+  const toCloseEnabled = (await tx.cashSettings.findUnique({ where: { tenantId: b.tenantId } }))?.toCloseEnabled === true;
+  if (!toCloseEnabled) requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
   const countedXpf = xpfInteger(b.countedXpf), occurredAt = date(b.occurredAt);
   // La clôture conserve son heure réelle ; le Z reste rattaché au CashDay d'origine.
   requireCash(businessDay(occurredAt) >= day.businessDay, "DAY_MISMATCH", 409);
@@ -219,7 +276,7 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
   const facts = await readFacts(tx, b.tenantId, day.id, day.revision);
   const totals = projectCashDay({ fond: day.canonicalSession.openingFloatXpf, cycle, revision: day.revision, facts, closures: [] }).totauxCourants;
   const expected = totals.expectedXpf;
-  let report: ZReport | null = null;
+  let report: CashDayReport | null = null;
   if (authoritative) {
     // Le rapport natif utilise son contrat numérique historique : refus de conversion non sûre.
     safeXpf(countedXpf); safeXpf(expected);
@@ -234,6 +291,12 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
       giftCardRedeemedCount: totals.giftCardRedeemedCount, giftCardRedeemedXpf: safeXpf(totals.giftCardRedeemedXpf),
       // SALE_PAID impose un paiement intégral dans le journal CashDay.
       creditXpf: 0, expectedXpf: safeXpf(expected), countedXpf: safeXpf(countedXpf), varianceXpf: safeXpf(countedXpf - expected) };
+    if (toCloseEnabled) Object.assign(report, {
+      parTaux: Object.fromEntries(Object.entries(totals.parTaux).sort(([a], [b]) => Number(a) - Number(b)).map(([rate, row]) => [Number(rate), {
+        ttcXpf: safeXpf(row.ttcXpf), htXpf: safeXpf(row.htXpf), tgcXpf: safeXpf(row.tgcXpf),
+      }])),
+      cancelledCount: totals.cancelledCount, refundCashXpf: safeXpf(totals.refundCashXpf), movementNetXpf: safeXpf(totals.movementNetXpf),
+    });
     // Heure d'origine seulement à la première clôture ; aucune pièce fermée n'est réécrite.
     if (!native.alreadyClosed) {
       const variance = countedXpf - expected;
