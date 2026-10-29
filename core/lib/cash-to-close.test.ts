@@ -134,6 +134,7 @@ test("repli éteint : clôture TO_CLOSE enrichie et Z authoritative relu après 
   const day: any = f.day;
   day.closures = [{ sourceKey: "authoritative" }];
   day.events = [{ snapshot: { report: { varianceXpf: 999 } } }];
+  tx.cashDayEvent.findMany = async () => [{ cashDayId: id }];
   tx.cashDayEvent.findFirst = async ({ where }: any) => where.kind === "TO_CLOSE"
     ? { id: "marker" } : where.sourceRef === "authoritative" ? closureFact : null;
   const listed = await f.days.listCashDays(tx, tenantId, new URLSearchParams());
@@ -183,4 +184,26 @@ test("4b : aucune route ni réglage partagé ne permet d'allumer toCloseEnabled"
   }
   roots.forEach(scan);
   assert.ok(!readFileSync(new URL("cash-shared-data.ts", import.meta.url), "utf8").includes("toCloseEnabled"));
+});
+
+test("listCashDays : interrupteur eteint, trois jours et une seule recherche TO_CLOSE", async () => {
+  const f = dayPorts();
+  const rows = [0, 1, 2].map(n => ({ ...f.day, id: id + n,
+    businessDay: "2026-10-" + (28 - n),
+    currentSession: { ...f.day.currentSession, status: "CLOSED" },
+    events: [{ snapshot: { marker: n } }], closures: [] }));
+  let queries = 0;
+  f.tx.cashDay.findMany = async () => rows;
+  f.tx.cashDayEvent.findMany = async (q: any) => {
+    queries++;
+    assert.equal(q.where.tenantId, tenantId);
+    assert.equal(q.where.kind, "TO_CLOSE");
+    assert.deepEqual(Array.from(q.where.cashDayId.in), rows.map(d => d.id));
+    assert.deepEqual(JSON.parse(JSON.stringify(q.select)), { cashDayId: true });
+    return [{ cashDayId: rows[1].id }];
+  };
+  const result = await f.days.listCashDays(f.tx, tenantId, new URLSearchParams());
+  assert.deepEqual(JSON.parse(JSON.stringify(result.days.map((d: any) => d.closure))),
+    [{ marker: 0 }, null, { marker: 2 }]);
+  assert.equal(queries, 1);
 });

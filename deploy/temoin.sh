@@ -312,7 +312,6 @@ def temoin_to_close():
             break
         propre = jour.get("openedByName") == auteur and jour.get("openedBy") == ACTEUR
         if propre and jour.get("status") == "CLOSED" and jour.get("closedByName") != "Secours temoin TO_CLOSE":
-            print(f"caissedemo TO_CLOSE : {business}, deja prouve (CLOSED, meme auteur)")
             jid_preuve = jour.get("cashDayId")
             if not jid_preuve:
                 ko("TO_CLOSE, jour deja prouve sans identifiant")
@@ -343,6 +342,7 @@ def temoin_to_close():
                     or any(str(report.get(k)) != v for k, v in attendu_preuve.items())
                     or report.get("parTaux") != {}):
                 ko("TO_CLOSE, Z deja prouve absent ou incorrect")
+            print(f"caissedemo TO_CLOSE : {business}, deja prouve (CLOSED, meme auteur)")
             return "TO_CLOSE vert (deja prouve, Z relu, ecart 0)"
         # Tout jour existant est occupé, même s'il s'agit d'un reste TO_CLOSE du témoin.
         print(f"TO_CLOSE : {business} occupe, saute (aucune ecriture)")
@@ -416,7 +416,7 @@ def temoin_to_close():
         return ledger.get("data", [])
     fs_led = faits(led)
     if fs_led is None:
-        print(f"TO_CLOSE : {business} journal incomplet, sautÃ© (aucune Ã©criture)")
+        print(f"TO_CLOSE : {business} journal incomplet, saute (aucune ecriture)")
         return "TO_CLOSE non joué (journal incomplet)"
     if len([f for f in fs_led if f.get("kind") == "TO_CLOSE"]) != 1:
         ko("TO_CLOSE, evenement absent ou duplique")
