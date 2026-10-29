@@ -1,5 +1,11 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ 2026-10-29 — Lot 2 « à fermer », étape 4a EN LIGNE (21 h 02 NC, tag `deploy/core-caisse/20261029T100254Z-4b827d31aa0f`)
+- 4a = valeur d'enum `SessionStatus.TO_CLOSE` + colonne `CashSettings.toCloseEnabled` (défaut false, lue par GET /api/cash-settings, jamais modifiable par PATCH ni par aucune route). Aucune écriture de TO_CLOSE. Migrations additives jouées avant le ship (20261029200000_cash_to_close, 20261029200100_cash_settings_to_close_enabled ; pg_dump core-caisse-20261029T095501Z-avant.sql). QCM Marco + VAS-Y 00-Architecture, 4 témoins verts, +15 vert.
+- 4b (transition sous interrupteur, ouverture tardive ≤ 7 jours, ventes sur TO_CLOSE, rapport enrichi) : branche `claude/core-caisse-4b-final`, en relecture (2e et dernière).
+- ⛔ **RÈGLE DE REPLI (00-Architecture, 29/10)** : aucun retour manuel sous la 4b dès qu'un `toCloseEnabled` a été allumé ; repli = `toCloseEnabled=false`. Preuve : 4b827d3 ne lit plus une journée TO_CLOSE (factDelta sans TO_CLOSE → ledger et clôture en 400, vente en ligne 409). Le rollback automatique pendant la livraison de la 4b reste sûr tant qu'aucun interrupteur n'est allumé (aucune ligne TO_CLOSE).
+- Allumage : commerce par commerce, par QCM Marco avec le relevé des versions de ses appareils ; caissedemo d'abord, pour le témoin TO_CLOSE.
+
 ## ✅ 2026-10-29 — Dépôt CashDeposit EN LIGNE (16 h 18 NC, tag `deploy/core-caisse/20261029T051848Z-711530a72665`)
 main `711530a` (PR 103 `bc276b7` + PR 104 `2213a9a`) : dépôt brut des actions d'appareil (table `CashDeposit`, routes POST/GET `/api/cash-deposits`, décision Marco 29/10 « rien ne reste bloqué sur la tablette »). ci-local GREEN sur 711530a (test:pg 19/19, unitaires 837). Migration `20261029160000_cash_deposit` jouée 16 h 13 par migrate-local (pg_dump `premigration/core-caisse-20261029T051340Z-avant.sql`, preuve RLS) : table présente, RLS ENABLE + FORCE, politique `tenant_isolation`. Livraison sur accord Marco (QCM) + feu vert 00-Architecture ; routage moteur authorization + database_migration. Témoins OK : core-caisse, mixydemo (vente encaissée puis annulée), mixytruck (lecture), rotisserie-surface. GET `/api/cash-deposits` (tenant Rôtisserie) → 200 vide. Phase 2 (application serveur des dépôts) : non commencée.
 
