@@ -95,7 +95,11 @@ function opening(b: ReturnType<typeof input>) { return sync.cashAction("cash-day
 function closeInput(tenantId: string, extra: Record<string, any> = {}) {
   return input(tenantId, 0, { cycle: 0, countedXpf: "1000", localExpectedXpf: "1000", localVarianceXpf: "0", closureMode: "ONLINE", ...extra });
 }
-function json(value: unknown) { return JSON.stringify(value, (_key, v) => typeof v === "bigint" ? String(v) : v); }
+// JSON canonique : jsonb (Postgres) ne garde pas l'ordre des clés d'une réponse stockée puis rejouée.
+function json(value: unknown) {
+  return JSON.stringify(value, (_key, v) => typeof v === "bigint" ? String(v)
+    : v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : v);
+}
 
 test("4b pg : éteint garde le corps 409 ; même ouverture PENDING réussit après allumage et se rejoue", async () => fixture(async (tenant, tx) => {
   const old = await previous(tx, tenant);
