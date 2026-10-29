@@ -186,7 +186,13 @@ export async function currentSession(tenantId: string, posteId?: string | null) 
   // session d'un autre comptoir ferait rattacher des ventes au mauvais tiroir.
   // Pour les marchands mono-caisse, dont les sessions ont `posteId = NULL`, le
   // résultat est exactement celui d'avant.
-  return withTenant(tenantId, (tx) => {
+  return withTenant(tenantId, async (tx) => {
+    const enabled = (await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled === true;
+    if (enabled && await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) {
+      const day = await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN", posteId: receivedPosteId } },
+        orderBy: { businessDay: "desc" }, select: { currentSessionId: true } });
+      if (day) return tx.cashSession.findFirst({ where: { tenantId, id: day.currentSessionId } });
+    }
     return tx.cashSession.findFirst({
       where: { tenantId, status: "OPEN", posteId: receivedPosteId },
       orderBy: { openedAt: "desc" },
@@ -204,6 +210,10 @@ export type ZReport = {
   salesCount: number;
   totalSalesXpf: number; // CA total de la session (tous moyens de paiement)
   byMethod: Record<string, number>;
+  parTaux?: Record<string, { htXpf: number; tgcXpf: number; ttcXpf: number }>;
+  cancelledCount?: number;
+  refundCashXpf?: number;
+  movementNetXpf?: number;
   // ── Mouvements de tiroir (chantier « ecart de caisse », 2026-08-05) ────────────────
   // Trois postes SEPARES et POSITIFS : ils expliquent l'ecart, ils ne le noient pas dans
   // un net opaque. Ils entrent dans `expectedXpf` et n'entrent PAS dans `totalSalesXpf` :
@@ -257,8 +267,14 @@ export async function closeSessionTx(
     const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId: input.sessionId } } });
     const owner = alias ? { id: alias.cashDayId } : await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: input.sessionId } });
     if (owner) {
-      await lockDay(tx, tenantId, owner.id);
-      if (await tx.partialRefund.findFirst({ where: { tenantId, cashDayId: owner.id, status: "PENDING" } })) throw new CashContractError("REFUND_IN_PROGRESS", 409);
+      const day = await lockDay(tx, tenantId, owner.id);
+      const pendingRefund = await tx.partialRefund.findFirst({ where: { tenantId, cashDayId: owner.id, status: "PENDING" } });
+      if (pendingRefund) {
+        const settings = await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } });
+        const toCloseFact = settings?.toCloseEnabled === true || day.currentSession.status === "TO_CLOSE"
+          || !!await tx.cashDayEvent?.findFirst({ where: { tenantId, cashDayId: owner.id, kind: "TO_CLOSE" }, select: { id: true } });
+        if (!toCloseFact) throw new CashContractError("REFUND_IN_PROGRESS", 409);
+      }
     }
     // Sérialise le Z avec la finalisation d'un REFUND: lecture après le verrou.
     await tx.$executeRaw`SELECT set_config('lock_timeout', ${"3s"}, true)`;
@@ -609,6 +625,7 @@ export async function openSaleSession(
   const session = await tx.cashSession.findFirst({ where: { tenantId, id: sessionId }, select: { status: true, posteId: true } });
   if (session?.status === "OPEN") return sessionId;
   const poste = posteId ?? session?.posteId;
+  // Helper historique : les parcours CashDay ont leur propre sélection par businessDay.
   const replacement = await tx.cashSession.findFirst({
     where: { tenantId, status: "OPEN", ...(poste != null ? { posteId: poste } : {}) },
     orderBy: [{ openedAt: "desc" }, { id: "asc" }], select: { id: true },
@@ -1840,9 +1857,16 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
         if (day.currentSession.status !== "OPEN") {
           const reserved = await tx.partialRefund.findFirst({ where: { tenantId: safeTenantId, actionId: normalizeActionId(normalized.actionId) } });
-          if (reserved?.cashDayId === day.id && reserved.status === "PENDING") throw new CashContractError("REFUND_DAY_CLOSED_REOPEN_REQUIRED", 409,
-            { message: "Le jour réservé est clos : rouvrir cette caisse puis rejouer le même avoir." });
-          throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+          const sameReservation = reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId;
+          const settings = await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } });
+          const lateContract = settings?.toCloseEnabled === true || day.currentSession.status === "TO_CLOSE"
+            || !!await tx.cashDayEvent?.findFirst({ where: { tenantId: safeTenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true } });
+          if (day.currentSession.status === "CLOSED" && !(lateContract && sameReservation && (reserved.status === "PENDING" || reserved.status === "DONE"))) {
+            // Conserver l'erreur historique pour une réservation incompatible, même interrupteur éteint.
+            if (reserved?.cashDayId === day.id && reserved.status === "PENDING") throw new CashContractError("REFUND_DAY_CLOSED_REOPEN_REQUIRED", 409,
+              { message: "Le jour réservé est clos : rouvrir cette caisse puis rejouer le même avoir." });
+            throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+          }
         }
         if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
         // Refuse la collision avant la réservation de l'avoir et tout appel Compta.
@@ -1863,7 +1887,15 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
     recordDrawer: async (tx, action, plan) => {
       if (!normalized.cashDayId) return;
       const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
-      if (day.currentSession.status !== "OPEN") throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+      const reserved = await tx.partialRefund.findFirst({ where: { tenantId: safeTenantId, actionId: normalizeActionId(normalized.actionId) } });
+      if (day.currentSession.status === "CLOSED") {
+        const settings = await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } });
+        const lateContract = settings?.toCloseEnabled === true || !!await tx.cashDayEvent?.findFirst({
+          where: { tenantId: safeTenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true },
+        });
+        if (!lateContract || !(reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId
+          && (reserved.status === "PENDING" || reserved.status === "DONE"))) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
+      }
       if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
       await appendDayFact(tx, safeTenantId, day.id, { kind: "PARTIAL_REFUND_DONE", sourceRef: normalized.actionId,
         refundActionId: action.id, deviceId: normalized.deviceId!, occurredAt: new Date(normalized.occurredAt!),
@@ -2177,7 +2209,9 @@ export async function recordCashMovement(
   tenantId = uuid(tenantId); input = normalizeActionInput(input);
   return withTenant(tenantId, async (tx) => {
     await lockCashTenant(tx, tenantId);
-    const openDay = await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN" } } });
+    const toCloseEnabled = (await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled === true;
+    const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+    const openDay = await tx.cashDay.findFirst({ where: { tenantId, currentSession: { status: "OPEN" }, ...(toCloseEnabled ? { businessDay: today } : {}) }, ...(toCloseEnabled ? { orderBy: { businessDay: "desc" } } : {}) });
     const lockedDay = openDay ? await lockDay(tx, tenantId, openDay.id) : null;
     if (lockedDay ? lockedDay.currentSession.status !== "OPEN"
       : await tx.cashDay.findFirst({ where: { tenantId }, select: { id: true } })) {

@@ -55,9 +55,10 @@ test("openSession rattrape la course sur l'index unique au lieu de remonter une 
 });
 
 test("currentSession cherche la session DU poste, pas n'importe laquelle", () => {
-  const bloc = caisse.slice(caisse.indexOf("export async function currentSession"));
-  assert.match(bloc.slice(0, 1200), /const receivedPosteId = posteId \?\? null/);
-  assert.match(bloc.slice(0, 1200), /where:\s*\{ tenantId, status: "OPEN", posteId: receivedPosteId \}/);
+  const start = caisse.indexOf("export async function currentSession");
+  const bloc = caisse.slice(start, caisse.indexOf("\nexport ", start + 10));
+  assert.match(bloc, /const receivedPosteId = posteId \?\? null/);
+  assert.match(bloc, /where:\s*\{ tenantId, status: "OPEN", posteId: receivedPosteId \}/);
 });
 
 // ── Horodatage ───────────────────────────────────────────────────────────────
