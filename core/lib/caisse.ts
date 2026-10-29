@@ -267,11 +267,13 @@ export async function closeSessionTx(
     const alias = await tx.cashDaySession.findUnique({ where: { tenantId_sessionId: { tenantId, sessionId: input.sessionId } } });
     const owner = alias ? { id: alias.cashDayId } : await tx.cashDay.findFirst({ where: { tenantId, canonicalSessionId: input.sessionId } });
     if (owner) {
-      await lockDay(tx, tenantId, owner.id);
+      const day = await lockDay(tx, tenantId, owner.id);
       const pendingRefund = await tx.partialRefund.findFirst({ where: { tenantId, cashDayId: owner.id, status: "PENDING" } });
       if (pendingRefund) {
         const settings = await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } });
-        if (settings?.toCloseEnabled !== true) throw new CashContractError("REFUND_IN_PROGRESS", 409);
+        const toCloseFact = settings?.toCloseEnabled === true || day.currentSession.status === "TO_CLOSE"
+          || !!await tx.cashDayEvent?.findFirst({ where: { tenantId, cashDayId: owner.id, kind: "TO_CLOSE" }, select: { id: true } });
+        if (!toCloseFact) throw new CashContractError("REFUND_IN_PROGRESS", 409);
       }
     }
     // Sérialise le Z avec la finalisation d'un REFUND: lecture après le verrou.
@@ -1854,16 +1856,15 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
       if (normalized.cashDayId) {
         const day = await lockDay(tx, safeTenantId, normalized.cashDayId);
         if (day.currentSession.status !== "OPEN") {
-          const enabled = (await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled === true;
           const reserved = await tx.partialRefund.findFirst({ where: { tenantId: safeTenantId, actionId: normalizeActionId(normalized.actionId) } });
-          if (!enabled) {
-            // Conserver exactement le refus historique, même sur une clé en collision.
+          const sameReservation = reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId;
+          const settings = await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } });
+          const lateContract = settings?.toCloseEnabled === true || day.currentSession.status === "TO_CLOSE"
+            || !!await tx.cashDayEvent?.findFirst({ where: { tenantId: safeTenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true } });
+          if (day.currentSession.status === "CLOSED" && !(lateContract && sameReservation && (reserved.status === "PENDING" || reserved.status === "DONE"))) {
+            // Conserver l'erreur historique pour une réservation incompatible, même interrupteur éteint.
             if (reserved?.cashDayId === day.id && reserved.status === "PENDING") throw new CashContractError("REFUND_DAY_CLOSED_REOPEN_REQUIRED", 409,
               { message: "Le jour réservé est clos : rouvrir cette caisse puis rejouer le même avoir." });
-            throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
-          }
-          const sameReservation = reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId;
-          if (day.currentSession.status === "CLOSED" && !(sameReservation && (reserved.status === "PENDING" || reserved.status === "DONE"))) {
             throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
           }
         }
@@ -1889,10 +1890,12 @@ export async function rembourserPartiellement(tenantId: string, saleId: string, 
       const reserved = await tx.partialRefund.findFirst({ where: { tenantId: safeTenantId, actionId: normalizeActionId(normalized.actionId) } });
       if (day.currentSession.status === "CLOSED") {
         const settings = await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } });
-        if (settings?.toCloseEnabled !== true || !(reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId
+        const lateContract = settings?.toCloseEnabled === true || !!await tx.cashDayEvent?.findFirst({
+          where: { tenantId: safeTenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true },
+        });
+        if (!lateContract || !(reserved?.cashDayId === day.id && reserved.saleId.toLowerCase() === saleId
           && (reserved.status === "PENDING" || reserved.status === "DONE"))) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
       }
-      if (day.currentSession.status === "TO_CLOSE" && (await tx.cashSettings?.findUnique({ where: { tenantId: safeTenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled !== true) throw new CashContractError("CASHDAY_ROUTE_REQUIRED", 409);
       if (day.businessDay !== normalized.drawerBusinessDay) throw new Error("DAY_MISMATCH");
       await appendDayFact(tx, safeTenantId, day.id, { kind: "PARTIAL_REFUND_DONE", sourceRef: normalized.actionId,
         refundActionId: action.id, deviceId: normalized.deviceId!, occurredAt: new Date(normalized.occurredAt!),

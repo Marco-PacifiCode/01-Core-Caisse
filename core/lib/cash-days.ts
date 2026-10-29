@@ -37,7 +37,10 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
   let day = await tx.cashDay.findUnique({ where: { tenantId_scope_businessDay: { tenantId, scope: "rotisserie-caisse", businessDay: business } } });
   const conflicts: Array<{ actionName: string; tenantId: string; scope: string; businessDay: string; code: string }> = [];
   if (!day) {
-    if (toCloseEnabled && business < serverDay) {
+    const newerDay = toCloseEnabled && business < serverDay
+      ? await tx.cashDay.findFirst({ where: { tenantId, scope: "rotisserie-caisse", businessDay: { gt: business } }, select: { id: true } })
+      : null;
+    if (newerDay) {
       const ageDays = (Date.parse(`${serverDay}T00:00:00Z`) - Date.parse(`${business}T00:00:00Z`)) / 86_400_000;
       if (ageDays > 7) throw new CashConflictAfterRollback("OUVERTURE_TROP_ANCIENNE", {
         actionName: `${tenantId}:rotisserie-caisse:${business}:OUVERTURE_TROP_ANCIENNE`, tenantId, scope: "rotisserie-caisse", businessDay: business,
@@ -126,13 +129,16 @@ export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchPar
     where: { tenantId, scope: "rotisserie-caisse", ...(cursor ? { businessDay: { lt: cursor } } : {}) },
     orderBy: { businessDay: "desc" }, take: limit + 1,
     include: { canonicalSession: true, currentSession: true,
-      ...(toCloseEnabled ? { closures: { where: { tenantId, authoritative: true }, orderBy: [{ cycle: "desc" }, { receivedAt: "desc" }], take: 1 } } : {}),
+      closures: { where: { tenantId, authoritative: true }, orderBy: [{ cycle: "desc" }, { receivedAt: "desc" }], take: 1 },
       events: { where: { tenantId, kind: "CLOSURE" }, orderBy: { sequence: "desc" }, take: 1 } },
   });
   const days = [];
   for (const day of rows.slice(0, limit)) {
     let closure = day.events[0]?.snapshot ?? null;
-    if (toCloseEnabled) {
+    const hasToClose = day.currentSession.status === "TO_CLOSE" || (!toCloseEnabled && !!await tx.cashDayEvent.findFirst({
+      where: { tenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true },
+    }));
+    if (toCloseEnabled || hasToClose) {
       const authoritative = day.closures?.[0];
       const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
       closure = event?.snapshot ?? null;
@@ -238,7 +244,12 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
   cashDayId = uuid(cashDayId); b = normalizeActionInput(b);
   const day = await lockDay(tx, b.tenantId, cashDayId), author = sourceAuthor(b);
   const toCloseEnabled = (await tx.cashSettings.findUnique({ where: { tenantId: b.tenantId } }))?.toCloseEnabled === true;
-  if (!toCloseEnabled) requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
+  // L'extinction empêche les créations ; elle ne change pas le contrat des données 4b existantes.
+  const hasToClose = day.currentSession.status === "TO_CLOSE" || !!await tx.cashDayEvent.findFirst({
+    where: { tenantId: b.tenantId, cashDayId, kind: "TO_CLOSE" }, select: { id: true },
+  });
+  const lateContract = toCloseEnabled || hasToClose;
+  if (!lateContract) requireCash(!await tx.partialRefund.findFirst({ where: { tenantId: b.tenantId, cashDayId, status: "PENDING" } }), "REFUND_IN_PROGRESS", 409);
   const countedXpf = xpfInteger(b.countedXpf), occurredAt = date(b.occurredAt);
   // La clôture conserve son heure réelle ; le Z reste rattaché au CashDay d'origine.
   requireCash(businessDay(occurredAt) >= day.businessDay, "DAY_MISMATCH", 409);
@@ -291,7 +302,7 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
       giftCardRedeemedCount: totals.giftCardRedeemedCount, giftCardRedeemedXpf: safeXpf(totals.giftCardRedeemedXpf),
       // SALE_PAID impose un paiement intégral dans le journal CashDay.
       creditXpf: 0, expectedXpf: safeXpf(expected), countedXpf: safeXpf(countedXpf), varianceXpf: safeXpf(countedXpf - expected) };
-    if (toCloseEnabled) Object.assign(report, {
+    if (lateContract) Object.assign(report, {
       parTaux: Object.fromEntries(Object.entries(totals.parTaux).sort(([a], [b]) => Number(a) - Number(b)).map(([rate, row]) => [Number(rate), {
         ttcXpf: safeXpf(row.ttcXpf), htXpf: safeXpf(row.htXpf), tgcXpf: safeXpf(row.tgcXpf),
       }])),

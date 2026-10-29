@@ -54,10 +54,14 @@ function load(file: string): any {
 }
 const globals: Record<string, any> = { Date: Clock, Error, BigInt, Prisma, randomUUID, createHash, withTenant: transaction };
 for (const file of ["cash-day-projection", "caisse-sync", "cash-day-guard", "cash-day-ledger", "sale-lock", "money", "cash-movement", "gift-card", "z-report", "credit", "sync", "partial-refund", "partial-refund-db"]) Object.assign(globals, load(file));
-globals.comptaClient = () => ({ creditNote: async () => { creditCalls++; await onCredit?.(); return { creditNoteId: "synthetic-credit", totalXpf: -100 }; } });
+globals.comptaClient = () => ({ creditNote: async () => { creditCalls++; await onCredit?.(); return { creditNoteId: "synthetic-credit", totalXpf: -100 }; }, receiptUrl: () => null });
+// Frontière Compta/Stock seule simulée : l'encaissement et le journal utilisent le vrai PostgreSQL.
+globals.syncLoadedSale = async () => ({ synced: true, failure: null, stopped: null, invoiceId: null, invoiceNumber: null,
+  stockDecremented: 0, neutralized: false, settledOnVoidingSale: false, stockOnVoidingSale: false });
 globals.log = { warn() {}, error() {} };
+globals.assertTenantId = (value: string) => value;
 const context = vm.createContext(globals), caisse = readFileSync(resolve(lib, "caisse.ts"), "utf8");
-for (const name of ["openSessionTx", "closeSessionTx", "currentSession", "openSaleSession", "recordCashMovement", "rembourserPartiellement"]) {
+for (const name of ["openSessionTx", "closeSessionTx", "currentSession", "openSaleSession", "recordCashMovement", "getSale", "checkoutSale", "rembourserPartiellement"]) {
   const start = caisse.indexOf(`export async function ${name}(`), end = caisse.indexOf("\nexport ", start + 10);
   assert.ok(start >= 0, name);
   const js = ts.transpileModule(caisse.slice(start, end < 0 ? undefined : end).replace("export ", ""), {
@@ -143,6 +147,65 @@ test("4b pg : éteint garde le corps 409 ; même ouverture PENDING réussit apr�
   assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 1);
 }));
 
+test("4b pg : repli éteint conserve les jours TO_CLOSE issus de bascule et ouverture tardive", async () => fixture(async (tenant, tx) => {
+  const bascule = await previous(tx, tenant);
+  const today = await opening(input(tenant));
+  assert.equal(today.status, 200);
+  const tardifInput = input(tenant, -2);
+  const tardif = await opening(tardifInput);
+  assert.equal(tardif.status, 200); assert.equal(tardif.body.data.status, "TO_CLOSE");
+  const lateDayId = tardif.body.data.id as string;
+  await flag(tx, tenant, false);
+
+  const lines = [{ kind: "OTHER", label: "Recette", qty: 1, unitXpf: "106", lineXpf: "106", tgcRatePpm: 60000 }];
+  async function sell(dayId: string, offset: number, offlineCompleted: boolean) {
+    const body = input(tenant, offset, { sourceType: "recette-repli", sourceId: randomUUID(), ticketNumber: randomUUID(), lines,
+      ...(offlineCompleted ? { offlineCompleted: true } : {}) });
+    const sale = await sales.createDaySale(tx, dayId, body);
+    assert.ok(sale.id);
+    const paid = await native.checkoutSale(tenant, sale.id, [{ method: "CASH", amountXpf: 106n }], {
+      cashDayId: dayId, paidAt: new Date(body.occurredAt),
+    });
+    assert.equal(paid.ok, true);
+  }
+  await sell(bascule.id, -1, false); // vente en ligne datée du jour basculé
+  await sell(lateDayId, -2, true); // remontée hors ligne datée du jour ouvert tardivement
+
+  const closed = await days.closeCashDay(tx, bascule.id, closeInput(tenant, { countedXpf: "1106", localExpectedXpf: "1106" }));
+  assert.equal(closed.report.totalSalesXpf, 106); assert.equal(closed.report.expectedXpf, 1106);
+  assert.equal(closed.report.varianceXpf, 0); assert.equal(closed.report.cancelledCount, 0);
+  assert.equal((await days.dayState(tx, tenant, bascule.id)).closedLate, true);
+  const closedLate = await days.closeCashDay(tx, lateDayId, closeInput(tenant, { countedXpf: "1106", localExpectedXpf: "1106" }));
+  assert.equal(closedLate.report.totalSalesXpf, 106); assert.equal(closedLate.report.expectedXpf, 1106);
+  assert.equal(closedLate.report.varianceXpf, 0);
+  assert.equal((await days.dayState(tx, tenant, lateDayId)).closedLate, true);
+  assert.equal((await days.dayState(tx, tenant, bascule.id)).status, "CLOSED");
+  assert.equal((await days.dayState(tx, tenant, lateDayId)).status, "CLOSED");
+  assert.equal((await days.ledgerPage(tx, tenant, bascule.id, new URLSearchParams())).data.length > 0, true);
+  assert.equal((await days.ledgerPage(tx, tenant, lateDayId, new URLSearchParams())).data.length > 0, true);
+  const listing = await days.listCashDays(tx, tenant, new URLSearchParams());
+  assert.equal(listing.days.find((day: any) => day.id === bascule.id)?.status, "CLOSED");
+  assert.equal(listing.days.find((day: any) => day.id === lateDayId)?.status, "CLOSED");
+  assert.equal(json(listing.days.find((day: any) => day.id === bascule.id)?.closure.report), json(closed.report));
+  assert.equal(json(listing.days.find((day: any) => day.id === lateDayId)?.closure.report), json(closedLate.report));
+
+  // Le nouveau jour en mode 4a garde son refus historique si la veille reste OPEN.
+  const toCloseFacts = await tx.cashDayEvent.count({ where: { tenantId: tenant, kind: "TO_CLOSE" } });
+  const refused = await opening(input(tenant, 1));
+  assert.equal(refused.status, 409); assert.equal(refused.body.error, "PREVIOUS_SESSION_OPEN");
+  assert.equal(await tx.cashDayEvent.count({ where: { tenantId: tenant, kind: "TO_CLOSE" } }), toCloseFacts);
+}));
+
+test("4b pg : appareil en retard sans journée plus récente garde l'ouverture 4a OPEN", async () => fixture(async (tenant, tx) => {
+  await flag(tx, tenant, true);
+  const result = await opening(input(tenant, -1));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "OPEN");
+  assert.equal(await tx.cashSession.count({ where: { tenantId: tenant, status: "TO_CLOSE" } }), 0);
+  assert.equal(await tx.cashDayEvent.count({ where: { tenantId: tenant, kind: "TO_CLOSE" } }), 0);
+  assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 0);
+}));
+
 test("4b pg : +61 s refusé et jour serveur jamais basculé, même tablette en avance à minuit", async () => fixture(async (tenant, tx) => {
   await flag(tx, tenant, true);
   const future = input(tenant, 0, { occurredAt: new Date(now.getTime() + 61000).toISOString() });
@@ -174,18 +237,20 @@ test("4b pg : tardif J-7 créé TO_CLOSE ; J-8 refus définitif et conflit durab
 }));
 
 test("4b pg : une session historique non liée reste OPEN ; sourceKey d'un autre jour refusé sans création", async () => fixture(async (tenant, tx) => {
-  const session = await tx.cashSession.create({ data: { tenantId: tenant, openedBy: tenant, openedAt: new Date(input(tenant, -1).occurredAt) } });
   await flag(tx, tenant, true);
+  const newer = await days.openCashDay(tx, input(tenant, -1));
+  await days.closeCashDay(tx, newer.id, closeInput(tenant));
+  const session = await tx.cashSession.create({ data: { tenantId: tenant, openedBy: tenant, openedAt: new Date(input(tenant, -1).occurredAt) } });
   const refused = await opening(input(tenant));
   assert.equal(refused.body.error, "PREVIOUS_SESSION_OPEN");
   assert.equal((await tx.cashSession.findFirstOrThrow({ where: { tenantId: tenant, id: session.id } })).status, "OPEN");
-  assert.equal(await tx.cashDay.count({ where: { tenantId: tenant } }), 0);
+  assert.equal(await tx.cashDay.count({ where: { tenantId: tenant } }), 1);
   assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 0);
   const late = input(tenant, -2);
   assert.equal((await opening(late)).status, 200);
   const collision = await opening(input(tenant, -3, { sourceKey: late.sourceKey }));
   assert.equal(collision.status, 409); assert.equal(collision.body.error, "SOURCE_CONFLICT");
-  assert.equal(await tx.cashDay.count({ where: { tenantId: tenant } }), 1);
+  assert.equal(await tx.cashDay.count({ where: { tenantId: tenant } }), 2);
   assert.equal(await tx.cashDeposit.count({ where: { tenantId: tenant } }), 1);
 }));
 
@@ -273,6 +338,8 @@ test("4b pg : /sessions garde unicité OPEN et clôture native, sans CashDay ni 
 
 test("4b pg : CashDay historique et /sessions natif du même tenant gardent leur lecture/remplacement", async () => fixture(async (tenant, tx) => {
   await flag(tx, tenant, true);
+  const newer = await days.openCashDay(tx, input(tenant));
+  await days.closeCashDay(tx, newer.id, closeInput(tenant));
   const late = await days.openCashDay(tx, input(tenant, -1)); // TO_CLOSE, pas de session OPEN liée
   const legacy = await native.openSessionTx(tx, tenant, { openedBy: tenant, openingFloatXpf: 1000n });
   assert.equal(legacy.ok, true);

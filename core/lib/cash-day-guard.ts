@@ -41,9 +41,12 @@ export async function cashDayGuard(tenantId: string, target: LegacyWrite): Promi
       where: { tenantId, id: target.saleId }, select: { cashDayId: true },
     }))?.cashDayId) return false;
     if ("saleId" in target && target.refundCashDayId) {
-      if (await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId, currentSession: { status: "OPEN" } }, select: { id: true } })) return false;
-      if ((await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled === true
-        && await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId }, select: { id: true } })) return false;
+      const day = await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId }, select: { id: true } });
+      if (day && await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId, currentSession: { status: "OPEN" } }, select: { id: true } })) return false;
+      const enabled = (await tx.cashSettings?.findUnique({ where: { tenantId }, select: { toCloseEnabled: true } }))?.toCloseEnabled === true;
+      if (day && enabled) return false;
+      if (day && (await tx.cashDay.findFirst({ where: { tenantId, id: target.refundCashDayId, currentSession: { status: "TO_CLOSE" } }, select: { id: true } })
+        || await tx.cashDayEvent?.findFirst({ where: { tenantId, cashDayId: target.refundCashDayId, kind: "TO_CLOSE" }, select: { id: true } }))) return false;
     }
     return true;
   });

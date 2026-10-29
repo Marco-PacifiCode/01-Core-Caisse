@@ -47,13 +47,13 @@ function salePorts(status: string) {
 const saleBody = { tenantId, actionId, entityKey: dayId, deviceId: "device", deviceName: "Recette", ticketNumber: "synthetic-1", occurredAt: now.toISOString(),
   sourceType: "synthetic", sourceId: "source", lines: [{ kind: "OTHER", label: "Test", qty: 1, unitXpf: "100", lineXpf: "100" }] };
 
-test("cashDayGuard : existence du jour seulement sous interrupteur ; autres commerces isolés", async () => {
-  for (const enabled of [false, true]) for (const status of ["OPEN", "TO_CLOSE", "CLOSED"]) {
+test("cashDayGuard : marqueur TO_CLOSE conservé après extinction ; autres commerces isolés", async () => {
+  for (const enabled of [false, true]) for (const status of ["OPEN", "TO_CLOSE", "CLOSED"]) for (const hasToClose of [false, true]) {
     const tx = { cashSettings: { findUnique: async () => ({ toCloseEnabled: enabled }) }, cashDay: {
       findFirst: async ({ where }: Row) => where.id && where.id !== dayId || where.currentSession && where.currentSession.status !== status ? null : { id: dayId },
-    } };
+    }, cashDayEvent: { findFirst: async () => hasToClose ? { id: actionId } : null } };
     const { cashDayGuard } = load("cash-day-guard.ts", ["cashDayGuard"], { withTenant: async (_tenant: string, fn: Function) => fn(tx) });
-    assert.equal(await cashDayGuard(tenantId, { saleId, refundCashDayId: dayId }), !(enabled || status === "OPEN"));
+    assert.equal(await cashDayGuard(tenantId, { saleId, refundCashDayId: dayId }), !(enabled || status === "OPEN" || status === "TO_CLOSE" || hasToClose));
     assert.equal(await cashDayGuard(tenantId, { saleId, refundCashDayId: actionId }), true);
   }
 });
@@ -69,7 +69,7 @@ test("createDaySale accepte OPEN/TO_CLOSE, et CLOSED seulement hors ligne ou imp
   assert.equal((await createDaySale(closed.tx, dayId, { ...saleBody, offlineCompleted: true } as any)).alreadyExisted, false);
 });
 
-function refundFixture(enabled = true, initial = "TO_CLOSE", seeded = true) {
+function refundFixture(enabled = true, initial = "TO_CLOSE", seeded = true, hasToClose = initial === "TO_CLOSE") {
   const day = { id: dayId, businessDay: "2026-10-15", currentSession: { status: initial } };
   const line = { id: tenantId, label: "Recette", qty: 1, unitXpf: 100n, lineXpf: 100n, tgcRatePpm: 0 };
   const sale = { id: saleId, tenantId, cashDayId: dayId, status: "PAID", invoiceId: "synthetic-invoice", totalXpf: 100n,
@@ -91,6 +91,7 @@ function refundFixture(enabled = true, initial = "TO_CLOSE", seeded = true) {
       create: async ({ data }: Row) => (reserved = { id: actionId, status: "PENDING", ...data }),
       update: async ({ data }: Row) => { assert.ok(reserved); Object.assign(reserved, data); return reserved; },
     },
+    cashDayEvent: { findFirst: async () => hasToClose ? { id: actionId } : null },
   };
   const db = load("partial-refund-db.ts", ["partialRefundWithPorts"], {});
   const { rembourserPartiellement } = load("caisse.ts", ["rembourserPartiellement"], {
@@ -126,14 +127,21 @@ test("réservation PENDING après clôture : verrou vente et ACK, DONE rejoué s
   assert.equal(collision.calls(), 0); assert.equal(collision.facts.length, 0);
 });
 
-test("nouveau remboursement TO_CLOSE accepté ; CLOSED refusé, et interrupteur éteint inchangé", async () => {
-  const late = refundFixture(true, "TO_CLOSE", false);
-  assert.equal((await late.refund()).ok, true); assert.equal(late.facts.length, 1);
-  const closed = refundFixture(true, "CLOSED", false);
-  await assert.rejects(closed.refund(), /CASHDAY_ROUTE_REQUIRED/); assert.equal(closed.reserved(), null);
-  const off = refundFixture(false, "CLOSED");
-  await assert.rejects(off.refund(), /REFUND_DAY_CLOSED_REOPEN_REQUIRED/); assert.equal(off.calls(), 0);
-  const wrong = refundFixture(true, "CLOSED"); wrong.reserved()!.cashDayId = saleId;
+test("remboursement TO_CLOSE toléré flag éteint ; CLOSED refuse les nouveaux et reprend une réservation marquée", async () => {
+  for (const enabled of [false, true]) {
+    const late = refundFixture(enabled, "TO_CLOSE", false);
+    assert.equal((await late.refund()).ok, true); assert.equal(late.facts.length, 1);
+  }
+  for (const enabled of [false, true]) {
+    const closed = refundFixture(enabled, "CLOSED", false);
+    await assert.rejects(closed.refund(), /CASHDAY_ROUTE_REQUIRED/); assert.equal(closed.reserved(), null);
+  }
+  const resumed = refundFixture(false, "CLOSED", true, true);
+  assert.equal((await resumed.refund()).ok, true); assert.equal(resumed.reserved()!.status, "DONE");
+  assert.equal(resumed.calls(), 1);
+  const offNoMarker = refundFixture(false, "CLOSED");
+  await assert.rejects(offNoMarker.refund(), /REFUND_DAY_CLOSED_REOPEN_REQUIRED/); assert.equal(offNoMarker.calls(), 0);
+  const wrong = refundFixture(false, "CLOSED", true, true); wrong.reserved()!.cashDayId = saleId;
   await assert.rejects(wrong.refund(), /CASHDAY_ROUTE_REQUIRED/); assert.equal(wrong.calls(), 0);
 });
 

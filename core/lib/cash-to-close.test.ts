@@ -7,6 +7,7 @@ import vm from "node:vm";
 import { expectedXpfPourRapport } from "./z-report.ts";
 import { verifierCorrection, type SaleSnapshotForCorrection } from "./payment-correction.ts";
 import * as projection from "./cash-day-projection.ts";
+import * as sync from "./caisse-sync.ts";
 
 // Lectures de l'inventaire confirmées une par une (lignes du lot 4a, avant → après).
 // prisma/schema.prisma:25,69 : enum binaire → troisième valeur connue par le client livré.
@@ -105,6 +106,39 @@ test("TO_CLOSE : le Z recalcule le tiroir et la correction reste autorisée", ()
     comptaSyncedAt: now, invoiceId: "synthetic-invoice", paidAt: now, createdAt: now,
     payments: [{ method: "CASH", amountXpf: 200n, settleRef: null }] };
   assert.deepEqual(verifierCorrection(sale, { fromMethod: "CASH", toMethod: "CARD", amountXpf: 200, maintenant: now }), { ok: true });
+});
+
+test("repli éteint : clôture TO_CLOSE enrichie et Z authoritative relu après recomptage", async () => {
+  const f = dayPorts(), tx: any = f.tx;
+  let closureFact: any;
+  tx.cashDayClosure.findFirst = async () => null;
+  tx.cashDayClosure.create = async ({ data }: any) => ({ id, ...data });
+  tx.cashSession = { update: async ({ data }: any) => Object.assign(f.day.currentSession, data) };
+  const { closeCashDay } = load("cash-days.ts", ["closeCashDay"], {
+    ...projection, ...sync, ...f.ledger,
+    appendDayFact: async (_tx: any, _tenant: string, _day: string, fact: any) => {
+      closureFact = fact;
+      return { sequence: 1n };
+    },
+    closeSessionTx: async () => { f.day.currentSession.status = "CLOSED"; return { ok: true }; },
+  });
+  const result = await closeCashDay(tx, id, { tenantId, actionId: "close", entityKey: id,
+    deviceId: "synthetic", deviceName: "Recette", actorId: tenantId, actorName: "Recette", receivedById: tenantId,
+    occurredAt: "2026-10-29T01:00:00Z", sourceKey: "authoritative", countedXpf: "25000",
+    localExpectedXpf: "25000", localVarianceXpf: "0", cycle: 0, closureMode: "ONLINE" });
+  assert.equal(result.report.expectedXpf, 25000);
+  assert.equal(result.report.varianceXpf, 0);
+  assert.equal(result.report.cancelledCount, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.report.parTaux)), {});
+  // Après clôture, seul le fait TO_CLOSE permet encore d'identifier ce contrat 4b.
+  const day: any = f.day;
+  day.closures = [{ sourceKey: "authoritative" }];
+  day.events = [{ snapshot: { report: { varianceXpf: 999 } } }];
+  tx.cashDayEvent.findFirst = async ({ where }: any) => where.kind === "TO_CLOSE"
+    ? { id: "marker" } : where.sourceRef === "authoritative" ? closureFact : null;
+  const listed = await f.days.listCashDays(tx, tenantId, new URLSearchParams());
+  assert.equal(listed.days[0].closure.report.varianceXpf, 0);
+  assert.equal(listed.days[0].closure.report.cancelledCount, 0);
 });
 
 test("cash-settings : GET false, PATCH seul refusé, clé ignorée avec un champ autorisé", async () => {

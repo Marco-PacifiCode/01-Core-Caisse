@@ -2238,15 +2238,41 @@ test("ouverture CashDay : une session OPEN non liée garde PREVIOUS_SESSION_OPEN
   assert.equal(f.rows("cashDeposit").length, 0);
 });
 
+test("ouverture tardive CashDay : appareil en retard sans journée plus récente conserve 4a", async () => {
+  const f = fixture();
+  await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  const b = input({ businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00.000Z" });
+  const result = await f.sync.cashAction("open", b, tx => f.days.openCashDay(tx, b));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.data.status, "OPEN");
+  assert.equal(f.rows("cashSession")[0].status, "OPEN");
+  assert.equal(f.rows("cashDayEvent").filter(e => e.kind === "TO_CLOSE").length, 0);
+  assert.equal(f.rows("cashDeposit").length, 0);
+});
+
+test("ouverture tardive CashDay : une journée plus récente d'un autre commerce ou scope ne suffit pas", async () => {
+  for (const other of [{ tenantId: tenantB, scope: "rotisserie-caisse" }, { tenantId: tenant, scope: "autre" }]) {
+    const f = fixture();
+    await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+    await f.tx.cashDay.create({ data: { ...other, businessDay: "2026-10-15" } });
+    const b = input({ businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00.000Z" });
+    const result = await f.sync.cashAction("open", b, tx => f.days.openCashDay(tx, b));
+    assert.equal(result.status, 200);
+    assert.equal(result.body.data.status, "OPEN");
+    assert.equal(f.rows("cashDeposit").length, 0);
+  }
+});
+
 test("ouverture tardive CashDay : J-7 est créée TO_CLOSE ; J-8 est refusée avec conflit rejoué idempotent", async () => {
   const f = fixture();
   await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  await f.days.openCashDay(f.tx, input());
   const atJ7 = input({ actionId: "late-j7", businessDay: "2026-10-08", occurredAt: "2026-10-08T01:00:00.000Z",
     sourceKey: "opening-j7", localSessionKey: "local-j7" });
   const accepted = await f.sync.cashAction("open", atJ7, tx => f.days.openCashDay(tx, atJ7));
   assert.equal(accepted.status, 200);
-  const j7 = f.rows("cashDay")[0];
-  assert.equal(f.rows("cashSession")[0].status, "TO_CLOSE");
+  const j7 = f.rows("cashDay")[1];
+  assert.equal(f.rows("cashSession")[1].status, "TO_CLOSE");
   assert.equal(f.rows("cashDayEvent").filter(e => e.cashDayId === j7.id && e.kind === "TO_CLOSE").length, 1);
   assert.equal(f.rows("cashDeposit")[0].operation, "OUVERTURE_TARDIVE");
   const atJ8 = input({ actionId: "late-j8", businessDay: "2026-10-07", occurredAt: "2026-10-07T01:00:00.000Z",
@@ -2254,7 +2280,7 @@ test("ouverture tardive CashDay : J-7 est créée TO_CLOSE ; J-8 est refusée av
   const tooOld = () => f.sync.cashAction("open", atJ8, tx => f.days.openCashDay(tx, atJ8));
   const refused = await tooOld();
   assert.equal(refused.status, 409); assert.equal(refused.body.error, "OUVERTURE_TROP_ANCIENNE");
-  assert.equal(f.rows("cashDay").length, 1); assert.equal(f.rows("cashSession").length, 1);
+  assert.equal(f.rows("cashDay").length, 2); assert.equal(f.rows("cashSession").length, 2);
   assert.equal(f.rows("cashDeposit").filter(d => d.operation === "OUVERTURE_TROP_ANCIENNE").length, 1);
   // Le premier corps est un littéral de la VM ; le port Prisma simulé renvoie
   // une structuredClone dans le contexte hôte. Comparer le contrat JSON,
@@ -2266,6 +2292,7 @@ test("ouverture tardive CashDay : J-7 est créée TO_CLOSE ; J-8 est refusée av
 test("ouverture tardive CashDay : sourceKey réutilisée sur un autre jour reste SOURCE_CONFLICT sans écriture", async () => {
   const f = fixture();
   await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+  await f.days.openCashDay(f.tx, input());
   const first = input({ actionId: "late-source-a", businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00.000Z",
     sourceKey: "shared-late-source", localSessionKey: "local-source-a" });
   assert.equal((await f.sync.cashAction("open", first, tx => f.days.openCashDay(tx, first))).status, 200);
@@ -2273,8 +2300,8 @@ test("ouverture tardive CashDay : sourceKey réutilisée sur un autre jour reste
     sourceKey: "shared-late-source", localSessionKey: "local-source-b" });
   const refused = await f.sync.cashAction("open", second, tx => f.days.openCashDay(tx, second));
   assert.equal(refused.status, 409); assert.equal(refused.body.error, "SOURCE_CONFLICT");
-  assert.equal(f.rows("cashDay").length, 1); assert.equal(f.rows("cashSession").length, 1);
-  assert.equal(f.rows("cashDayOpening").length, 1); assert.equal(f.rows("cashDeposit").length, 1);
+  assert.equal(f.rows("cashDay").length, 2); assert.equal(f.rows("cashSession").length, 2);
+  assert.equal(f.rows("cashDayOpening").length, 2); assert.equal(f.rows("cashDeposit").length, 1);
 });
 
 test("ouverture CashDay : TO_CLOSE est un marqueur nul et une journée du jour serveur reste OPEN", async () => {

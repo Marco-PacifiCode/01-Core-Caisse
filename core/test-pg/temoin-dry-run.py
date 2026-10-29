@@ -1,246 +1,208 @@
-"""Joue à blanc le témoin journée face à une API Core locale simulée."""
-import base64
+"""Exécute le vrai parcours TO_CLOSE sans réseau, secret, fichier .env ou serveur.
+
+Depuis la racine : python core/test-pg/temoin-dry-run.py
+Preuve rouge : python core/test-pg/temoin-dry-run.py --baseline=ca93ea4
+"""
 import contextlib
+import copy
 import io
 import json
-import os
 from pathlib import Path
+import re
+import subprocess
 import sys
-import threading
+import uuid
+import urllib.parse
 from datetime import datetime, timezone, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parents[2]
+ACTOR = "c0000000-0000-4000-8002-000000000001"
+TENANT = "c0000000-0000-4000-8000-0000000000ca"
+AUTHOR = "Parcours temoin TO_CLOSE"
+DEVICE = "temoin-to-close"
+NOW = datetime(2026, 10, 29, 1, tzinfo=timezone.utc)
+TODAY = (NOW + timedelta(hours=11)).date()
+NS = uuid.UUID("6f1c2d6e-7a51-4c1e-9d0b-5c3a0e7d7e11")
 
 
-SOURCE_PATH = "C:/dev/ecosysteme/00-Archi-NextGen/vps/tenants/caissedemo-seeds/temoin-journee.py"
+def day(offset):
+    return (TODAY + timedelta(days=offset)).isoformat()
 
 
 class Core:
-    def __init__(self, state):
-        self.state = state
-        self.day = None
-        previous_business = ((datetime.now(timezone.utc) + timedelta(hours=11)).date() - timedelta(days=1)).isoformat()
-        self.previous = {"status": state, "businessDay": previous_business, "cashDayId": "synthetic-previous"} if state in ("TO_CLOSE", "OPEN") else None
-        self.sales = {}
-        self.next_sale = 0
-        self.opening = 10000
-        self.expected = self.opening
-        self.events = []
-        self.conflicts = [{"entityKey": "dry-business", "kind": "conflit", "operation": "OUVERTURE_TARDIVE", "status": "APPLIED"}]
+    def __init__(self, scenario, status="CLOSED"):
+        self.scenario = scenario
+        self.days, self.sales, self.requests, self.conflicts = {}, {}, [], []
+        self.created = []
+        self.legacy = []
+        if scenario in ("occupied", "stale_manual", "closed_manual"):
+            own = scenario in ("stale_manual", "closed_manual")
+            self.days[day(-6)] = {
+                "cashDayId": "occupied", "businessDay": day(-6), "status": "TO_CLOSE" if scenario == "stale_manual" else status,
+                "cycle": 0, "openedBy": ACTOR if own else "synthetic-other",
+                "openedByName": AUTHOR if own else "Autre auteur synthétique",
+                "events": [{"kind": "SALE_PAID", "deviceId": "manual", "snapshot": {"sellerId": "synthetic-other"}}],
+                "openings": [],
+            }
+            if scenario == "stale_manual":
+                # L'ancienne recherche partait de J-7 : elle doit aussi rencontrer
+                # un vrai reste du témoin utilisé par une autre vendeuse.
+                previous = copy.deepcopy(self.days[day(-6)])
+                previous.update(cashDayId="occupied-j7", businessDay=day(-7))
+                previous["openings"] = [{"sourceKey": str(uuid.uuid5(NS, f"to-close:{day(-7)}:open")),
+                                         "deviceId": DEVICE, "actorId": ACTOR, "actorName": AUTHOR}]
+                previous["events"].append({"kind": "TO_CLOSE", "deviceId": "core"})
+                self.days[day(-7)] = previous
+        if scenario == "legacy":
+            self.legacy = [{"businessDay": day(-6), "sessions": [{"status": status}],
+                            "origins": [], "salesWithoutSource": 0, "more": False}]
+        self.initial = copy.deepcopy(self.days)
 
-    def handle(self, method, path, body):
-        route = urlparse(path).path
-        query = parse_qs(urlparse(path).query)
-        if method == "GET" and route == "/api/cash-days":
-            day = query.get("businessDay", [""])[0]
-            if self.previous and self.previous["businessDay"] == day:
-                return 200, {"day": self.previous}
-            return 200, {"day": self.day if self.day and self.day["businessDay"] == day else None}
-        if method == "POST" and route == "/api/cash-days":
-            if self.state == "OPEN" and self.previous:
-                self.previous["status"] = "TO_CLOSE"
-            self.day = {"cashDayId": "dry-day", "businessDay": body["businessDay"], "status": "OPEN", "cycle": 0}
-            self.opening = int(body.get("openingFloatXpf", 10000))
-            self.expected = self.opening
-            return 200, self.day
-        if route.endswith("/reopen"):
-            self.day["status"] = "OPEN"
-            self.day["cycle"] += 1
-            return 200, self.day
-        if method == "POST" and route.endswith("/sales"):
-            self.next_sale += 1
-            sale_id = f"dry-sale-{self.next_sale}"
-            self.sales[sale_id] = {"total": int(body["totalXpf"]), "paid": False, "void": False}
-            return 200, {"data": {"saleId": sale_id, "totalXpf": body["totalXpf"]}}
-        if method == "POST" and route.endswith("/checkout"):
-            sale_id = route.split("/")[-2]
-            sale = self.sales[sale_id]
-            sale["paid"] = True
-            if not sale["void"]:
-                self.expected += sale["total"]
-                self.events.append({"kind": "SALE_PAID", "deviceId": body["deviceId"], "occurredAt": body["paidAt"], "totalXpf": str(sale["total"])})
-            return 200, {"data": {"status": "PAID"}}
-        if method == "POST" and route.endswith("/void"):
-            sale_id = route.split("/")[-2]
-            sale = self.sales[sale_id]
-            if sale["paid"] and not sale["void"]:
-                sale["void"] = True
-                self.expected -= sale["total"]
-            return 200, {"data": {"creditNoteId": "dry-credit"}}
-        if method == "GET" and route.endswith("/ledger"):
-            return 200, {"projection": {"totauxCourants": {"expectedXpf": str(self.expected)}},
-                         "openings": [{"sourceKey": "dry-open", "deviceId": "temoin-to-close", "actorId": "dry-actor", "actorName": "Parcours temoin TO_CLOSE"}],
-                         "data": self.events + ([{"kind": "TO_CLOSE", "deviceId": "core"}] if self.state == "TO_CLOSE" else []),
-                         "hasMore": False}
-        if method == "POST" and route.endswith("/close"):
-            self.day["status"] = "CLOSED"
-            self.day["closedLate"] = body["occurredAt"][:10] > self.day["businessDay"]
-            self.day["closedByName"] = body["actorName"]
-            return 200, {"data": {"report": {"varianceXpf": "0", "expectedXpf": str(self.expected)}}}
-        if method == "GET" and route == "/api/cash-settings":
-            return 200, {"toCloseEnabled": True}
-        if method == "GET" and route == "/api/cash-deposits":
+    def totals(self, current):
+        sales = [s for s in self.sales.values() if s["day"] is current]
+        active = [s for s in sales if s["paid"] and not s["void"]]
+        total = sum(s["total"] for s in active)
+        return {"expectedXpf": 10000 + total, "totalSalesXpf": total, "salesCount": len(active),
+                "cancelledCount": sum(s["void"] for s in sales), "refundCashXpf": 0, "movementNetXpf": 0,
+                "parTaux": {"0": {"ttcXpf": total, "htXpf": total, "tgcXpf": 0}} if active else {}}
+
+    def call(self, method, path, body=None, idem=None, **options):
+        self.requests.append((method, path, copy.deepcopy(body), options))
+        route = urllib.parse.urlparse(path).path
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        if route == "/api/cash-settings":
+            return 200, {"toCloseEnabled": self.scenario != "off"}
+        if route == "/api/cash-days/legacy":
+            return 200, {"days": self.legacy, "nextCursor": None}
+        if route == "/api/cash-deposits":
             return 200, {"items": self.conflicts, "nextCursor": None}
-        return 404, {"error": "NOT_FOUND", "route": route}
-
-
-def execute(source, state, core=None):
-    core = core or Core(state)
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def _reply(self, status, payload):
-            raw = json.dumps(payload).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def do_GET(self):
-            status, payload = core.handle("GET", self.path, {})
-            self._reply(status, payload)
-
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
-            status, payload = core.handle("POST", self.path, body)
-            self._reply(status, payload)
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    source = source.replace('BASE = "http://127.0.0.1:3106"', f'BASE = "http://127.0.0.1:{server.server_port}"')
-    source = source.replace('URL = os.environ["TEMOIN_URL"].rstrip("/")', f'URL = "http://127.0.0.1:{server.server_port}"')
-    original_open = open
-
-    def safe_open(path, *args, **kwargs):
-        if path == "/home/deploy/moteurs/01-Core-Caisse/core/.env":
-            return io.StringIO("CORE_CAISSE_API_KEY=dry-run\n")
-        return original_open(path, *args, **kwargs)
-
-    namespace = {"__name__": "__main__", "open": safe_open}
-    old_argv = sys.argv
-    old_env = dict(os.environ)
-    os.environ.update(TEMOIN_ID="synthetic-dry-run", TEMOIN_ENV_FILE="/home/deploy/moteurs/01-Core-Caisse/core/.env")
-    out = io.StringIO()
-    try:
-        sys.argv = [SOURCE_PATH]
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            exec(compile(source, SOURCE_PATH, "exec"), namespace)
-        return out.getvalue(), core.day, core.previous
-    except SystemExit as exc:
-        return out.getvalue() + f"SystemExit({exc.code})\n", core.day, core.previous
-    finally:
-        sys.argv = old_argv
-        os.environ.clear()
-        os.environ.update(old_env)
-        server.shutdown()
-        server.server_close()
-        thread.join()
-        assert not thread.is_alive()
-
-
-class LateCore(Core):
-    """Fenêtre historique, journal et pannes pour le nouveau parcours TO_CLOSE."""
-    def __init__(self, scenario):
-        super().__init__("NONE")
-        self.scenario, self.days, self.requests = scenario, {}, []
-        self.today = (datetime.now(timezone.utc) + timedelta(hours=11)).date()
-        self.conflicts = []
-        self.opening_body = None
-        for offset in (range(7, 1, -1) if scenario == "full" else [7] if scenario in ("occupied", "proved") else []):
-            business = (self.today - timedelta(days=offset)).isoformat()
-            self.days[business] = {"cashDayId": "occupied-" + business, "status": "CLOSED", "cycle": 0,
-                "openedBy": "c0000000-0000-4000-8002-000000000001" if scenario == "proved" else "synthetic-other",
-                "openedByName": "Parcours temoin TO_CLOSE" if scenario == "proved" else "Autre auteur synthétique"}
-
-    def handle(self, method, path, body):
-        route = urlparse(path).path
-        self.requests.append((method, route, body))
-        if method == "GET" and route == "/api/cash-days":
-            business = parse_qs(urlparse(path).query)["businessDay"][0]
-            return 200, {"day": self.days.get(business)}
-        if self.scenario in ("failure", "manual") and route.endswith("/checkout"):
-            if self.scenario == "manual":
-                self.events.append({"kind": "CASH_OUT", "deviceId": "synthetic-other-device"})
-            return 503, {"error": "SYNTHETIC_CHECKOUT_FAILURE"}
-        if method == "GET" and route.endswith("/ledger"):
-            b = self.opening_body
-            return 200, {"projection": {"totauxCourants": {"expectedXpf": str(self.expected)}},
-                "openings": [{k: b[k] for k in ("sourceKey", "deviceId", "actorId", "actorName")}],
-                "data": self.events, "hasMore": False}
-        status, result = super().handle(method, path, body)
-        if method == "POST" and route == "/api/cash-days":
-            assert body["businessDay"] not in self.days, "aucune ouverture sur un jour occupé"
-            self.opening_body = body
-            self.day.update(status="TO_CLOSE", openedBy=body["actorId"], openedByName=body["actorName"])
-            self.days[body["businessDay"]] = self.day
-            self.events = [{"kind": "OPENING", "deviceId": body["deviceId"]}, {"kind": "TO_CLOSE", "deviceId": "core"}]
-            self.conflicts.append({"entityKey": body["businessDay"], "kind": "conflit", "operation": "OUVERTURE_TARDIVE", "status": "APPLIED"})
-        if method == "POST" and route.endswith("/sales"):
-            assert body["occurredAt"][:10] == self.day["businessDay"]
-        if method == "POST" and route.endswith("/close"):
-            assert int(body["countedXpf"]) == self.expected
-            total = self.expected - self.opening
-            report = {"expectedXpf": self.expected, "countedXpf": self.expected, "varianceXpf": 0,
-                "totalSalesXpf": total, "salesCount": sum(s["paid"] for s in self.sales.values()),
-                "cancelledCount": 0, "refundCashXpf": 0, "movementNetXpf": 0,
-                "parTaux": {"0": {"ttcXpf": total, "htXpf": total, "tgcXpf": 0}}}
-            self.events.append({"kind": "CLOSURE", "deviceId": body["deviceId"], "sourceRef": body["sourceKey"], "snapshot": {"report": report}})
+        if route == "/api/cash-days":
+            if method == "GET":
+                return 200, {"day": self.days.get(query["businessDay"][0])}
+            business = body["businessDay"]
+            assert business not in self.days, "réouverture d'un jour occupé"
+            current = {"cashDayId": "created-" + business, "businessDay": business, "status": "TO_CLOSE", "cycle": 0,
+                       "openedBy": body["actorId"], "openedByName": body["actorName"],
+                       "events": [{"kind": "TO_CLOSE", "deviceId": "core"}, {"kind": "OPENING", "deviceId": body["deviceId"]}],
+                       "openings": [{k: body[k] for k in ("sourceKey", "deviceId", "actorId", "actorName")}], "closedLate": False}
+            self.days[business] = current
+            self.created.append(current)
+            self.conflicts.append({"entityKey": business, "kind": "conflit", "operation": "OUVERTURE_TARDIVE", "status": "APPLIED"})
+            return 200, {"data": current}
+        parts = route.split("/")
+        current = next((d for d in self.days.values() if d["cashDayId"] == parts[3]), None)
+        assert current is not None, route
+        if route.endswith("/ledger"):
+            return 200, {"data": current["events"], "openings": current["openings"], "hasMore": False,
+                         "projection": {"totauxCourants": self.totals(current)}}
+        if route.endswith("/sales"):
+            sid = "sale-" + str(len(self.sales) + 1)
+            self.sales[sid] = {"day": current, "total": int(body["totalXpf"]), "paid": False, "void": False,
+                               "sellerId": body.get("sellerId"), "sellerName": body.get("sellerName")}
+            return 200, {"data": {"saleId": sid}}
+        if route.endswith("/checkout"):
+            if self.scenario == "failure":
+                return 503, {"error": "SYNTHETIC_CHECKOUT_FAILURE"}
+            sid = parts[-2]
+            sale = self.sales[sid]
+            sale["paid"] = True
+            current["events"].append({"kind": "SALE_PAID", "deviceId": body["deviceId"], "sourceRef": sid,
+                                      "occurredAt": body["occurredAt"],
+                                      "snapshot": {"sellerId": sale["sellerId"], "sellerName": sale["sellerName"]}})
+            return 200, {"data": {"status": "PAID"}}
+        if route.endswith("/void"):
+            sid = parts[-2]
+            self.sales[sid]["void"] = True
+            current["events"].append({"kind": "SALE_VOID", "deviceId": body["deviceId"], "sourceRef": sid,
+                                      "snapshot": {"creditNoteId": "synthetic-credit", "saleRef": sid}})
+            # L'ACK peut être minimal : la preuve de l'avoir est dans le journal.
+            return 200, {"data": {"status": "VOID"}}
+        if route.endswith("/close"):
+            if self.scenario == "failure_after_void" and not options.get("nettoyage"):
+                return 503, {"error": "SYNTHETIC_CLOSE_FAILURE"}
+            report = {**self.totals(current), "countedXpf": int(body["countedXpf"])}
+            report["varianceXpf"] = report["countedXpf"] - report["expectedXpf"]
+            current.update(status="CLOSED", closedLate=True, closedByName=body["actorName"])
+            current["events"].append({"kind": "CLOSURE", "deviceId": body["deviceId"], "sourceRef": body["sourceKey"],
+                                      "snapshot": {"report": report}})
             return 200, {"data": {"report": report}}
-        return status, result
+        raise AssertionError((method, route))
+
+
+def execute(source, core):
+    namespace = {"json": json, "re": re, "sys": sys, "uuid": uuid, "urllib": urllib,
+                 "datetime": datetime, "timezone": timezone, "timedelta": timedelta,
+                 "T": TENANT, "ACTEUR": ACTOR, "NS": NS, "QUAND": NOW, "HORLOGE": NOW,
+                 "SECOURS": [], "appel": core.call}
+    # Réutilise aussi le vrai nettoyage d'erreur du témoin, sans son préambule qui lit l'environnement.
+    helpers = source[source.index("def ko("):source.index("# Reassort")]
+    part = source[source.index("def temoin_to_close("):source.index("\ntry:\n    TO_CLOSE =")]
+    output = io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(output):
+        exec(compile(helpers + "\n" + part, "temoin.sh:TO_CLOSE", "exec"), namespace)
+        try:
+            print(namespace["temoin_to_close"]())
+        except SystemExit as error:
+            code = error.code
+    return code, output.getvalue()
+
+
+def check(source, scenario, status="CLOSED"):
+    core = Core(scenario, status)
+    code, output = execute(source, core)
+    posts = [r for r in core.requests if r[0] == "POST"]
+    expected_code = 1 if scenario.startswith("failure") else 0
+    assert code == expected_code, output
+    assert all(d["status"] == "CLOSED" for d in core.created), output
+    assert all(core.days[k] == v for k, v in core.initial.items()), "jour manuel modifié"
+    if scenario == "off":
+        assert not posts and "interrupteur éteint" in output, output
+    else:
+        expected_day = day(-5 if scenario in ("occupied", "stale_manual", "closed_manual", "legacy") else -6)
+        assert core.created and core.created[0]["businessDay"] == expected_day, output
+        if scenario.startswith("failure"):
+            assert "secours" in output and posts[-1][1].endswith("/close"), output
+        else:
+            assert "TO_CLOSE vert" in output, output
+            assert all(not s["paid"] or s["void"] for s in core.sales.values()), "vente non neutralisée"
+            report = core.created[0]["events"][-1]["snapshot"]["report"]
+            assert report["varianceXpf"] == 0 and report["totalSalesXpf"] == 0 and report["cancelledCount"] == 1, report
+    print(f"{scenario}/{status} → PASS ; sortie : {output.strip().replace(chr(10), ' | ')}")
+    if scenario == "green":
+        before = len(posts)
+        code, replay = execute(source, core)
+        assert code == 0 and "deja prouve" in replay, replay
+        assert len([r for r in core.requests if r[0] == "POST"]) == before
+        print("rejeu déjà prouvé → PASS ; Z relu, aucune écriture")
+        core.created[0]["events"][-1]["snapshot"]["report"]["varianceXpf"] = 1
+        code, broken = execute(source, core)
+        assert code == 1 and "Z deja prouve" in broken, broken
+        print("rejeu Z altéré → PASS ; KO attendu")
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     if len(sys.argv) > 1:
-        source = base64.b64decode(sys.argv[1]).decode("utf-8")
+        assert sys.argv[1].startswith("--baseline=")
+        commit = sys.argv[1].split("=", 1)[1]
+        source = subprocess.check_output(["git", "show", f"{commit}:deploy/temoin.sh"], cwd=ROOT).decode("utf-8")
     else:
-        source = open(SOURCE_PATH, encoding="utf-8").read()
-    shell = Path("deploy/temoin.sh").read_text(encoding="utf-8").split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    preamble = shell[:shell.index("# ─── 1.")]
-    part2 = preamble + shell[shell.index("# ─── 2."):shell.index("# 3.")] + '\nprint("VERT")\n'
-    for name, script in (("temoin-journee.py", source), ("temoin.sh partie 2", part2)):
-        for state in ("NONE", "TO_CLOSE", "OPEN"):
-            core = Core(state)
-            output, today, previous = execute(script, state, core)
-            passed = "VERT" in output and "SystemExit(" not in output and today and today.get("status") == "CLOSED" and core.expected == 11200
-            if state != "NONE":
-                passed = passed and previous and previous.get("status") == "TO_CLOSE"
-            print(f"{name} état={state} résultat={'VERT' if passed else 'KO'} jour={today} veille={previous}")
-            assert passed, output
-    tc = preamble + '\nT = "c0000000-0000-4000-8000-0000000000ca"\nACTEUR = "c0000000-0000-4000-8002-000000000001"\n'
-    tc += shell[shell.index("# 3."):shell.index("\ntry:\n    TO_CLOSE =")]
-    tc += '\ntry:\n    print(temoin_to_close())\nexcept Exception as e:\n    ko(str(e))\n'
-    for scenario in ("free", "occupied", "full", "proved", "failure"):
-        core = LateCore(scenario)
-        output, _, _ = execute(tc, "NONE", core)
-        posts = [r for r in core.requests if r[0] == "POST"]
-        assert not any(d["status"] == "TO_CLOSE" for d in core.days.values()), output
-        if scenario in ("full", "proved"):
-            assert not posts and ("aucun jour libre" if scenario == "full" else "deja prouve") in output, output
-        elif scenario == "failure":
-            assert "SystemExit(1)" in output and "secours" in output and posts[-1][1].endswith("/close"), output
-        else:
-            business = (core.today - timedelta(days=6 if scenario == "occupied" else 7)).isoformat()
-            assert "TO_CLOSE vert" in output and posts[0][2]["businessDay"] == business, output
-        print(f"TO_CLOSE scénario={scenario} → PASS, POST={len(posts)}, aucune TO_CLOSE restante")
-        if scenario == "failure":
-            core.scenario = "recovery"
-            core.requests = []
-            replay, _, _ = execute(tc, "NONE", core)
-            openings = [r for r in core.requests if r[:2] == ("POST", "/api/cash-days")]
-            assert "TO_CLOSE vert" in replay and "deja prouve" not in replay, replay
-            assert openings[0][2]["businessDay"] == (core.today - timedelta(days=6)).isoformat(), replay
-            print("TO_CLOSE après secours → PASS, jour CLOSED de secours sauté, preuve complète sur J-6")
-    manual = LateCore("manual")
-    output, _, _ = execute(tc, "NONE", manual)
-    assert "SystemExit(1)" in output and "usage concurrent, aucune ecriture" in output, output
-    assert not any(method == "POST" and route.endswith("/close") for method, route, _ in manual.requests), output
-    print("TO_CLOSE usage manuel concurrent → PASS, KO conservé, aucune clôture/comptage de l'autre appareil")
-    print("Serveurs arrêtés et threads joints ; aucun processus auxiliaire restant.")
-    return 0
+        source = (ROOT / "deploy/temoin.sh").read_text(encoding="utf-8")
+    source = source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    failures = 0
+    cases = [("off", "CLOSED"), ("green", "CLOSED"), ("stale_manual", "TO_CLOSE"), ("closed_manual", "CLOSED"),
+             ("failure", "CLOSED"), ("failure_after_void", "CLOSED")]
+    cases += [(scenario, status) for scenario in ("occupied", "legacy") for status in ("OPEN", "CLOSED", "TO_CLOSE")]
+    for scenario, status in cases:
+        try:
+            check(source, scenario, status)
+        except Exception as error:
+            failures += 1
+            print(f"{scenario}/{status} → FAIL : {type(error).__name__}: {error}")
+    print(f"BILAN : {len(cases) - failures}/{len(cases)} cas verts ; aucun réseau, serveur ou processus auxiliaire.")
+    return int(failures != 0)
 
 
 if __name__ == "__main__":

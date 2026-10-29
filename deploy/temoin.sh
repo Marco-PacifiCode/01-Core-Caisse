@@ -271,7 +271,7 @@ print(f"caissedemo : journee {JOUR} {quoi}, produit encaisse, prestation annulee
 
 # 3. Ouverture tardive directe (voie ii). La voie i demanderait une veille encore OPEN au jour
 # serveur : impossible a fabriquer ici sans changer l'horloge ou la journee reelle de la demo.
-# Premier jour libre entre J-7 et J-2. Une seule preuve par jour,
+# Premier jour libre entre J-6 et J-2. Une seule preuve par jour,
 # independante du SHA/TEMOIN_ID : les livraisons suivantes relisent le Z, sans rouvrir ni revendre.
 def temoin_to_close():
     s, settings = appel("GET", f"/api/cash-settings?tenantId={T}")
@@ -288,9 +288,21 @@ def temoin_to_close():
         ko("TO_CLOSE, horloge future")
     device, auteur = "temoin-to-close", "Parcours temoin TO_CLOSE"
     jour = None
-    for recul in range(7, 1, -1):
+    def lire(chemin):
+        s, r = appel("GET", chemin)
+        if s != 200:
+            ko(f"TO_CLOSE, lecture : HTTP {s}")
+        return r
+    legacy = lire(f"/api/cash-days/legacy?tenantId={T}&cursor={(jour_serveur - timedelta(days=7)).isoformat()}&limit=31")
+    legacy_jours = legacy.get("days", [])
+    legacy_occupes = {d.get("businessDay") for d in legacy_jours
+                      if d.get("sessions") or d.get("origins") or d.get("salesWithoutSource", 0) > 0 or d.get("more")}
+    for recul in range(6, 1, -1):
         fictif = jour_serveur - timedelta(days=recul)
         business = fictif.isoformat()
+        if business in legacy_occupes:
+            print(f"TO_CLOSE : {business} ancien usage manuel, saute (aucune ecriture)")
+            continue
         query = f"/api/cash-days?tenantId={T}&businessDay={business}"
         s, r = appel("GET", query)
         if s != 200:
@@ -301,10 +313,38 @@ def temoin_to_close():
         propre = jour.get("openedByName") == auteur and jour.get("openedBy") == ACTEUR
         if propre and jour.get("status") == "CLOSED" and jour.get("closedByName") != "Secours temoin TO_CLOSE":
             print(f"caissedemo TO_CLOSE : {business}, deja prouve (CLOSED, meme auteur)")
-            return "TO_CLOSE vert (deja prouve)"
-        # Reprendre seulement un reste de notre propre parcours interrompu.
-        if propre and jour.get("status") == "TO_CLOSE":
-            break
+            jid_preuve = jour.get("cashDayId")
+            if not jid_preuve:
+                ko("TO_CLOSE, jour deja prouve sans identifiant")
+            led_preuve = appel("GET", f"/api/cash-days/{jid_preuve}/ledger?tenantId={T}&afterSequence=0")
+            if led_preuve[0] != 200:
+                ko(f"TO_CLOSE, relecture du Z deja prouve : HTTP {led_preuve[0]}")
+            data_preuve = led_preuve[1].get("data", [])
+            ouverts_preuve = led_preuve[1].get("openings", [])
+            if (led_preuve[1].get("hasMore") or len(ouverts_preuve) != 1
+                    or any(o.get("actorId") != ACTEUR or o.get("actorName") != auteur
+                           or o.get("deviceId") != device for o in ouverts_preuve)
+                    or any(f.get("deviceId") not in ("core", device)
+                           or f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "SALE_VOID", "CLOSURE")
+                           or (f.get("kind") == "SALE_PAID" and
+                               ((f.get("snapshot") or {}).get("sellerId") != ACTEUR or
+                                (f.get("snapshot") or {}).get("sellerName") != auteur))
+                           for f in data_preuve)):
+                print(f"TO_CLOSE : {business} utilisé manuellement, sauté (aucune écriture)")
+                continue
+            cl = [f for f in data_preuve if f.get("kind") == "CLOSURE"]
+            ventes_preuve = [f for f in data_preuve if f.get("kind") == "SALE_PAID"]
+            annulations_preuve = [f for f in data_preuve if f.get("kind") == "SALE_VOID"]
+            report = ((cl[-1].get("snapshot") or {}).get("report") or {}) if cl else {}
+            attendu_preuve = {"expectedXpf": "10000", "countedXpf": "10000", "varianceXpf": "0",
+                              "totalSalesXpf": "0", "salesCount": "0", "cancelledCount": "1"}
+            if (len(cl) != 1 or len(ventes_preuve) != 1 or len(annulations_preuve) != 1
+                    or not (annulations_preuve[0].get("snapshot") or {}).get("creditNoteId")
+                    or any(str(report.get(k)) != v for k, v in attendu_preuve.items())
+                    or report.get("parTaux") != {}):
+                ko("TO_CLOSE, Z deja prouve absent ou incorrect")
+            return "TO_CLOSE vert (deja prouve, Z relu, ecart 0)"
+        # Tout jour existant est occupé, même s'il s'agit d'un reste TO_CLOSE du témoin.
         print(f"TO_CLOSE : {business} occupe, saute (aucune ecriture)")
     else:
         print("TO_CLOSE non joué (aucun jour libre)")
@@ -313,11 +353,6 @@ def temoin_to_close():
     fermeture = (fictif + timedelta(days=1)).isoformat() + "T01:00:00.000Z"
     def cle(etape):
         return str(uuid.uuid5(NS, f"to-close:{business}:{etape}"))
-    def lire(chemin):
-        s, r = appel("GET", chemin)
-        if s != 200:
-            ko(f"TO_CLOSE, lecture : HTTP {s}")
-        return r
     def ecrire(etape, chemin, entite, at=ouverture, **extra):
         a = cle(etape)
         corps = {"tenantId": T, "actionId": a, "deviceId": device, "entityKey": entite,
@@ -344,8 +379,11 @@ def temoin_to_close():
         if s != 200 or len(ouvertures) != 1 or any(o.get("sourceKey") != source or o.get("deviceId") != device
                 or o.get("actorId") != ACTEUR or o.get("actorName") != auteur for o in ouvertures):
             return "propriete non prouvee, aucune ecriture"
-        if led_sec.get("hasMore") or any(f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "CLOSURE")
+        if led_sec.get("hasMore") or any(f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "SALE_VOID", "CLOSURE")
                 or f.get("deviceId") != ("core" if f.get("kind") == "TO_CLOSE" else device)
+                or (f.get("kind") == "SALE_PAID" and
+                    ((f.get("snapshot") or {}).get("sellerId") != ACTEUR or
+                     (f.get("snapshot") or {}).get("sellerName") != auteur))
                 for f in led_sec.get("data", [])):
             return "usage concurrent, aucune ecriture"
         att = str(led_sec.get("projection", {}).get("totauxCourants", {}).get("expectedXpf"))
@@ -370,16 +408,25 @@ def temoin_to_close():
     # Verifie toutes les ouvertures, pas seulement le nom courant ; jamais de reprise manuelle.
     if len(openings) != 1 or any(o.get("sourceKey") != source or o.get("deviceId") != device
                                 or o.get("actorId") != ACTEUR or o.get("actorName") != auteur for o in openings):
-        ko(f"TO_CLOSE, jour fictif {business} partage avec un autre auteur")
+        print(f"TO_CLOSE : {business} utilisé manuellement, sauté (aucune écriture)")
+        return "TO_CLOSE non joué (jour occupé)"
     def faits(ledger):
         if ledger.get("hasMore"):
-            ko("TO_CLOSE, journal inattendu trop volumineux")
+            return None
         return ledger.get("data", [])
-    if len([f for f in faits(led) if f.get("kind") == "TO_CLOSE"]) != 1:
+    fs_led = faits(led)
+    if fs_led is None:
+        print(f"TO_CLOSE : {business} journal incomplet, sautÃ© (aucune Ã©criture)")
+        return "TO_CLOSE non joué (journal incomplet)"
+    if len([f for f in fs_led if f.get("kind") == "TO_CLOSE"]) != 1:
         ko("TO_CLOSE, evenement absent ou duplique")
-    if any(f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "CLOSURE")
-           or f.get("deviceId") != ("core" if f.get("kind") == "TO_CLOSE" else device) for f in faits(led)):
-        ko(f"TO_CLOSE, jour fictif {business} utilise manuellement (aucune nouvelle ecriture)")
+    if any(f.get("kind") not in ("TO_CLOSE", "OPENING", "SALE_PAID", "SALE_VOID", "CLOSURE")
+           or f.get("deviceId") != ("core" if f.get("kind") == "TO_CLOSE" else device)
+           or (f.get("kind") == "SALE_PAID" and
+               ((f.get("snapshot") or {}).get("sellerId") != ACTEUR or
+                (f.get("snapshot") or {}).get("sellerName") != auteur)) for f in fs_led):
+        print(f"TO_CLOSE : {business} utilisé manuellement, sauté (aucune écriture)")
+        return "TO_CLOSE non joué (jour occupé)"
     # CashDeposit est lisible, pagine par receivedAt/id. Aucun payload ni autre tenant demande.
     cursor, conflits = None, []
     while True:
@@ -402,6 +449,7 @@ def temoin_to_close():
     if jour["status"] == "TO_CLOSE":
         vente = ecrire("vente", f"/api/cash-days/{jid_tc}/sales", vente_source,
                        ticketNumber="TEMOIN-TC-" + business, sourceType=device, sourceId=vente_source,
+                       sellerId=ACTEUR, sellerName=auteur,
                        totalXpf="100", lines=[{"kind": "SERVICE", "label": auteur, "qty": 1,
                        "unitXpf": "100", "lineXpf": "100", "productId": None, "tgcRatePpm": 0}])
         vid_tc = vente.get("saleId")
@@ -410,32 +458,48 @@ def temoin_to_close():
         ecrire("checkout", f"/api/cash-days/{jid_tc}/sales/{vid_tc}/checkout", vente_source,
                 ticketNumber="TEMOIN-TC-" + business, paidAt=ouverture,
                 payments=[{"method": "CASH", "amountXpf": "100", "tenderedXpf": "100"}])
+        annule = ecrire("void", f"/api/cash-days/{jid_tc}/sales/{vid_tc}/void", vente_source,
+                reason="Parcours temoin TO_CLOSE : annulation avant fermeture")
+        if annule.get("status") != "VOID":
+            ko("TO_CLOSE, annulation absente")
         led = lire(ledger_url)
+        avoirs_tc = [f for f in faits(led) if f.get("kind") == "SALE_VOID"]
+        if len(avoirs_tc) != 1 or not (avoirs_tc[0].get("snapshot") or {}).get("creditNoteId"):
+            ko("TO_CLOSE, avoir Comptabilite absent du journal")
         attendu_tc = str(led.get("projection", {}).get("totauxCourants", {}).get("expectedXpf"))
-        if attendu_tc != "10100":
-            ko("TO_CLOSE, attendu different de 10100 F (usage concurrent possible)")
+        if attendu_tc != "10000":
+            ko("TO_CLOSE, attendu different de 10000 F apres annulation")
         ecrire("close", f"/api/cash-days/{jid_tc}/close", jid_tc, at=fermeture,
-                sourceKey=cle("close"), countedXpf="10100", closureMode="ONLINE",
-                localExpectedXpf="10100", localVarianceXpf="0", cycle=0)
+                sourceKey=cle("close"), countedXpf="10000", closureMode="ONLINE",
+                localExpectedXpf="10000", localVarianceXpf="0", cycle=0)
     ferme = lire(query).get("day") or {}
     if ferme.get("status") != "CLOSED" or ferme.get("closedLate") is not True:
         ko("TO_CLOSE, fermeture tardive non CLOSED")
     led = lire(ledger_url)
     fs = faits(led)
+    if fs is None:
+        ko("TO_CLOSE, journal incomplet apres fermeture")
     ventes = [f for f in fs if f.get("kind") == "SALE_PAID"]
     zs = [f for f in fs if f.get("kind") == "CLOSURE"]
+    annulations = [f for f in fs if f.get("kind") == "SALE_VOID"]
     if (len(ventes) != 1 or ventes[0].get("deviceId") != device
+            or (ventes[0].get("snapshot") or {}).get("sellerId") != ACTEUR
+            or (ventes[0].get("snapshot") or {}).get("sellerName") != auteur
             or not str(ventes[0].get("occurredAt", "")).startswith(business)
+            or len(annulations) != 1 or annulations[0].get("deviceId") != device
+            or not (annulations[0].get("snapshot") or {}).get("creditNoteId")
             or len(zs) != 1 or zs[0].get("sourceRef") != cle("close")):
         ko("TO_CLOSE, preuve de vente ou de Z inattendue")
     z = (zs[0].get("snapshot") or {}).get("report") or {}
-    attendu_z = {"expectedXpf": "10100", "countedXpf": "10100", "varianceXpf": "0",
-                 "totalSalesXpf": "100", "salesCount": "1", "cancelledCount": "0",
+    attendu_z = {"expectedXpf": "10000", "countedXpf": "10000", "varianceXpf": "0",
+        "totalSalesXpf": "0", "salesCount": "0", "cancelledCount": "1",
                  "refundCashXpf": "0", "movementNetXpf": "0"}
-    if any(str(z.get(k)) != v for k, v in attendu_z.items()) or z.get("parTaux") != {"0": {"ttcXpf": 100, "htXpf": 100, "tgcXpf": 0}}:
+    if any(str(z.get(k)) != v for k, v in attendu_z.items()) or z.get("parTaux") != {}:
         ko("TO_CLOSE, Z fige incorrect ou champs 4b absents")
+    if len([f for f in fs if f.get("kind") == "SALE_VOID"]) != 1:
+        ko("TO_CLOSE, annulation absente ou dupliquee")
     SECOURS.pop()
-    print(f"caissedemo TO_CLOSE : {business}, evenement unique, conflit APPLIED unique, vente acceptee, CLOSED tardif, Z fige 10100 F ecart 0")
+    print(f"caissedemo TO_CLOSE : {business}, vente annulee, aucune vente due, CLOSED tardif, Z fige 10000 F ecart 0")
     return "TO_CLOSE vert"
 
 try:
