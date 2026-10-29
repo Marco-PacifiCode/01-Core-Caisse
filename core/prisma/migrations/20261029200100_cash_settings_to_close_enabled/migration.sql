@@ -1,0 +1,1 @@
+ALTER TABLE "CashSettings" ADD COLUMN "toCloseEnabled" BOOLEAN NOT NULL DEFAULT false;

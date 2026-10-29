@@ -34,7 +34,7 @@ export type SaleSnapshotForCorrection = {
   id: string;
   status: "DRAFT" | "PAID" | "VOID";
   sessionId: string | null;
-  sessionStatus: "OPEN" | "CLOSED" | null; // null = la vente n'est rattachée à aucune session
+  sessionStatus: "OPEN" | "TO_CLOSE" | "CLOSED" | null; // null = la vente n'est rattachée à aucune session
   comptaSyncedAt: Date | null;
   invoiceId: string | null;
   /** Date RÉELLE de l'encaissement — sert de point de départ à la fenêtre de correction (1 mois
