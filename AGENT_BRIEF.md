@@ -1,8 +1,15 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## ✅ 2026-10-30 — Lot 2 « à fermer », étape 4b EN LIGNE, DORMANTE (07 h 52 NC, tag `deploy/core-caisse/20261029T205252Z-da0269eb5380`)
+- 4b = transition de la veille sous interrupteur, ouverture tardive (≤ 7 jours, seulement si une journée plus récente existe), ventes sur TO_CLOSE, rapport enrichi, témoin TO_CLOSE. PR 109 → main da0269e ; relecture 2/2 APPROUVÉE (preuves P1-P4 contre vrai Postgres, trigger : 0 écriture TO_CLOSE interrupteur éteint). Aucune migration.
+- QCM Marco « Oui, maintenant » + VAS-Y 00-Architecture ; 4 témoins verts (core-caisse « TO_CLOSE non joué (interrupteur éteint) », mixydemo, mixytruck, rotisserie-surface).
+- **Interrupteur éteint partout** : rien ne change tant que `toCloseEnabled` est faux. Allumage = geste `00-Archi-NextGen/_routine/ops/caisse-interrupteur.sh <tenant> on|off` (jamais sql-write-local : garde ARGENT), une question à Marco par commerce, avec le relevé des versions de ses appareils ; d'abord caissedemo seul, vérifié par `temoin-manuel-core-caisse.sh da0269e` (attendu « TO_CLOSE vert »).
+- Repli : avant tout retour à 4b827d3, `SELECT count(*) FROM "CashDayEvent" WHERE kind='TO_CLOSE'` doit valoir 0 ; après un allumage, repli = `toCloseEnabled=false` (règle iv ci-dessous).
+- Retouches A2-A4 de la relecture (témoin ASCII, « déjà prouvé » contrôlé, une requête TO_CLOSE par page) : PR 110 → main ec6f7df, **pas encore en ligne** (partent à la prochaine livraison).
+
 ## ✅ 2026-10-29 — Lot 2 « à fermer », étape 4a EN LIGNE (21 h 02 NC, tag `deploy/core-caisse/20261029T100254Z-4b827d31aa0f`)
 - 4a = valeur d'enum `SessionStatus.TO_CLOSE` + colonne `CashSettings.toCloseEnabled` (défaut false, lue par GET /api/cash-settings, jamais modifiable par PATCH ni par aucune route). Aucune écriture de TO_CLOSE. Migrations additives jouées avant le ship (20261029200000_cash_to_close, 20261029200100_cash_settings_to_close_enabled ; pg_dump core-caisse-20261029T095501Z-avant.sql). QCM Marco + VAS-Y 00-Architecture, 4 témoins verts, +15 vert.
-- 4b (transition sous interrupteur, ouverture tardive ≤ 7 jours, ventes sur TO_CLOSE, rapport enrichi) : branche `claude/core-caisse-4b-final`, en relecture (2e et dernière).
+- 4b : EN LIGNE le 30/10 (voir ci-dessus).
 - ⛔ **RÈGLE DE REPLI (00-Architecture, 29/10)** : aucun retour manuel sous la 4b dès qu'un `toCloseEnabled` a été allumé ; repli = `toCloseEnabled=false`. Preuve : 4b827d3 ne lit plus une journée TO_CLOSE (factDelta sans TO_CLOSE → ledger et clôture en 400, vente en ligne 409). Le rollback automatique pendant la livraison de la 4b reste sûr tant qu'aucun interrupteur n'est allumé (aucune ligne TO_CLOSE).
 - Allumage : commerce par commerce, par QCM Marco avec le relevé des versions de ses appareils ; caissedemo d'abord, pour le témoin TO_CLOSE.
 
@@ -58,6 +65,7 @@ valeur de secret n'entre dans la ligne** : elle ne compte qu'un chemin.
   que `chemin=secret` décroît jusqu'à 0.
 
 ### Dernières actions
+- **30/10 — 4b « à fermer » EN LIGNE dormante** (da0269e, 07:52, 4 témoins verts) ; retouches A2-A4 fusionnées (ec6f7df), non livrées.
 Run PM local du 2026-10-23 (`local-pm-20261023-160041`, identité `ng-pm (local)`) : branche
 `claude/authjws-journal-repli` poussée, preuve rouge/vert jouée, `ci-local` verte, fusion.
 Clone du poste rendu **propre sur `main`** après le run. Aucune migration, aucun geste serveur.
