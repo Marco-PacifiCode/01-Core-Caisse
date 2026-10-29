@@ -9,6 +9,9 @@ const makeAction = (actionId = randomUUID(), payload: any = { a: 1, b: 2 }) => (
 test("valide les UUID, l'objet payload et les limites du lot", () => {
   assert.throws(() => validateDepositInput({ tenantId: "bad", actions: [makeAction()] }));
   assert.throws(() => validateDepositInput({ tenantId, actions: Array.from({ length: 201 }, () => makeAction()) }));
+  assert.throws(() => validateDepositInput({ tenantId, actions: [] }), "corps vide refusé");
+  assert.throws(() => validateDepositInput({ tenantId, actions: [], applied: [] }), "corps vide refusé");
+  assert.deepEqual(validateDepositInput({ tenantId, actions: [], applied: [tenantId] }).actions, [], "applied seul accepté");
   assert.throws(() => validateDepositInput({ tenantId, actions: [{ ...makeAction(), actionId: "bad" }] }));
   assert.throws(() => validateDepositInput({ tenantId, actions: [{ ...makeAction(), payload: [] }] }));
   assert.throws(() => validateDepositInput({ tenantId, actions: [{ ...makeAction(), payload: null }] }));
