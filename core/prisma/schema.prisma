@@ -24,6 +24,7 @@ datasource db {
 // État d'une session de caisse (journée / poste).
 enum SessionStatus {
   OPEN
+  TO_CLOSE
   CLOSED
 }
 
@@ -564,6 +565,7 @@ model CashSettings {
   tenantId String @id @db.Uuid
   defaultFloatXpf BigInt @default(25000)
   allowNegativeStock Boolean @default(false)
+  toCloseEnabled Boolean @default(false)
   revision Int @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

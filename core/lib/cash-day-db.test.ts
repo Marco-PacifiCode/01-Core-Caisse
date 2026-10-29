@@ -2129,7 +2129,7 @@ test("cash-settings : GET par défaut, PATCH partiel, booléen strict et révisi
   let serial = 0;
   const initial = await get();
   assert.equal(initial.status, 200);
-  assert.deepEqual(initial.body, { tenantId: tenant, defaultFloatXpf: "25000", allowNegativeStock: false, revision: 0 });
+  assert.deepEqual(initial.body, { tenantId: tenant, defaultFloatXpf: "25000", allowNegativeStock: false, toCloseEnabled: false, revision: 0 });
   const first = await patch({ allowNegativeStock: true, baseRevision: 0 });
   assert.equal(first.status, 200);
   assert.equal((await get()).body.allowNegativeStock, true);

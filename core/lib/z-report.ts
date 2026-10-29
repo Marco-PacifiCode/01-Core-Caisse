@@ -19,7 +19,7 @@
 // précisément elle qu'on veut voir suivre une correction de moyen de paiement même après clôture.
 // Cette fonction ne décide QUE de l'attendu du tiroir ; elle n'a rien à dire sur la ventilation.
 export function expectedXpfPourRapport(
-  session: { status: "OPEN" | "CLOSED"; expectedXpf: bigint | null },
+  session: { status: "OPEN" | "TO_CLOSE" | "CLOSED"; expectedXpf: bigint | null },
   expectedRecalcule: bigint,
 ): bigint {
   // Exception : `expectedXpf` peut être `null` sur une session CLOSED ANTÉRIEURE à l'ajout du champ
