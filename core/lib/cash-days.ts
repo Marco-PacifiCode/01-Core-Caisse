@@ -132,12 +132,15 @@ export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchPar
       closures: { where: { tenantId, authoritative: true }, orderBy: [{ cycle: "desc" }, { receivedAt: "desc" }], take: 1 },
       events: { where: { tenantId, kind: "CLOSURE" }, orderBy: { sequence: "desc" }, take: 1 } },
   });
+  const page = rows.slice(0, limit);
+  const toCloseDays = new Set(toCloseEnabled ? [] : (await tx.cashDayEvent.findMany({
+    where: { tenantId, cashDayId: { in: page.map(day => day.id) }, kind: "TO_CLOSE" },
+    select: { cashDayId: true },
+  })).map(event => event.cashDayId));
   const days = [];
-  for (const day of rows.slice(0, limit)) {
+  for (const day of page) {
     let closure = day.events[0]?.snapshot ?? null;
-    const hasToClose = day.currentSession.status === "TO_CLOSE" || (!toCloseEnabled && !!await tx.cashDayEvent.findFirst({
-      where: { tenantId, cashDayId: day.id, kind: "TO_CLOSE" }, select: { id: true },
-    }));
+    const hasToClose = day.currentSession.status === "TO_CLOSE" || toCloseDays.has(day.id);
     if (toCloseEnabled || hasToClose) {
       const authoritative = day.closures?.[0];
       const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
