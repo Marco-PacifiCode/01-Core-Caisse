@@ -61,6 +61,7 @@ function functions() {
   return vm.runInContext(`${js}\n({ openSessionTx, closeSessionTx, reopenSessionTx })`, context);
 }
 const api = functions();
+const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
 const reopenCashDay = load("cash-days").reopenCashDay as (tx: Prisma.TransactionClient, id: string, b: any) => Promise<any>;
 
 async function cleanup(tenant: string) {
@@ -190,7 +191,8 @@ test("CashDay : mode caisse jour même rouvre, refusés, retard ignoré idempote
     const trace = await transaction(tenant, tx => tx.cashDayEvent.findFirstOrThrow({ where: { tenantId: tenant, cashDayId: day.id, kind: "REOPEN" } }));
     assert.equal(trace.snapshot.reopenMode, "CAISSE_JOUR_MEME"); assert.equal(trace.snapshot.actorId, actor); assert.equal(trace.snapshot.actorName, "Acteur réel"); assert.equal(trace.snapshot.receivedById, receiver);
     assert.equal(await transaction(tenant, tx => tx.cashDaySession.count({ where: { tenantId: tenant, cashDayId: day.id } })), 2);
-    assert.deepEqual(await apply(appliedRequest), reopened, "rejeu de la réouverture appliquée renvoie le même accusé");
+    // Accusé relu en base au rejeu : objets du contexte principal, ceux du 1er appel viennent du vm → comparer en JSON.
+    assert.deepEqual(plain(await apply(appliedRequest)), plain(reopened), "rejeu de la réouverture appliquée renvoie le même accusé");
     const sessionsAfterReopen = await transaction(tenant, tx => tx.cashDaySession.count({ where: { tenantId: tenant, cashDayId: day.id } }));
     const ignoredOpen = await apply(request(randomUUID()));
     assert.equal(ignoredOpen.status, 200); assert.equal(ignoredOpen.body.data.ignored, true);
@@ -207,7 +209,7 @@ test("CashDay : mode caisse jour même rouvre, refusés, retard ignoré idempote
     const lateApply = () => load("caisse-sync").cashAction(`cash-days:${oldDay.id}:reopen`, late, (tx: Prisma.TransactionClient) => reopenCashDay(tx, oldDay.id, late));
     const first = await lateApply(), replay = await lateApply();
     assert.equal(first.status, 200); assert.equal(first.body.data.ignored, true); assert.equal(first.body.data.code, "REOUVERTURE_TARDIVE");
-    assert.deepEqual(replay, first);
+    assert.deepEqual(plain(replay), plain(first));
     const lateState = await transaction(tenant, async tx => ({ day: await tx.cashDay.findFirstOrThrow({ where: { tenantId: tenant, id: oldDay.id } }),
       sessions: await tx.cashDaySession.count({ where: { tenantId: tenant, cashDayId: oldDay.id } }) }));
     assert.equal(lateState.day.cycle, 0); assert.equal(lateState.day.currentSessionId, oldSession.id); assert.equal(lateState.sessions, 1);
