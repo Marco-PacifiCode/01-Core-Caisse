@@ -30,7 +30,7 @@ function load(file: string): any {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const run = vm.runInNewContext(`(function(require,module,exports){${js}\n})`, {
-    Date, Error, Promise, Map, Set, WeakMap, BigInt, JSON, Number, String, Object, Array, console,
+    Date, Error, Promise, Map, Set, WeakMap, BigInt, JSON, Number, String, Object, Array, console, Buffer,
     URL, URLSearchParams, setTimeout, clearTimeout,
   });
   run((name: string) => name.startsWith(".") ? load(resolve(dirname(path), name)) : require(name), module, module.exports);
