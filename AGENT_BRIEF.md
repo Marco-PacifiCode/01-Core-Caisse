@@ -3,7 +3,7 @@
 ## ✅ 2026-10-30 — Lot 2 « à fermer », étape 4b EN LIGNE, DORMANTE (07 h 52 NC, tag `deploy/core-caisse/20261029T205252Z-da0269eb5380`)
 - 4b = transition de la veille sous interrupteur, ouverture tardive (≤ 7 jours, seulement si une journée plus récente existe), ventes sur TO_CLOSE, rapport enrichi, témoin TO_CLOSE. PR 109 → main da0269e ; relecture 2/2 APPROUVÉE (preuves P1-P4 contre vrai Postgres, trigger : 0 écriture TO_CLOSE interrupteur éteint). Aucune migration.
 - QCM Marco « Oui, maintenant » + VAS-Y 00-Architecture ; 4 témoins verts (core-caisse « TO_CLOSE non joué (interrupteur éteint) », mixydemo, mixytruck, rotisserie-surface).
-- **Interrupteur éteint partout** : rien ne change tant que `toCloseEnabled` est faux. Allumage = geste `00-Archi-NextGen/_routine/ops/caisse-interrupteur.sh <tenant> on|off` (jamais sql-write-local : garde ARGENT), une question à Marco par commerce, avec le relevé des versions de ses appareils ; d'abord caissedemo seul, vérifié par `temoin-manuel-core-caisse.sh da0269e` (attendu « TO_CLOSE vert »).
+- ⛔ **30/10 08:29 — caissedemo ALLUMÉ** (00-Architecture, QCM Marco, `caisse-interrupteur.sh on`, témoin manuel « TO_CLOSE vert ») : **règle (iv) en vigueur, plus aucun retour sous da0269e** ; repli = `caisse-interrupteur.sh <tenant> off`. Tous les autres commerces : éteint, rien ne change tant que `toCloseEnabled` est faux. Allumage = geste `00-Archi-NextGen/_routine/ops/caisse-interrupteur.sh <tenant> on|off` (jamais sql-write-local : garde ARGENT), une question à Marco par commerce, avec le relevé des versions de ses appareils ; d'abord caissedemo seul, vérifié par `temoin-manuel-core-caisse.sh da0269e` (attendu « TO_CLOSE vert »).
 - Repli : avant tout retour à 4b827d3, `SELECT count(*) FROM "CashDayEvent" WHERE kind='TO_CLOSE'` doit valoir 0 ; après un allumage, repli = `toCloseEnabled=false` (règle iv ci-dessous).
 - Retouches A2-A4 de la relecture (témoin ASCII, « déjà prouvé » contrôlé, une requête TO_CLOSE par page) : PR 110 → main ec6f7df, **pas encore en ligne** (partent à la prochaine livraison).
 
@@ -65,6 +65,7 @@ valeur de secret n'entre dans la ligne** : elle ne compte qu'un chemin.
   que `chemin=secret` décroît jusqu'à 0.
 
 ### Dernières actions
+- **30/10 08:29 — caissedemo allumé (Archi) : règle (iv) en vigueur.**
 - **30/10 — 4b « à fermer » EN LIGNE dormante** (da0269e, 07:52, 4 témoins verts) ; retouches A2-A4 fusionnées (ec6f7df), non livrées.
 Run PM local du 2026-10-23 (`local-pm-20261023-160041`, identité `ng-pm (local)`) : branche
 `claude/authjws-journal-repli` poussée, preuve rouge/vert jouée, `ci-local` verte, fusion.
