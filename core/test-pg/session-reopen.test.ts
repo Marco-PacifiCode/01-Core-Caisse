@@ -65,12 +65,6 @@ const reopenCashDay = load("cash-days").reopenCashDay as (tx: Prisma.Transaction
 
 async function cleanup(tenant: string) {
   await transaction(tenant, async tx => {
-    await tx.cashDeposit.deleteMany({ where: { tenantId: tenant } });
-    await tx.caisseSyncAction.deleteMany({ where: { tenantId: tenant } });
-    await tx.cashSettings.deleteMany({ where: { tenantId: tenant } });
-    await tx.cashDayEvent.deleteMany({ where: { tenantId: tenant } });
-    await tx.cashDaySession.deleteMany({ where: { tenantId: tenant } });
-    await tx.cashDay.deleteMany({ where: { tenantId: tenant } });
     await tx.cashSessionReopen.deleteMany({ where: { tenantId: tenant } });
     await tx.cashSession.deleteMany({ where: { tenantId: tenant } });
   });
@@ -172,7 +166,7 @@ test("CashDay : administration conserve son contrat même jour et jour passé", 
     const past = new Date(Date.now() - 48 * 3600000 + 11 * 3600000).toISOString().slice(0, 10);
     const pastResult = await execute(past, new Date(`${past}T01:00:00.000Z`).toISOString(), randomUUID());
     assert.equal(pastResult.result.status, 409); assert.equal(pastResult.result.body.error, "DAY_MISMATCH");
-  } finally { await cleanup(tenant); }
+  } finally { /* Faits de caisse immuables (IMMUTABLE_CASH_FACT) : tenant aléatoire, base jetable, rien à effacer. */ }
 });
 
 test("CashDay : mode caisse jour même rouvre, refusés, retard ignoré idempotent et OPEN ignoré", async () => {
@@ -225,6 +219,6 @@ test("CashDay : mode caisse jour même rouvre, refusés, retard ignoré idempote
     assert.equal(skewedResult.status, 200); assert.equal(skewedResult.body.data.ignored, true); assert.equal(skewedResult.body.data.code, "REOUVERTURE_TARDIVE");
     assert.equal(await transaction(tenant, tx => tx.cashDaySession.count({ where: { tenantId: tenant, cashDayId: day.id } })), sessionsAfterReopen);
     assert.equal(await transaction(tenant, tx => tx.cashDeposit.count({ where: { tenantId: tenant, operation: "REOUVERTURE_TARDIVE", entityKey: today } })), 1);
-  } finally { await cleanup(tenant); }
+  } finally { /* Faits de caisse immuables (IMMUTABLE_CASH_FACT) : tenant aléatoire, base jetable, rien à effacer. */ }
   }
 });
