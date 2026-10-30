@@ -37,7 +37,7 @@ function action(raw: unknown) {
   const formatVersion = a.formatVersion == null ? null : a.formatVersion;
   requireCash(formatVersion === null || formatVersion === 1 || formatVersion === 2, "INVALID_FORMAT_VERSION");
   const sequence = a.sequence == null ? null : a.sequence;
-  requireCash(sequence === null || (Number.isSafeInteger(sequence) && sequence >= 0), "INVALID_SEQUENCE");
+  requireCash(sequence === null || (typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence >= 0), "INVALID_SEQUENCE");
   if (formatVersion === 2) {
     requireCash(sequence !== null, "INVALID_SEQUENCE");
     requireCash((a.actorId == null) === (a.receivedById == null), "INVALID_AUTHOR_IDS");
@@ -50,7 +50,7 @@ function action(raw: unknown) {
     operation: nullableText(a.operation, 200, "operation"), entityKey: nullableText(a.entityKey, 300, "entityKey"),
     payload: payload as Prisma.InputJsonObject, dependsOn: (a.dependsOn ?? []) as string[], payloadHash: createHash("sha256").update(canonical(payload)).digest("hex"),
     clientCreatedAt: createdAt, clientState: nullableText(a.clientState, 100, "clientState"), clientErrorCode: nullableText(a.clientErrorCode, 200, "clientErrorCode"),
-    formatVersion, sequence: sequence === null ? null : BigInt(sequence), actorId: a.actorId == null ? null : uuid(a.actorId), receivedById: a.receivedById == null ? null : uuid(a.receivedById) };
+    formatVersion, sequence: sequence === null ? null : BigInt(sequence as number), actorId: a.actorId == null ? null : uuid(a.actorId), receivedById: a.receivedById == null ? null : uuid(a.receivedById) };
 }
 export function validateDepositInput(input: unknown) {
   const b = object(input), tenantId = uuid(b.tenantId);
@@ -101,13 +101,13 @@ export async function listDeposits(tx: CashDepositTx, input: { tenantId: string;
 export function validateClaimInput(input: unknown) {
   const b = object(input), tenantId = uuid(b.tenantId), holder = nullableText(b.holder, 100, "holder");
   requireCash(!!holder, "INVALID_HOLDER");
-  requireCash(Number.isInteger(b.leaseSeconds) && b.leaseSeconds >= 1 && b.leaseSeconds <= 60, "INVALID_LEASE_SECONDS");
-  requireCash(Number.isInteger(b.limit) && b.limit >= 1 && b.limit <= 200, "INVALID_LIMIT");
+  requireCash(typeof b.leaseSeconds === "number" && Number.isInteger(b.leaseSeconds) && b.leaseSeconds >= 1 && b.leaseSeconds <= 60, "INVALID_LEASE_SECONDS");
+  requireCash(typeof b.limit === "number" && Number.isInteger(b.limit) && b.limit >= 1 && b.limit <= 200, "INVALID_LIMIT");
   let after: { deviceId: string; sequence: number; actionId: string } | null = null;
   if (b.after != null) {
     try {
       const c = object(b.after), deviceId = nullableText(c.deviceId, 200, "deviceId");
-      requireCash(!!deviceId && Number.isSafeInteger(c.sequence) && c.sequence >= 0, "INVALID_CURSOR");
+      requireCash(!!deviceId && typeof c.sequence === "number" && Number.isSafeInteger(c.sequence) && c.sequence >= 0, "INVALID_CURSOR");
       after = { deviceId, sequence: c.sequence as number, actionId: uuid(c.actionId) };
     } catch { throw new CashContractError("INVALID_CURSOR"); }
   }
