@@ -10,12 +10,88 @@ import { claimDeposits, depositActions, recordDepositResult, validateClaimInput,
 
 const tenantId = randomUUID();
 const makeAction = (actionId = randomUUID(), payload: any = { a: 1, b: 2 }) => ({ actionId, deviceId: "tablet", kind: "SALE", payload });
-test("contrat apply complet (source courante ou base Git pour la preuve rouge)", () => {
+// Preuves rouges P2B : CASH_DEPOSIT_TEST_BASE=HEAD (base avant cette passe).
+test("P2B format 2 exige sequence", () => {
+  const api = contractApi();
+  for (const sequence of [undefined, null, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion: 2, sequence }] }), /INVALID_SEQUENCE/);
+  }
+  for (const formatVersion of [undefined, null, 1]) {
+    assert.equal(api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion }] }).actions[0].sequence, null);
+  }
+  assert.equal(api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion: 2, sequence: 0 }] }).actions[0].sequence, 0n);
+});
+test("P2B format 2 exige paire UUID auteur reception", () => {
+  const api = contractApi();
+  for (const ids of [{ actorId: tenantId }, { receivedById: tenantId }, { actorId: "bad", receivedById: tenantId }, { actorId: tenantId, receivedById: "bad" }]) {
+    assert.throws(() => api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion: 2, sequence: 0, ...ids }] }), /INVALID_AUTHOR_IDS/);
+  }
+  for (const ids of [{}, { actorId: null, receivedById: null }, { actorId: tenantId, receivedById: tenantId }]) {
+    assert.doesNotThrow(() => api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion: 2, sequence: 0, ...ids }] }));
+  }
+  for (const formatVersion of [null, 1]) {
+    assert.doesNotThrow(() => api.validateDepositInput({ tenantId, actions: [{ ...makeAction(), formatVersion, actorId: tenantId }] }));
+  }
+});
+test("P2B redepot preserve toutes les colonnes sauf lastSeenAt", async () => {
+  const api = contractApi(), original = { ...makeAction(), formatVersion: 1, clientState: "queued", clientErrorCode: "OFFLINE" };
+  let row: any;
+  const tx: any = { $queryRaw: async () => [], cashDeposit: {
+    findUnique: async () => row,
+    create: async ({ data }: any) => { row = { ...data, status: "PENDING", attempts: 2, lastResultCode: "REJEU_TABLETTE", resultJson: null, lastSeenAt: new Date(0) }; },
+    update: async ({ data }: any) => { row = { ...row, ...data }; return row; },
+  } };
+  await api.depositActions(tx, { tenantId, actions: [original] });
+  const { lastSeenAt, ...before } = row;
+  const result = await api.depositActions(tx, { tenantId, actions: [{ ...original, deviceId: "changed", formatVersion: 2, sequence: 10, actorId: tenantId, receivedById: tenantId, clientState: "changed", clientErrorCode: "NEW" }] });
+  assert.equal(result.results[0].result, "seen");
+  const { lastSeenAt: seen, ...after } = row;
+  assert.deepEqual(after, before); assert.ok(seen > lastSeenAt);
+});
+test("P2B curseur trois appareils sans famine et bail renouvele", async () => {
+  const api = contractApi(), limit = 3;
+  const rows = ["A", "B", "C"].flatMap((deviceId, d) => Array.from({ length: d === 0 ? limit + 5 : 3 }, (_, i) => ({
+    tenantId, actionId: "00000000-0000-4000-8000-" + String(d * 100 + i).padStart(12, "0"),
+    deviceId, sequence: BigInt(Math.floor(i / 2)), clientCreatedAt: new Date(100 - i), dependsOn: [],
+  })));
+  const compare = (a: any, b: any) => a < b ? -1 : a > b ? 1 : 0;
+  const ordered = [...rows].sort((a, b) => compare(a.deviceId, b.deviceId) || compare(a.sequence, b.sequence) || compare(a.actionId, b.actionId));
+  const matches = (row: any, where: any): boolean => Object.entries(where).every(([k, value]: any) =>
+    k === "OR" ? value.some((clause: any) => matches(row, clause)) :
+    value && typeof value === "object" && "gt" in value ? row[k] > value.gt : row[k] === value);
+  let leases = 0;
+  const tx: any = { $queryRaw: async () => { leases++; return [{ token: randomUUID(), until: new Date(Date.now() + 60000) }]; }, cashDeposit: {
+    updateMany: async () => ({}),
+    findMany: async ({ where, orderBy, take }: any) => {
+      assert.equal(where.tenantId, tenantId); assert.equal(where.status, "PENDING"); assert.equal(where.formatVersion, 2);
+      const { tenantId: _, status, formatVersion, ...filter } = where;
+      return rows.filter(r => matches(r, filter)).sort((a: any, b: any) => {
+        for (const order of orderBy) { const key = Object.keys(order)[0], n = compare(a[key], b[key]); if (n) return n; } return 0;
+      }).slice(0, take);
+    },
+  } };
+  let after: any = null, previousToken: string | undefined; const seen: string[] = [];
+  do {
+    assert.ok(leases < 20, "pagination doit terminer");
+    const page = await api.claimDeposits(tx, api.validateClaimInput({ tenantId, holder: "same", leaseSeconds: 60, limit, after }));
+    assert.ok(page); assert.notEqual(page.token, previousToken); previousToken = page.token;
+    seen.push(...page.items.map((r: any) => r.actionId));
+    assert.ok(page.nextAfter === null || (typeof page.nextAfter?.deviceId === "string" && Number.isSafeInteger(page.nextAfter.sequence)), "curseur JSON explicite");
+    after = page.nextAfter;
+    if (after) assert.equal(after.actionId, page.items.at(-1).actionId);
+  } while (after);
+  assert.deepEqual(seen, ordered.map(r => r.actionId)); assert.equal(new Set(seen).size, rows.length);
+  assert.equal(leases, Math.ceil(rows.length / limit));
+  for (const after of [{ deviceId: "A", sequence: -1, actionId: tenantId }, { deviceId: "", sequence: 0, actionId: tenantId }, { deviceId: "A", sequence: 0, actionId: "bad" }]) {
+    assert.throws(() => api.validateClaimInput({ tenantId, holder: "h", leaseSeconds: 5, limit, after }), /INVALID_CURSOR/);
+  }
+});
+function contractApi() {
   const source = process.env.CASH_DEPOSIT_TEST_BASE
     ? execFileSync("git", ["show", `${process.env.CASH_DEPOSIT_TEST_BASE}:core/lib/cash-deposits.ts`], { encoding: "utf8" })
     : readFileSync(new URL("cash-deposits.ts", import.meta.url), "utf8");
   const js = stripTypeScriptTypes(source).replace(/^import .*from .*;\r?$/gm, "").replace(/^export /gm, "");
-  const api = vm.runInNewContext(`(function(){${js}\nreturn {validateDepositInput, validateClaimInput, validateResultInput, claimDeposits, recordDepositResult};})()`, {
+  const api = vm.runInNewContext(`(function(){${js}\nreturn {validateDepositInput, validateClaimInput, validateResultInput, claimDeposits, recordDepositResult, depositActions};})()`, {
     Buffer, Date, Error, Set, Map, Object, Array, Number, String, JSON, Promise, BigInt,
     createHash, randomUUID,
     canonical: (v: unknown) => JSON.stringify(v), date: (v: string) => new Date(v),
@@ -24,6 +100,10 @@ test("contrat apply complet (source courante ou base Git pour la preuve rouge)",
     requireCash: (ok: boolean, code = "INVALID") => { if (!ok) throw Error(code); },
     CashContractError: class extends Error {},
   });
+  return api;
+}
+test("contrat apply complet (source courante ou base Git pour la preuve rouge)", () => {
+  const api = contractApi();
   const actionId = randomUUID(), payload = { total: 42 };
   const core = { tenantId, actionId, deviceId: "tablet", kind: "SALE", payload };
   const v2 = api.validateDepositInput({ tenantId, actions: [{ ...core, formatVersion: 2, sequence: 3, actorId: tenantId, receivedById: tenantId }] }).actions[0];
@@ -145,8 +225,8 @@ test("claim marque v1 et renvoie v2 trié avec dépendances", async () => {
   } };
   const result = await claimDeposits(tx, validateClaimInput({ tenantId, holder: "worker", leaseSeconds: 10, limit: 20 }));
   assert.equal(marked, true); assert.equal(result!.items[0].deviceId, "a");
-  assert.deepEqual(findArgs.orderBy, [{ deviceId: "asc" }, { sequence: "asc" }, { clientCreatedAt: "asc" }, { actionId: "asc" }]);
-  assert.deepEqual(findArgs.where, { tenantId, status: "PENDING", formatVersion: 2 }); assert.equal(findArgs.take, 20);
+  assert.deepEqual(findArgs.orderBy, [{ deviceId: "asc" }, { sequence: "asc" }, { actionId: "asc" }]);
+  assert.deepEqual(findArgs.where, { tenantId, status: "PENDING", formatVersion: 2 }); assert.equal(findArgs.take, 21);
   assert.deepEqual(result!.items[1].dependances, [{ actionId: tenantId, status: "APPLIED", resultJson: { ok: true } }]);
   assert.deepEqual(result!.items[0].dependances, [{ actionId: "invalid", status: "MISSING", resultJson: null }]);
 });

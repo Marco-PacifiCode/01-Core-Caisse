@@ -38,6 +38,14 @@ function action(raw: unknown) {
   requireCash(formatVersion === null || formatVersion === 1 || formatVersion === 2, "INVALID_FORMAT_VERSION");
   const sequence = a.sequence == null ? null : a.sequence;
   requireCash(sequence === null || (Number.isSafeInteger(sequence) && sequence >= 0), "INVALID_SEQUENCE");
+  if (formatVersion === 2) {
+    requireCash(sequence !== null, "INVALID_SEQUENCE");
+    requireCash((a.actorId == null) === (a.receivedById == null), "INVALID_AUTHOR_IDS");
+    if (a.actorId != null) {
+      try { uuid(a.actorId); uuid(a.receivedById); }
+      catch { throw new CashContractError("INVALID_AUTHOR_IDS"); }
+    }
+  }
   return { actionId: uuid(a.actionId), deviceId, deviceName: nullableText(a.deviceName, 200, "deviceName"), kind,
     operation: nullableText(a.operation, 200, "operation"), entityKey: nullableText(a.entityKey, 300, "entityKey"),
     payload: payload as Prisma.InputJsonObject, dependsOn: (a.dependsOn ?? []) as string[], payloadHash: createHash("sha256").update(canonical(payload)).digest("hex"),
@@ -63,7 +71,7 @@ export async function depositActions(tx: CashDepositTx, input: unknown) {
     const prior = await tx.cashDeposit.findUnique({ where });
     if (!prior) { await tx.cashDeposit.create({ data: { tenantId: b.tenantId, ...a } }); results.push({ actionId: a.actionId, result: "stored" }); }
     else if (prior.payloadHash === a.payloadHash) {
-      await tx.cashDeposit.update({ where, data: { lastSeenAt: new Date(), clientState: a.clientState, clientErrorCode: a.clientErrorCode } });
+      await tx.cashDeposit.update({ where, data: { lastSeenAt: new Date() } });
       results.push({ actionId: a.actionId, result: "seen" });
     } else {
       await tx.cashDeposit.update({ where, data: { conflictCount: { increment: 1 } } }); results.push({ actionId: a.actionId, result: "conflict" });
@@ -95,18 +103,35 @@ export function validateClaimInput(input: unknown) {
   requireCash(!!holder, "INVALID_HOLDER");
   requireCash(Number.isInteger(b.leaseSeconds) && b.leaseSeconds >= 1 && b.leaseSeconds <= 60, "INVALID_LEASE_SECONDS");
   requireCash(Number.isInteger(b.limit) && b.limit >= 1 && b.limit <= 200, "INVALID_LIMIT");
-  return { tenantId, holder, leaseSeconds: b.leaseSeconds as number, limit: b.limit as number };
+  let after: { deviceId: string; sequence: number; actionId: string } | null = null;
+  if (b.after != null) {
+    try {
+      const c = object(b.after), deviceId = nullableText(c.deviceId, 200, "deviceId");
+      requireCash(!!deviceId && Number.isSafeInteger(c.sequence) && c.sequence >= 0, "INVALID_CURSOR");
+      after = { deviceId, sequence: c.sequence as number, actionId: uuid(c.actionId) };
+    } catch { throw new CashContractError("INVALID_CURSOR"); }
+  }
+  return { tenantId, holder, leaseSeconds: b.leaseSeconds as number, limit: b.limit as number, after };
 }
 export async function claimDeposits(tx: CashDepositTx, input: ReturnType<typeof validateClaimInput>) {
   const token = randomUUID();
   const leases = await tx.$queryRaw<{ token: string; until: Date }[]>`INSERT INTO "CashDepositLease" ("tenantId", holder, token, "until") VALUES (${input.tenantId}::uuid, ${input.holder}, ${token}::uuid, clock_timestamp() + (${input.leaseSeconds} * interval '1 second')) ON CONFLICT ("tenantId") DO UPDATE SET holder=EXCLUDED.holder, token=EXCLUDED.token, "until"=EXCLUDED."until" WHERE "CashDepositLease"."until" <= clock_timestamp() OR "CashDepositLease".holder=EXCLUDED.holder RETURNING token, "until"`;
   if (!leases.length) return null;
   await tx.cashDeposit.updateMany({ where: { tenantId: input.tenantId, status: "PENDING", OR: [{ formatVersion: null }, { formatVersion: 1 }], lastResultCode: null }, data: { lastResultCode: "REJEU_TABLETTE" } });
-  const rows = await tx.cashDeposit.findMany({ where: { tenantId: input.tenantId, status: "PENDING", formatVersion: 2 }, orderBy: [{ deviceId: "asc" }, { sequence: "asc" }, { clientCreatedAt: "asc" }, { actionId: "asc" }], take: input.limit });
+  const after = input.after;
+  const candidates = await tx.cashDeposit.findMany({ where: { tenantId: input.tenantId, status: "PENDING", formatVersion: 2,
+    ...(after ? { OR: [
+      { deviceId: { gt: after.deviceId } },
+      { deviceId: after.deviceId, sequence: { gt: BigInt(after.sequence) } },
+      { deviceId: after.deviceId, sequence: BigInt(after.sequence), actionId: { gt: after.actionId } },
+    ] } : {}) }, orderBy: [{ deviceId: "asc" }, { sequence: "asc" }, { actionId: "asc" }], take: input.limit + 1 });
+  const rows = candidates.slice(0, input.limit), last = rows.at(-1);
+  const nextAfter = candidates.length > input.limit && last
+    ? { deviceId: last.deviceId, sequence: Number(last.sequence), actionId: last.actionId } : null;
   const deps = [...new Set(rows.flatMap(r => Array.isArray(r.dependsOn) ? r.dependsOn.filter((x): x is string => typeof x === "string").map(x => x.toLowerCase()).filter(x => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(x)) : []))];
   const depRows = deps.length ? await tx.cashDeposit.findMany({ where: { tenantId: input.tenantId, actionId: { in: deps } }, select: { actionId: true, status: true, resultJson: true } }) : [];
   const byId = new Map(depRows.map(x => [x.actionId, x]));
-  return { token: leases[0].token, until: leases[0].until, items: rows.map(r => ({ ...r, dependances: depsFor(r.dependsOn, byId) })) };
+  return { token: leases[0].token, until: leases[0].until, nextAfter, items: rows.map(r => ({ ...r, dependances: depsFor(r.dependsOn, byId) })) };
 }
 function depsFor(value: unknown, byId: Map<string, { actionId: string; status: string; resultJson: unknown }>) {
   return Array.isArray(value) ? value.flatMap(x => typeof x === "string"
