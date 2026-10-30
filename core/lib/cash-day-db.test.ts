@@ -2238,6 +2238,71 @@ test("ouverture CashDay : une session OPEN non liée garde PREVIOUS_SESSION_OPEN
   assert.equal(f.rows("cashDeposit").length, 0);
 });
 
+test("réouverture CashDay : administration garde ses règles et la caisse du jour trace l'auteur", async () => {
+  for (const toCloseEnabled of [false, true]) {
+    const f = fixture();
+    if (toCloseEnabled) await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+    await f.days.openCashDay(f.tx, input());
+    const day = f.rows("cashDay")[0];
+    await f.tx.cashSession.updateMany({ where: { tenantId: tenant, id: day.currentSessionId }, data: { status: "CLOSED", closedAt: now } });
+    const b = input({ actionId: `reopen-admin-${toCloseEnabled}`, administration: true });
+    const result = await f.sync.cashAction("reopen", b, tx => f.days.reopenCashDay(tx, day.id, b));
+    assert.equal(result.status, 200);
+    assert.equal(result.body.data.status, "OPEN"); assert.equal(result.body.data.cycle, 1);
+    const event = f.rows("cashDayEvent").find(e => e.kind === "REOPEN")!;
+    assert.equal(event.snapshot.reopenMode, "ADMINISTRATION"); assert.equal(event.snapshot.actorId, actor);
+    const alreadyOpen = input({ actionId: `reopen-admin-open-${toCloseEnabled}`, administration: true });
+    const openResult = await f.sync.cashAction("reopen", alreadyOpen, tx => f.days.reopenCashDay(tx, day.id, alreadyOpen));
+    assert.equal(openResult.status, 409); assert.equal(openResult.body.error, "DAY_ALREADY_OPEN");
+  }
+  for (const toCloseEnabled of [false, true]) {
+    const f = fixture();
+    if (toCloseEnabled) await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });
+    await f.days.openCashDay(f.tx, input()); const day = f.rows("cashDay")[0];
+    await f.tx.cashSession.updateMany({ where: { tenantId: tenant, id: day.currentSessionId }, data: { status: "CLOSED", closedAt: now } });
+    const b = input({ actionId: `reopen-today-${toCloseEnabled}`, reopenMode: "CAISSE_JOUR_MEME", actorName: "Acteur réel", receivedById: tenantB });
+    const result = await f.sync.cashAction("reopen", b, tx => f.days.reopenCashDay(tx, day.id, b));
+    assert.equal(result.status, 200); assert.equal(result.body.data.cycle, 1);
+    assert.equal(result.body.data.status, "OPEN"); assert.equal(f.rows("cashDaySession").filter(s => s.cashDayId === day.id).length, 2);
+    assert.equal(f.rows("cashDayEvent").find(e => e.kind === "REOPEN")!.snapshot.reopenMode, "CAISSE_JOUR_MEME");
+    assert.equal(f.rows("cashDayEvent").find(e => e.kind === "REOPEN")!.snapshot.receivedById, tenantB);
+    assert.equal(f.rows("cashDayEvent").find(e => e.kind === "REOPEN")!.snapshot.actorName, "Acteur réel");
+    assert.deepEqual(JSON.parse(JSON.stringify(await f.sync.cashAction("reopen", b, tx => f.days.reopenCashDay(tx, day.id, b)))), JSON.parse(JSON.stringify(result)));
+  }
+});
+
+test("réouverture CashDay : rejoue tardif ignoré et conflit unique; modes refusés, OPEN ignoré", async () => {
+  const f = fixture();
+  const lateOpen = input({ actionId: "late-day-open", businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00Z", sourceKey: "late-day-source", localSessionKey: "late-day-local" });
+  await f.days.openCashDay(f.tx, lateOpen); const day = f.rows("cashDay")[0];
+  await f.tx.cashSession.updateMany({ where: { tenantId: tenant, id: day.currentSessionId }, data: { status: "CLOSED", closedAt: new Date("2026-10-14T08:00:00Z") } });
+  const late = input({ actionId: "reopen-late", reopenMode: "CAISSE_JOUR_MEME", businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00Z" });
+  const applyLate = () => f.sync.cashAction("reopen", late, tx => f.days.reopenCashDay(tx, day.id, late));
+  const first = await applyLate();
+  assert.equal(first.status, 200); assert.equal(first.body.data.ignored, true); assert.equal(first.body.data.code, "REOUVERTURE_TARDIVE");
+  assert.equal(f.rows("cashDeposit").filter(d => d.operation === "REOUVERTURE_TARDIVE").length, 1);
+  assert.equal(f.rows("cashSession").length, 1); assert.equal(f.rows("cashDay")[0].cycle, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(await applyLate())), JSON.parse(JSON.stringify(first)));
+  assert.equal(f.rows("cashDeposit").filter(d => d.operation === "REOUVERTURE_TARDIVE").length, 1);
+  for (const fields of [{}, { reopenMode: "UNKNOWN" }, { reopenMode: "CAISSE_JOUR_MEME", actorId: undefined }]) {
+    const denied = input({ ...fields, actionId: `denied-${Math.random()}` });
+    const response = await f.sync.cashAction("reopen", denied, tx => f.days.reopenCashDay(tx, day.id, denied));
+    assert.equal(response.status, 403); assert.equal(response.body.error, "MODE_CAISSE");
+  }
+  const today = fixture(); await today.days.openCashDay(today.tx, input()); const todayDay = today.rows("cashDay")[0];
+  const adminPast = input({ actionId: "admin-reopen-past", administration: true, businessDay: "2026-10-14", occurredAt: "2026-10-14T01:00:00Z" });
+  const adminPastResult = await f.sync.cashAction("reopen", adminPast, tx => f.days.reopenCashDay(tx, day.id, adminPast));
+  assert.equal(adminPastResult.status, 409); assert.equal(adminPastResult.body.error, "DAY_MISMATCH");
+  const adminBadTime = input({ actionId: "admin-reopen-bad-time", administration: true, occurredAt: "2026-10-14T01:00:00Z" });
+  const adminBadTimeResult = await today.sync.cashAction("reopen", adminBadTime, tx => today.days.reopenCashDay(tx, todayDay.id, adminBadTime));
+  assert.equal(adminBadTimeResult.status, 409); assert.equal(adminBadTimeResult.body.error, "DAY_MISMATCH");
+  const open = input({ actionId: "reopen-open", reopenMode: "CAISSE_JOUR_MEME" });
+  const ignored = await today.sync.cashAction("reopen", open, tx => today.days.reopenCashDay(tx, todayDay.id, open));
+  assert.equal(ignored.status, 200); assert.equal(ignored.body.data.ignored, true);
+  assert.equal(ignored.body.data.cycle, 0); assert.equal(today.rows("cashDaySession").filter(s => s.cashDayId === todayDay.id).length, 1);
+  assert.equal(today.rows("cashDeposit").length, 0);
+});
+
 test("ouverture tardive CashDay : appareil en retard sans journée plus récente conserve 4a", async () => {
   const f = fixture();
   await f.tx.cashSettings.create({ data: { tenantId: tenant, toCloseEnabled: true } });

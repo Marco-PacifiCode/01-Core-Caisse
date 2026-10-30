@@ -332,18 +332,32 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
 }
 export async function reopenCashDay(tx: CashTx, id: string, b: ActionInput) {
   id = uuid(id); b = normalizeActionInput(b);
+  const administration = b.administration === true;
+  const caisseToday = b.reopenMode === "CAISSE_JOUR_MEME";
+  // Refus explicite 403 des modes hors administration, avant sourceAuthor (qui valide l'auteur).
+  if (!administration) requireCash(caisseToday && !!b.actorId, "MODE_CAISSE", 403);
   const day = await lockDay(tx, b.tenantId, id), author = sourceAuthor(b);
   // Le relais S2S vérifie le cookie Administration signé ; le Core exige son attestation.
-  requireCash(b.administration === true && !!author.actorId, "MODE_CAISSE", 403);
-  requireCash(day.businessDay === businessDay(new Date()) && businessDay(date(b.occurredAt)) === day.businessDay, "DAY_MISMATCH", 409);
-  requireCash(day.currentSession.status === "CLOSED", "DAY_ALREADY_OPEN", 409);
+  requireCash((administration || caisseToday) && !!author.actorId, "MODE_CAISSE", 403);
+  if (administration) requireCash(day.businessDay === businessDay(new Date()) && businessDay(date(b.occurredAt)) === day.businessDay, "DAY_MISMATCH", 409);
+  // Mode caisse : jamais un 4xx qui casserait la file de la tablette. Hors du jour du commerce
+  // (rejeu tardif, horloge d'appareil fausse) : rien n'est rouvert, un conflit nous est remonté.
+  else if (day.businessDay !== businessDay(new Date()) || businessDay(date(b.occurredAt)) !== day.businessDay) {
+    await recordCashConflict(tx, { actionName: `${b.tenantId}:${day.businessDay}:${b.actionId}:REOUVERTURE_TARDIVE`, tenantId: b.tenantId,
+      scope: day.scope, businessDay: day.businessDay, code: "REOUVERTURE_TARDIVE" });
+    return { ...(await dayState(tx, b.tenantId, id)), ignored: true, code: "REOUVERTURE_TARDIVE" };
+  }
+  if (day.currentSession.status !== "CLOSED") {
+    if (administration) throw new CashContractError("DAY_ALREADY_OPEN", 409);
+    return { ...(await dayState(tx, b.tenantId, id)), ignored: true };
+  }
   const native = await openSessionTx(tx, b.tenantId, { openedBy: author.actorId!, openedByName: author.actorName,
     openingFloatXpf: 0n, occurredAt: date(b.occurredAt) });
   requireCash(native.ok, "PREVIOUS_SESSION_OPEN", 409);
   await tx.cashDaySession.create({ data: { tenantId: b.tenantId, cashDayId: id, sessionId: native.session.id, cycle: day.cycle + 1 } });
   await tx.cashDay.update({ where: { tenantId_id: { tenantId: b.tenantId, id } }, data: { currentSessionId: native.session.id, cycle: { increment: 1 } } });
   await appendDayFact(tx, b.tenantId, id, { kind: "REOPEN", sourceRef: b.actionId, deviceId: b.deviceId, occurredAt: date(b.occurredAt),
-    snapshot: { ...author, cycle: day.cycle + 1, sessionId: native.session.id } });
+    snapshot: { ...author, reopenMode: administration ? "ADMINISTRATION" : "CAISSE_JOUR_MEME", cycle: day.cycle + 1, sessionId: native.session.id } });
   return dayState(tx, b.tenantId, id);
 }
 export async function ledgerPage(tx: CashTx, tenantId: string, id: string, q: URLSearchParams) {
