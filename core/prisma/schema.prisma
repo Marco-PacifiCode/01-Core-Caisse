@@ -786,7 +786,24 @@ model CashDeposit {
   status String @default("PENDING")
   appliedAt DateTime? @db.Timestamptz(3)
   conflictCount Int @default(0)
+  formatVersion Int?
+  sequence BigInt?
+  actorId String? @db.Uuid
+  receivedById String? @db.Uuid
+  attempts Int @default(0)
+  lastAttemptAt DateTime? @db.Timestamptz(3)
+  lastResultCode String?
+  lastResultReason String?
+  resultJson Json?
 
   @@unique([tenantId, actionId])
   @@index([tenantId, status, receivedAt])
+  @@index([tenantId, status, formatVersion])
+}
+
+model CashDepositLease {
+  tenantId String @id @db.Uuid
+  holder String
+  token String @db.Uuid
+  until DateTime @db.Timestamptz(3)
 }

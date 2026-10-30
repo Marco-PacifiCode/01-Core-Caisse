@@ -28,7 +28,7 @@ DECLARE
     'CashSession','Sale','SaleLine','SalePayment','CashMovement','GiftCard','GiftCardOrder',
     'LoyaltyProgram','LoyaltyAccount','LoyaltyEntry','VoidAction','Poste',
     'CashSettings','CaisseSyncAction','ParkedBasket','PickupOrder',
-    'CashDay','CashDaySession','CashDayOpening','CashDayClosure','CashDayEvent','CashDeposit'
+    'CashDay','CashDaySession','CashDayOpening','CashDayClosure','CashDayEvent','CashDeposit','CashDepositLease'
   ];
 BEGIN
   FOREACH t IN ARRAY tables LOOP
