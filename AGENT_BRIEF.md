@@ -1,5 +1,12 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🔓 2026-10-31 — Réouverture du jour même en mode Caisse — ✅ EN LIGNE (14 h 58 NC, main `1b46ea1`, PR 113, tag `deploy/core-caisse/20261031T035806Z-1b46ea1ee6c8`)
+- Incident Rôtisserie du 31/10 : le gérant avait fermé le jour même par erreur, et la réouverture était réservée au mode Administration, ce qui bloquait le commerce. Décision de Marco : « Il ne faut jamais bloquer une réouverture, ça bloque le commerce » + « Tout compte, le jour même ».
+- `reopenCashDay` (core/lib/cash-days.ts) : le chemin `administration === true` est inchangé (DAY_MISMATCH hors du jour, DAY_ALREADY_OPEN 409). Nouveau : `reopenMode: "CAISSE_JOUR_MEME"` + actorId, accepté seulement pour le jour du commerce aujourd'hui et un occurredAt du même jour. Sinon : 200 `{ ignored: true, code: "REOUVERTURE_TARDIVE" }` + un conflit idempotent (tenant:jour:actionId), rien n'est rouvert. Journée déjà OPEN : 200 `ignored` sans conflit. Tout autre mode, ou un actorId absent : MODE_CAISSE 403. Le snapshot REOPEN porte reopenMode et l'auteur.
+- RÈGLE EXACTE : jour du jour seulement, en mode Caisse comme en Administration ; les ventes faites après un Z vont en complément. Aucune migration. Inclut la retouche 4b `ec6f7df` (témoin ASCII, une requête TO_CLOSE).
+- Relu par 00-Architecture (frontière d'autorisation), QCM de Marco, 4 témoins verts (core-caisse, mixydemo, mixytruck, rotisserie-surface), +15 VERT à 15 h 13. Le relais Rôtisserie (5eb5dcd, en ligne à 15 h 10) envoie CAISSE_JOUR_MEME avec l'acteur de la session, et administration seulement en mode Administration. ⛔ Règle (iv) toujours en vigueur : aucun retour sous da0269e.
+- Banc test-pg : les faits de caisse sont immuables (trigger IMMUTABLE_CASH_FACT), donc cleanup() ne les efface plus (tenant aléatoire, base jetable) ; les accusés sortis du contexte vm se comparent en JSON ; Buffer est exposé au vm.
+
 ## ✅ 2026-10-30 — Lot 2 « à fermer », étape 4b EN LIGNE, DORMANTE (07 h 52 NC, tag `deploy/core-caisse/20261029T205252Z-da0269eb5380`)
 - 4b = transition de la veille sous interrupteur, ouverture tardive (≤ 7 jours, seulement si une journée plus récente existe), ventes sur TO_CLOSE, rapport enrichi, témoin TO_CLOSE. PR 109 → main da0269e ; relecture 2/2 APPROUVÉE (preuves P1-P4 contre vrai Postgres, trigger : 0 écriture TO_CLOSE interrupteur éteint). Aucune migration.
 - QCM Marco « Oui, maintenant » + VAS-Y 00-Architecture ; 4 témoins verts (core-caisse « TO_CLOSE non joué (interrupteur éteint) », mixydemo, mixytruck, rotisserie-surface).
