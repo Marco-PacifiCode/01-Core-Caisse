@@ -160,6 +160,14 @@ export function projectCashDay(input: {
   const facts = [...dedup.values()];
   const closures = input.closures.filter(c => c.cutoffRevision <= input.revision);
   const closure = closures.find(c => c.cycle === input.cycle && c.authoritative);
+  const zRemplaces = closures.filter(c => c.authoritative).flatMap(c => {
+    const replacement = closures.filter(next => next.authoritative && next.cycle > c.cycle
+      && next.closureMode === "RECTIFICATION" && object(next.legacySnapshot ?? {}).replacedClosureId === c.id)
+      .sort((a, b) => a.cycle - b.cycle)[0];
+    return replacement ? [{ id: c.id, cycle: c.cycle, compte: c.countedXpf,
+      ecart: c.countedXpf - c.baselineExpectedXpf, occurredAt: c.occurredAt,
+      remplacéPar: replacement.id, motif: object(replacement.legacySnapshot ?? {}).motif }] : [];
+  });
   const current = totals(facts, input.fond);
   const known = closure && closure.closureMode !== "ONLINE" ? object(closure.legacySnapshot ?? {}).knownSourceRefs : null;
   const knownSet = Array.isArray(known) ? new Set(known) : null;
@@ -177,6 +185,7 @@ export function projectCashDay(input: {
     clotureLe: closure?.occurredAt ?? null, cloturePar: closure?.actorName ?? null,
     totauxCloture: totals(atCutoff, input.fond), totauxCourants: current, ecartCloture, regularisation,
     ecartZ: ecartCloture === null ? null : ecartCloture - regularisation, regulariseLe: last,
-    remonteesApresCloture: late, recomptages: closures.filter(c => c !== closure),
+    remonteesApresCloture: late, zRemplaces,
+    recomptages: closures.filter(c => c !== closure && !zRemplaces.some(z => z.id === c.id)),
     reouvertures: facts.filter(f => f.kind === "REOPEN") };
 }
