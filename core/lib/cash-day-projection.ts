@@ -5,7 +5,7 @@ export type DayFact = {
   occurredAt: Date; receivedAt: Date; cashDeltaXpf: bigint; snapshot: unknown;
 };
 export type DayClosure = {
-  id: string; cycle: number; authoritative: boolean; countedXpf: bigint;
+  id: string; sourceKey?: string; cycle: number; authoritative: boolean; countedXpf: bigint;
   baselineExpectedXpf: bigint; cutoffRevision: bigint; closureMode: string;
   occurredAt: Date; receivedAt: Date; actorName: string; legacySnapshot: unknown;
 };
@@ -20,6 +20,17 @@ export function requireCash(condition: unknown, code = "INVALID_PAYLOAD", status
 export function object(value: unknown): JsonRecord {
   requireCash(!!value && typeof value === "object" && !Array.isArray(value));
   return value as JsonRecord;
+}
+/** Marqueur de rectification, cru seulement sur un Z écrit par rectifyCashDay (clé rectify:) :
+ *  un legacySnapshot fourni par une tablette ne peut pas faire passer un Z pour remplacé. */
+export function rectificationOf(c: { sourceKey?: string | null; legacySnapshot?: unknown } | null | undefined): JsonRecord | null {
+  if (!c || typeof c.sourceKey !== "string" || !c.sourceKey.startsWith("rectify:")) return null;
+  const marker = objectOrEmpty(objectOrEmpty(c.legacySnapshot).rectification);
+  return Object.keys(marker).length ? marker : null;
+}
+/** Les snapshots legacy sont des données historiques non garanties comme objets JSON. */
+export function objectOrEmpty(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 }
 export function xpfInteger(value: unknown, signed = false): bigint {
   requireCash(typeof value === "string" && (signed ? /^-?(0|[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(value));
@@ -159,9 +170,20 @@ export function projectCashDay(input: {
   }
   const facts = [...dedup.values()];
   const closures = input.closures.filter(c => c.cutoffRevision <= input.revision);
-  const closure = closures.find(c => c.cycle === input.cycle && c.authoritative);
+  const authoritative = closures.filter(c => c.authoritative).sort((a, b) => b.cycle - a.cycle);
+  const closure = authoritative.find(c => c.cycle === input.cycle)
+    ?? (objectOrEmpty(facts.filter(f => f.kind === "REOPEN").at(-1)?.snapshot).reopenMode === "ADMINISTRATION_RECTIFICATION"
+      ? authoritative.find(c => c.cycle < input.cycle) : undefined);
+  const zRemplaces = closures.filter(c => c.authoritative).flatMap(c => {
+    const replacement = closures.filter(next => next.authoritative && next.cycle > c.cycle
+      && rectificationOf(next)?.remplaceClosureId === c.id)
+      .sort((a, b) => a.cycle - b.cycle)[0];
+    return replacement ? [{ id: c.id, cycle: c.cycle, compte: c.countedXpf,
+      ecart: c.countedXpf - c.baselineExpectedXpf, occurredAt: c.occurredAt,
+      remplacéPar: replacement.id, motif: rectificationOf(replacement)?.motif }] : [];
+  });
   const current = totals(facts, input.fond);
-  const known = closure && closure.closureMode !== "ONLINE" ? object(closure.legacySnapshot ?? {}).knownSourceRefs : null;
+  const known = closure && closure.closureMode !== "ONLINE" ? objectOrEmpty(closure.legacySnapshot).knownSourceRefs : null;
   const knownSet = Array.isArray(known) ? new Set(known) : null;
   // Clôture hors ligne : ce que l'appareil connaissait en clôturant compte, même séquencé après le
   // cutoff parce que synchronisé plus tard (PC-0240, défaut A). En ligne : le cutoff fait foi.
@@ -177,6 +199,7 @@ export function projectCashDay(input: {
     clotureLe: closure?.occurredAt ?? null, cloturePar: closure?.actorName ?? null,
     totauxCloture: totals(atCutoff, input.fond), totauxCourants: current, ecartCloture, regularisation,
     ecartZ: ecartCloture === null ? null : ecartCloture - regularisation, regulariseLe: last,
-    remonteesApresCloture: late, recomptages: closures.filter(c => c !== closure),
+    remonteesApresCloture: late, zRemplaces,
+    recomptages: closures.filter(c => c !== closure && !zRemplaces.some(z => z.id === c.id)),
     reouvertures: facts.filter(f => f.kind === "REOPEN") };
 }
