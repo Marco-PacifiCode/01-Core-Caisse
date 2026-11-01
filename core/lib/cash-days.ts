@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
 import { date, findHistoricalSource, receivedActionInput, lockCashTenant, normalizeActionId, normalizeActionInput, recordCashConflict, CashConflictAfterRollback, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
-import { businessDay, canonical, CashContractError, jsonValue, object, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
+import { businessDay, canonical, CashContractError, jsonValue, object, objectOrEmpty, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
 
@@ -141,7 +141,7 @@ export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchPar
   for (const day of page) {
     let closure = day.events[0]?.snapshot ?? null;
     const hasToClose = day.currentSession.status === "TO_CLOSE" || toCloseDays.has(day.id);
-    if (toCloseEnabled || hasToClose || object(day.closures?.[0]?.legacySnapshot ?? {}).rectification != null) {
+    if (toCloseEnabled || hasToClose || Object.keys(objectOrEmpty(objectOrEmpty(day.closures?.[0]?.legacySnapshot).rectification)).length > 0) {
       const authoritative = day.closures?.[0];
       const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
       closure = event?.snapshot ?? null;
@@ -344,10 +344,10 @@ export async function rectifyCashDay(tx: CashTx, id: string, b: ActionInput) {
   const request = jsonValue({ cashDayId: id, actionId, countedXpf, motif, occurredAt, deviceId, deviceName, ...author });
   const previous = await tx.cashDayClosure.findFirst({ where: { tenantId, sourceKey } });
   if (previous) {
-    const snapshot = object(previous.legacySnapshot);
+    const snapshot = objectOrEmpty(previous.legacySnapshot);
     requireCash(canonical(snapshot.request) === canonical(request), "ACTION_ID_CONFLICT", 409);
-    return { ...object(snapshot.result), id: previous.id, closureId: previous.id,
-      revision: previous.cutoffRevision + 1n, alreadyApplied: true };
+    return { ...objectOrEmpty(snapshot.result), id: previous.id, closureId: previous.id,
+      revision: previous.cutoffRevision, alreadyApplied: true };
   }
   requireCash(Math.abs(occurredAt.getTime() - Date.now()) <= 300_000, "OCCURRED_AT_OUT_OF_RANGE");
   requireCash(day.currentSession.status === "CLOSED", "DAY_ALREADY_OPEN", 409);
@@ -371,16 +371,18 @@ export async function rectifyCashDay(tx: CashTx, id: string, b: ActionInput) {
     snapshot: { ...author, reopenMode: "ADMINISTRATION_RECTIFICATION", cycle, sessionId: session.id, motif } });
   const report = jsonValue({ sessionId: session.id, openingFloatXpf: day.canonicalSession.openingFloatXpf,
     cashSalesXpf: totals.cashXpf, ...totals, creditXpf: 0n, countedXpf, varianceXpf: variance });
+  // Comme closeCashDay : le fait CLOSURE d'abord, et le Z porte sa révision comme cutoff ;
+  // lu à la révision du REOPEN, l'historique montre donc encore l'ancien Z.
+  const marker = await appendDayFact(tx, tenantId, id, { kind: "CLOSURE", sourceRef: sourceKey, deviceId, occurredAt,
+    snapshot: { cycle, countedXpf, ...author, motif, replacedClosureId: replaced.id, report } });
   const closure = await tx.cashDayClosure.create({ data: { tenantId, cashDayId: id, sourceKey, cycle, deviceId, deviceName,
     ...author, occurredAt, countedXpf, localExpectedXpf: expected, localVarianceXpf: variance,
-    baselineExpectedXpf: expected, closureMode: "ONLINE", cutoffRevision: reopen.sequence,
+    baselineExpectedXpf: expected, closureMode: "ONLINE", cutoffRevision: marker.sequence,
     authoritative: true, legacySessionId: session.id,
     legacySnapshot: jsonValue({ rectification: { motif, remplaceClosureId: replaced.id, remplaceCycle: replaced.cycle }, request,
-      result: { cashDayId: id, cycle, cutoffRevision: reopen.sequence, report } }) as Prisma.InputJsonValue } });
-  const marker = await appendDayFact(tx, tenantId, id, { kind: "CLOSURE", sourceRef: sourceKey, deviceId, occurredAt,
-    snapshot: { cycle, countedXpf, ...author, motif, replacedClosureId: replaced.id, closureId: closure.id, report } });
+      result: { cashDayId: id, cycle, cutoffRevision: marker.sequence, report } }) as Prisma.InputJsonValue } });
   return { id: closure.id, closureId: closure.id, cashDayId: id, cycle, revision: marker.sequence,
-    cutoffRevision: reopen.sequence, alreadyApplied: false, report };
+    cutoffRevision: marker.sequence, alreadyApplied: false, report };
 }
 export async function reopenCashDay(tx: CashTx, id: string, b: ActionInput) {
   id = uuid(id); b = normalizeActionInput(b);

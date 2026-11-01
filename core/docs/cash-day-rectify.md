@@ -35,7 +35,7 @@ Les deux id désignent le nouveau Z ; révisions et montants sont des chaînes d
 `cashSalesXpf`, `creditXpf`, `countedXpf`, `varianceXpf`.
 Un rejeu du même contenu renvoie ces mêmes données avec `alreadyApplied:true`,
 sans écrire, même après expiration des cinq minutes et après une nouvelle rectification.
-`cutoffRevision` désigne le REOPEN ; `revision` le CLOSURE qui suit.
+`cutoffRevision` et `revision` désignent le fait CLOSURE, comme pour `closeCashDay` : lue à la révision du REOPEN, la journée montre encore l'ancien Z.
 
 Erreurs : `{ok:false,error}` (éventuellement `data`) :
 
@@ -106,3 +106,7 @@ Le marqueur rectification conserve cette selection lorsque TO_CLOSE est eteint.
 La projection utilise ce meme marqueur pour zRemplaces ; ONLINE conserve le cutoff
 comme frontiere des ventes connues. Les remontees suivantes restent tardives.
 La preuve PostgreSQL/RLS doit etre rejouee sur une base de recette.
+
+Le ledger n'expose un Z qu'apres son fait CLOSURE dans la revision demandee. Au
+milieu d'une rectification, entre REOPEN et CLOSURE, l'ancien Z reste effectif.
+Les snapshots legacy absents ou non objets sont ignores comme marqueurs.

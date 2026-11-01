@@ -17,7 +17,7 @@ function sale(sequence: bigint, sourceRef: string, cash: number): DayFact {
   return fact(sequence, "SALE_PAID", sourceRef, snapshot);
 }
 function closure(id: string, cycle: number, counted: bigint, cutoffRevision: bigint, legacySnapshot: unknown = null, baseline = 25000n): DayClosure {
-  return { id, cycle, authoritative: true, countedXpf: counted, baselineExpectedXpf: baseline,
+  return { id, sourceKey: id, cycle, authoritative: true, countedXpf: counted, baselineExpectedXpf: baseline,
     cutoffRevision, closureMode: "ONLINE", occurredAt: time,
     receivedAt: time, actorName: "Admin", legacySnapshot };
 }
@@ -55,9 +55,10 @@ test("deux rectifications successives affichent chaque Z antérieur comme rempla
   const z0 = closure("z0", 0, 25000n, 0n);
   const z1 = closure("z1", 1, 26000n, 2n, { rectification: { motif: "Premier", remplaceClosureId: z0.id } });
   const z2 = closure("z2", 2, 27000n, 4n, { rectification: { motif: "Second", remplaceClosureId: z1.id } });
-  const projected = projectCashDay({ fond: 25000n, revision: 4n, cycle: 2,
-    facts: [fact(1n, "REOPEN", "r1", { cycle: 1 }), fact(2n, "CLOSURE", "z1", {}),
-      fact(3n, "REOPEN", "r2", { cycle: 2 }), fact(4n, "CLOSURE", "z2", {})], closures: [z0, z1, z2] });
+  const projected = projectCashDay({ fond: 25000n, revision: 5n, cycle: 2,
+    facts: [fact(1n, "CLOSURE", "z0", {}), fact(2n, "REOPEN", "r1", { cycle: 1, reopenMode: "ADMINISTRATION_RECTIFICATION" }),
+      fact(3n, "CLOSURE", "z1", {}), fact(4n, "REOPEN", "r2", { cycle: 2, reopenMode: "ADMINISTRATION_RECTIFICATION" }),
+      fact(5n, "CLOSURE", "z2", {})], closures: [z0, z1, z2] });
   assert.equal(projected.compte, 27000n);
   assert.deepEqual(projected.zRemplaces.map((z: { id: string; remplacéPar: string }) => [z.id, z.remplacéPar]), [["z0", "z1"], ["z1", "z2"]]);
 });
@@ -104,6 +105,28 @@ test("rectifyCashDay ecrit uniquement des modes admis et conserve le marqueur et
 });
 
 
+test("avant le fait CLOSURE de rectification, l'ancien Z reste visible et n'est pas remplacé", () => {
+  const previous = closure("old-z", 0, 25000n, 1n);
+  // Le Z de rectification porte la révision de son fait CLOSURE (3), comme closeCashDay.
+  const replacement = closure("new-z", 1, 26000n, 3n,
+    { rectification: { motif: "Correction", remplaceClosureId: previous.id } });
+  const facts = [fact(1n, "CLOSURE", previous.id, {}),
+    fact(2n, "REOPEN", "rectification", { cycle: 1, reopenMode: "ADMINISTRATION_RECTIFICATION" }), fact(3n, "CLOSURE", replacement.id, {})];
+  const projected = projectCashDay({ fond: 25000n, revision: 2n, cycle: 1, facts, closures: [previous, replacement] });
+  assert.equal(projected.compte, previous.countedXpf);
+  assert.deepEqual(projected.zRemplaces, []);
+});
+
+test("un legacySnapshot primitif ou absent n'empêche pas de projeter les Z", () => {
+  const previous = closure("old-z", 0, 25000n, 1n, "archive");
+  const replacement = closure("new-z", 1, 26000n, 2n, "archive");
+  const projected = projectCashDay({ fond: 25000n, revision: 4n, cycle: 1,
+    facts: [fact(1n, "CLOSURE", previous.id, {}), fact(2n, "REOPEN", "r", {}), fact(3n, "CLOSURE", replacement.id, {})],
+    closures: [previous, replacement] });
+  assert.deepEqual(projected.zRemplaces, []);
+  assert.equal(projected.compte, replacement.countedXpf);
+});
+
 test("liste : le marqueur choisit le Z authoritative plutot que le dernier recomptage", async () => {
   const source = readFileSync(new URL("./cash-days.ts", import.meta.url), "utf8");
   const body = source.slice(source.indexOf("export async function listCashDays("), source.indexOf("export async function listLegacyCashDays("));
@@ -114,7 +137,18 @@ test("liste : le marqueur choisit le Z authoritative plutot que le dernier recom
     cashDay: { findMany: async () => [day] }, cashDayEvent: { findMany: async () => [], findFirst: async ({ where }: any) => {
       assert.equal(where.sourceRef, authoritative.sourceKey); return { snapshot: report };
     } } };
-  const list = new Function("uuid", "dayPage", "object", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
-    (v: unknown) => v, () => ({ limit: 31 }), projection.object, () => ({ id: "day" }));
+  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
+    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, () => ({ id: "day" }));
   assert.deepEqual((await list(tx, "tenant", new URLSearchParams())).days[0].closure, report);
+});
+
+test("liste : un legacySnapshot primitif est ignoré comme marqueur sans erreur", async () => {
+  const source = readFileSync(new URL("./cash-days.ts", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("export async function listCashDays("), source.indexOf("export async function listLegacyCashDays("));
+  const day = { id: "day", currentSession: { status: "CLOSED" }, closures: [{ legacySnapshot: "archive" }], events: [{ snapshot: { recount: true } }] };
+  const tx = { cashSettings: { findUnique: async () => ({ toCloseEnabled: false }) }, cashDay: { findMany: async () => [day] },
+    cashDayEvent: { findMany: async () => [] } };
+  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
+    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, () => ({ id: "day" }));
+  assert.deepEqual((await list(tx, "tenant", new URLSearchParams())).days[0].closure, { recount: true });
 });

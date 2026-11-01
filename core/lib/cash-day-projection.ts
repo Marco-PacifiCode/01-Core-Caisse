@@ -5,7 +5,7 @@ export type DayFact = {
   occurredAt: Date; receivedAt: Date; cashDeltaXpf: bigint; snapshot: unknown;
 };
 export type DayClosure = {
-  id: string; cycle: number; authoritative: boolean; countedXpf: bigint;
+  id: string; sourceKey?: string; cycle: number; authoritative: boolean; countedXpf: bigint;
   baselineExpectedXpf: bigint; cutoffRevision: bigint; closureMode: string;
   occurredAt: Date; receivedAt: Date; actorName: string; legacySnapshot: unknown;
 };
@@ -20,6 +20,10 @@ export function requireCash(condition: unknown, code = "INVALID_PAYLOAD", status
 export function object(value: unknown): JsonRecord {
   requireCash(!!value && typeof value === "object" && !Array.isArray(value));
   return value as JsonRecord;
+}
+/** Les snapshots legacy sont des données historiques non garanties comme objets JSON. */
+export function objectOrEmpty(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 }
 export function xpfInteger(value: unknown, signed = false): bigint {
   requireCash(typeof value === "string" && (signed ? /^-?(0|[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(value));
@@ -159,17 +163,20 @@ export function projectCashDay(input: {
   }
   const facts = [...dedup.values()];
   const closures = input.closures.filter(c => c.cutoffRevision <= input.revision);
-  const closure = closures.find(c => c.cycle === input.cycle && c.authoritative);
+  const authoritative = closures.filter(c => c.authoritative).sort((a, b) => b.cycle - a.cycle);
+  const closure = authoritative.find(c => c.cycle === input.cycle)
+    ?? (objectOrEmpty(facts.filter(f => f.kind === "REOPEN").at(-1)?.snapshot).reopenMode === "ADMINISTRATION_RECTIFICATION"
+      ? authoritative.find(c => c.cycle < input.cycle) : undefined);
   const zRemplaces = closures.filter(c => c.authoritative).flatMap(c => {
     const replacement = closures.filter(next => next.authoritative && next.cycle > c.cycle
-      && object(object(next.legacySnapshot ?? {}).rectification ?? {}).remplaceClosureId === c.id)
+      && objectOrEmpty(objectOrEmpty(next.legacySnapshot).rectification).remplaceClosureId === c.id)
       .sort((a, b) => a.cycle - b.cycle)[0];
     return replacement ? [{ id: c.id, cycle: c.cycle, compte: c.countedXpf,
       ecart: c.countedXpf - c.baselineExpectedXpf, occurredAt: c.occurredAt,
-      remplacéPar: replacement.id, motif: object(object(replacement.legacySnapshot ?? {}).rectification).motif }] : [];
+      remplacéPar: replacement.id, motif: objectOrEmpty(objectOrEmpty(replacement.legacySnapshot).rectification).motif }] : [];
   });
   const current = totals(facts, input.fond);
-  const known = closure && closure.closureMode !== "ONLINE" ? object(closure.legacySnapshot ?? {}).knownSourceRefs : null;
+  const known = closure && closure.closureMode !== "ONLINE" ? objectOrEmpty(closure.legacySnapshot).knownSourceRefs : null;
   const knownSet = Array.isArray(known) ? new Set(known) : null;
   // Clôture hors ligne : ce que l'appareil connaissait en clôturant compte, même séquencé après le
   // cutoff parce que synchronisé plus tard (PC-0240, défaut A). En ligne : le cutoff fait foi.

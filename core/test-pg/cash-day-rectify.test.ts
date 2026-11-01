@@ -68,7 +68,7 @@ async function fixture(fn: (tx: Tx, tenantId: string, dayId: string) => Promise<
     try {
       const opened = await days.openCashDay(tx, input(tenantId, new Date("2026-10-29T23:00:00.000Z")));
       const closed = await days.closeCashDay(tx, opened.id, input(tenantId, new Date("2026-10-30T19:25:00.000Z"), {
-        cycle: 0, countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0", closureMode: "ONLINE",
+        cycle: 0, countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0", closureMode: "ONLINE", legacySnapshot: "archive",
       }));
       assert.ok(closed.id);
       await fn(tx, tenantId, opened.id);
@@ -128,6 +128,22 @@ test("rectification PG : 56 ventes tardives, idempotence, immutabilité, vente u
   await tx.$executeRaw`SELECT set_config('app.current_tenant', ${randomUUID()}, true)`;
   assert.equal(await tx.cashDayClosure.count({ where: { cashDayId: dayId } }), 0);
   await tx.$executeRaw`SELECT set_config('app.current_tenant', ${tenantId}, true)`;
+}));
+
+test("legacySnapshot ONLINE primitif : listes et ledger restent lisibles après rectification", async () => fixture(async (tx, tenantId, dayId) => {
+  const otherOpened = await days.openCashDay(tx, input(tenantId, new Date("2026-10-28T23:00:00.000Z")));
+  await days.closeCashDay(tx, otherOpened.id, input(tenantId, new Date("2026-10-29T19:25:00.000Z"), {
+    cycle: 0, countedXpf: "25000", localExpectedXpf: "25000", localVarianceXpf: "0", closureMode: "ONLINE", legacySnapshot: "archive",
+  }));
+  assert.equal((await days.rectifyCashDay(tx, otherOpened.id, rectifyInput(tenantId))).alreadyApplied, false);
+  let listed = await days.listCashDays(tx, tenantId, new URLSearchParams());
+  assert.ok(listed.days.some((day: any) => day.id === dayId));
+  assert.ok(listed.days.some((day: any) => day.id === otherOpened.id));
+
+  assert.equal((await days.rectifyCashDay(tx, dayId, rectifyInput(tenantId))).alreadyApplied, false);
+  assert.equal((await days.ledgerPage(tx, tenantId, dayId, new URLSearchParams())).projection.zRemplaces.length, 1);
+  listed = await days.listCashDays(tx, tenantId, new URLSearchParams());
+  assert.ok(listed.days.some((day: any) => day.id === dayId));
 }));
 
 test("rectification PG refuse OPEN, mode Caisse et date hors fenêtre", async () => {
