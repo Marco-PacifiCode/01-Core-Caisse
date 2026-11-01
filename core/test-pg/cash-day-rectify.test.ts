@@ -106,9 +106,9 @@ test("rectification PG : 56 ventes tardives, idempotence, immutabilité, vente u
   assert.equal(first.report.expectedXpf, "105700"); assert.equal(first.report.varianceXpf, "0");
   const newClosure = await tx.cashDayClosure.findFirstOrThrow({ where: { tenantId, cashDayId: dayId, cycle: 1 } });
   assert.equal(newClosure.countedXpf, 105700n); assert.equal(newClosure.authoritative, true);
-  assert.equal(newClosure.closureMode, "RECTIFICATION"); assert.equal(newClosure.baselineExpectedXpf, 105700n);
-  assert.equal((newClosure.legacySnapshot as any).motif, request.motif);
-  assert.equal((newClosure.legacySnapshot as any).replacedClosureId, firstClosure.id);
+  assert.equal(newClosure.closureMode, "ONLINE"); assert.equal(newClosure.baselineExpectedXpf, 105700n);
+  assert.equal((newClosure.legacySnapshot as any).rectification.motif, request.motif);
+  assert.equal((newClosure.legacySnapshot as any).rectification.remplaceClosureId, firstClosure.id);
   assert.deepEqual(await tx.cashDayClosure.findFirstOrThrow({ where: { tenantId, id: firstClosure.id } }), firstClosure);
   const eventsAfter = await tx.cashDayEvent.findMany({ where: { tenantId, cashDayId: dayId, sequence: { lte: BigInt(firstEvents.length) } }, orderBy: { sequence: "asc" } });
   assert.deepEqual(eventsAfter, firstEvents);

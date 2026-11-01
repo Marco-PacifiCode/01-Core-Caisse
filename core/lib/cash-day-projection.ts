@@ -162,11 +162,11 @@ export function projectCashDay(input: {
   const closure = closures.find(c => c.cycle === input.cycle && c.authoritative);
   const zRemplaces = closures.filter(c => c.authoritative).flatMap(c => {
     const replacement = closures.filter(next => next.authoritative && next.cycle > c.cycle
-      && next.closureMode === "RECTIFICATION" && object(next.legacySnapshot ?? {}).replacedClosureId === c.id)
+      && object(object(next.legacySnapshot ?? {}).rectification ?? {}).remplaceClosureId === c.id)
       .sort((a, b) => a.cycle - b.cycle)[0];
     return replacement ? [{ id: c.id, cycle: c.cycle, compte: c.countedXpf,
       ecart: c.countedXpf - c.baselineExpectedXpf, occurredAt: c.occurredAt,
-      remplacéPar: replacement.id, motif: object(replacement.legacySnapshot ?? {}).motif }] : [];
+      remplacéPar: replacement.id, motif: object(object(replacement.legacySnapshot ?? {}).rectification).motif }] : [];
   });
   const current = totals(facts, input.fond);
   const known = closure && closure.closureMode !== "ONLINE" ? object(closure.legacySnapshot ?? {}).knownSourceRefs : null;

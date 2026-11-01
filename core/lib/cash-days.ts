@@ -141,7 +141,7 @@ export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchPar
   for (const day of page) {
     let closure = day.events[0]?.snapshot ?? null;
     const hasToClose = day.currentSession.status === "TO_CLOSE" || toCloseDays.has(day.id);
-    if (toCloseEnabled || hasToClose || day.closures?.[0]?.closureMode === "RECTIFICATION") {
+    if (toCloseEnabled || hasToClose || object(day.closures?.[0]?.legacySnapshot ?? {}).rectification != null) {
       const authoritative = day.closures?.[0];
       const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
       closure = event?.snapshot ?? null;
@@ -373,9 +373,9 @@ export async function rectifyCashDay(tx: CashTx, id: string, b: ActionInput) {
     cashSalesXpf: totals.cashXpf, ...totals, creditXpf: 0n, countedXpf, varianceXpf: variance });
   const closure = await tx.cashDayClosure.create({ data: { tenantId, cashDayId: id, sourceKey, cycle, deviceId, deviceName,
     ...author, occurredAt, countedXpf, localExpectedXpf: expected, localVarianceXpf: variance,
-    baselineExpectedXpf: expected, closureMode: "RECTIFICATION", cutoffRevision: reopen.sequence,
+    baselineExpectedXpf: expected, closureMode: "ONLINE", cutoffRevision: reopen.sequence,
     authoritative: true, legacySessionId: session.id,
-    legacySnapshot: jsonValue({ motif, replacedClosureId: replaced.id, request,
+    legacySnapshot: jsonValue({ rectification: { motif, remplaceClosureId: replaced.id, remplaceCycle: replaced.cycle }, request,
       result: { cashDayId: id, cycle, cutoffRevision: reopen.sequence, report } }) as Prisma.InputJsonValue } });
   const marker = await appendDayFact(tx, tenantId, id, { kind: "CLOSURE", sourceRef: sourceKey, deviceId, occurredAt,
     snapshot: { cycle, countedXpf, ...author, motif, replacedClosureId: replaced.id, closureId: closure.id, report } });
