@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { closeSessionTx, openSessionTx, type ZReport } from "./caisse";
 import { appendDayFact, lockDay, readFacts, recordSharedSale } from "./cash-day-ledger";
 import { date, findHistoricalSource, receivedActionInput, lockCashTenant, normalizeActionId, normalizeActionInput, recordCashConflict, CashConflictAfterRollback, text, uuid, type ActionInput, type CashTx } from "./caisse-sync";
-import { businessDay, canonical, CashContractError, jsonValue, object, objectOrEmpty, projectCashDay, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
+import { businessDay, canonical, CashContractError, jsonValue, object, objectOrEmpty, projectCashDay, rectificationOf, requireCash, safeXpf, validDay, xpfInteger, type DayClosure } from "./cash-day-projection";
 import { lockSaleRow } from "./sale-lock";
 import { assertNoLegacyOperationInProgress } from "./cash-day-guard";
 
@@ -141,7 +141,7 @@ export async function listCashDays(tx: CashTx, tenantId: string, q: URLSearchPar
   for (const day of page) {
     let closure = day.events[0]?.snapshot ?? null;
     const hasToClose = day.currentSession.status === "TO_CLOSE" || toCloseDays.has(day.id);
-    if (toCloseEnabled || hasToClose || Object.keys(objectOrEmpty(objectOrEmpty(day.closures?.[0]?.legacySnapshot).rectification)).length > 0) {
+    if (toCloseEnabled || hasToClose || rectificationOf(day.closures?.[0])) {
       const authoritative = day.closures?.[0];
       const event = authoritative ? await tx.cashDayEvent.findFirst({ where: { tenantId, cashDayId: day.id, kind: "CLOSURE", sourceRef: authoritative.sourceKey } }) : null;
       closure = event?.snapshot ?? null;
@@ -268,6 +268,8 @@ export async function closeCashDay(tx: CashTx, cashDayId: string, b: ActionInput
     requireCash(Array.isArray(snapshot.knownSourceRefs) && snapshot.knownSourceRefs.every((s: unknown) => typeof s === "string"));
   }
   const sourceKey = text(b.sourceKey, 300);
+  // Préfixe réservé aux Z écrits par rectifyCashDay (rectificationOf).
+  requireCash(!sourceKey.startsWith("rectify:"));
   const previous = await tx.cashDayClosure.findFirst({ where: { tenantId: b.tenantId, sourceKey: sourceKey } });
   if (previous) {
     requireCash(previous.cashDayId === day.id && previous.countedXpf === countedXpf && previous.cycle === cycle

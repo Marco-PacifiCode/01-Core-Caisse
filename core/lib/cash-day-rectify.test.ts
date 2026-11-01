@@ -17,7 +17,9 @@ function sale(sequence: bigint, sourceRef: string, cash: number): DayFact {
   return fact(sequence, "SALE_PAID", sourceRef, snapshot);
 }
 function closure(id: string, cycle: number, counted: bigint, cutoffRevision: bigint, legacySnapshot: unknown = null, baseline = 25000n): DayClosure {
-  return { id, sourceKey: id, cycle, authoritative: true, countedXpf: counted, baselineExpectedXpf: baseline,
+  // Un Z de rectification porte toujours la clé rectify: (rectificationOf).
+  const rectifie = !!legacySnapshot && typeof legacySnapshot === "object" && "rectification" in (legacySnapshot as object);
+  return { id, sourceKey: rectifie ? "rectify:" + id : id, cycle, authoritative: true, countedXpf: counted, baselineExpectedXpf: baseline,
     cutoffRevision, closureMode: "ONLINE", occurredAt: time,
     receivedAt: time, actorName: "Admin", legacySnapshot };
 }
@@ -117,6 +119,18 @@ test("avant le fait CLOSURE de rectification, l'ancien Z reste visible et n'est 
   assert.deepEqual(projected.zRemplaces, []);
 });
 
+test("un Z ordinaire qui porte un marqueur rectification n'en remplace aucun", () => {
+  const previous = closure("old-z", 0, 25000n, 1n);
+  const forged = { ...closure("tablette-z", 1, 26000n, 3n,
+    { rectification: { motif: "Forgé", remplaceClosureId: previous.id } }), sourceKey: "tablette-z" };
+  const facts = [fact(1n, "CLOSURE", previous.id, {}), fact(2n, "REOPEN", "jour-meme", { cycle: 1, reopenMode: "CAISSE_JOUR_MEME" }),
+    fact(3n, "CLOSURE", "tablette-z", {})];
+  const projected = projectCashDay({ fond: 25000n, revision: 3n, cycle: 1, facts, closures: [previous, forged] });
+  assert.deepEqual(projected.zRemplaces, []);
+  assert.equal(projection.rectificationOf(forged), null);
+  assert.deepEqual(projection.rectificationOf({ sourceKey: "rectify:x", legacySnapshot: { rectification: { motif: "Vrai" } } }), { motif: "Vrai" });
+});
+
 test("un legacySnapshot primitif ou absent n'empêche pas de projeter les Z", () => {
   const previous = closure("old-z", 0, 25000n, 1n, "archive");
   const replacement = closure("new-z", 1, 26000n, 2n, "archive");
@@ -137,8 +151,8 @@ test("liste : le marqueur choisit le Z authoritative plutot que le dernier recom
     cashDay: { findMany: async () => [day] }, cashDayEvent: { findMany: async () => [], findFirst: async ({ where }: any) => {
       assert.equal(where.sourceRef, authoritative.sourceKey); return { snapshot: report };
     } } };
-  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
-    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, () => ({ id: "day" }));
+  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "rectificationOf", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
+    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, projection.rectificationOf, () => ({ id: "day" }));
   assert.deepEqual((await list(tx, "tenant", new URLSearchParams())).days[0].closure, report);
 });
 
@@ -148,7 +162,7 @@ test("liste : un legacySnapshot primitif est ignoré comme marqueur sans erreur"
   const day = { id: "day", currentSession: { status: "CLOSED" }, closures: [{ legacySnapshot: "archive" }], events: [{ snapshot: { recount: true } }] };
   const tx = { cashSettings: { findUnique: async () => ({ toCloseEnabled: false }) }, cashDay: { findMany: async () => [day] },
     cashDayEvent: { findMany: async () => [] } };
-  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
-    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, () => ({ id: "day" }));
+  const list = new Function("uuid", "dayPage", "object", "objectOrEmpty", "rectificationOf", "cashDayView", stripTypeScriptTypes(body.replace("export ", "")) + "; return listCashDays;")(
+    (v: unknown) => v, () => ({ limit: 31 }), projection.object, projection.objectOrEmpty, projection.rectificationOf, () => ({ id: "day" }));
   assert.deepEqual((await list(tx, "tenant", new URLSearchParams())).days[0].closure, { recount: true });
 });

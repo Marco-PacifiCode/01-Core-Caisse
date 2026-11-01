@@ -83,7 +83,7 @@ Les contraintes des tables non ecrites (ventes, paiements, ouvertures) ne sont p
 | --- | --- |
 | CashDayClosure : CHECK closureMode | ONLINE, admis avec OFFLINE et IMPORT |
 | CashDayClosure : CHECK countedXpf >= 0 | countedXpf valide comme entier non negatif |
-| CashDayClosure : NOT NULL | tenantId, cashDayId, sourceKey=rectify:actionId, cycle=ancien+1, deviceId/deviceName, actorName/receivedById, occurredAt, countedXpf, localExpectedXpf=expected, localVarianceXpf=counted-expected, baselineExpectedXpf=expected, closureMode=ONLINE, cutoffRevision=sequence REOPEN, authoritative=true ; id UUID genere, receivedAt par defaut |
+| CashDayClosure : NOT NULL | tenantId, cashDayId, sourceKey=rectify:actionId, cycle=ancien+1, deviceId/deviceName, actorName/receivedById, occurredAt, countedXpf, localExpectedXpf=expected, localVarianceXpf=counted-expected, baselineExpectedXpf=expected, closureMode=ONLINE, cutoffRevision=sequence du fait CLOSURE, authoritative=true ; id UUID genere, receivedAt par defaut |
 | CashDayClosure : FK composites tenant/jour et tenant/session | Jour verrouille et session technique nouvellement creee du meme tenant |
 | CashDayClosure : UNIQUE tenant/sourceKey ; authoritative_cycle | Cle rectify:actionId avec recu de rejeu ; nouveau cycle sous verrou tenant/jour |
 | CashSession : NOT NULL, UUID et enum SessionStatus | id UUID genere, tenantId/ openedBy UUID, openedAt=occurredAt, openingFloatXpf=0, status=CLOSED ; closedAt=occurredAt, closedBy=actorId, noms=auteur, note=motif |

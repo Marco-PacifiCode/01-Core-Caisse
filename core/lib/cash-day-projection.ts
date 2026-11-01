@@ -21,6 +21,13 @@ export function object(value: unknown): JsonRecord {
   requireCash(!!value && typeof value === "object" && !Array.isArray(value));
   return value as JsonRecord;
 }
+/** Marqueur de rectification, cru seulement sur un Z écrit par rectifyCashDay (clé rectify:) :
+ *  un legacySnapshot fourni par une tablette ne peut pas faire passer un Z pour remplacé. */
+export function rectificationOf(c: { sourceKey?: string | null; legacySnapshot?: unknown } | null | undefined): JsonRecord | null {
+  if (!c || typeof c.sourceKey !== "string" || !c.sourceKey.startsWith("rectify:")) return null;
+  const marker = objectOrEmpty(objectOrEmpty(c.legacySnapshot).rectification);
+  return Object.keys(marker).length ? marker : null;
+}
 /** Les snapshots legacy sont des données historiques non garanties comme objets JSON. */
 export function objectOrEmpty(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
@@ -169,11 +176,11 @@ export function projectCashDay(input: {
       ? authoritative.find(c => c.cycle < input.cycle) : undefined);
   const zRemplaces = closures.filter(c => c.authoritative).flatMap(c => {
     const replacement = closures.filter(next => next.authoritative && next.cycle > c.cycle
-      && objectOrEmpty(objectOrEmpty(next.legacySnapshot).rectification).remplaceClosureId === c.id)
+      && rectificationOf(next)?.remplaceClosureId === c.id)
       .sort((a, b) => a.cycle - b.cycle)[0];
     return replacement ? [{ id: c.id, cycle: c.cycle, compte: c.countedXpf,
       ecart: c.countedXpf - c.baselineExpectedXpf, occurredAt: c.occurredAt,
-      remplacéPar: replacement.id, motif: objectOrEmpty(objectOrEmpty(replacement.legacySnapshot).rectification).motif }] : [];
+      remplacéPar: replacement.id, motif: rectificationOf(replacement)?.motif }] : [];
   });
   const current = totals(facts, input.fond);
   const known = closure && closure.closureMode !== "ONLINE" ? objectOrEmpty(closure.legacySnapshot).knownSourceRefs : null;
