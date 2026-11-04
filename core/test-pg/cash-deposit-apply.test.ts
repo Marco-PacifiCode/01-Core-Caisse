@@ -155,10 +155,11 @@ test("enveloppe format 2 hors payloadHash : même payload, autre auteur → seen
     assert.equal(row!.formatVersion, 2); assert.equal(row!.sequence, 1n);
   });
 });
-test("applied accusé par la tablette : objet avec resultJson, ligne APPLIED jamais réécrite", async () => {
+// R1 (04/11) : ce test portait l'ancien comportement sur des lignes de format 2 ; il ne vaut plus que pour le format 1.
+test("applied format 1 accusé par la tablette : objet avec resultJson, ligne APPLIED jamais réécrite", async () => {
   const tenantId = randomUUID();
   await rolledBack(tenantId, async tx => {
-    const a = v2("tab-a", 1), b = v2("tab-a", 2);
+    const a = legacy(), b = legacy();
     await deposits.depositActions(tx, { tenantId, actions: [a, b] });
     await deposits.depositActions(tx, { tenantId, actions: [], applied: [a.actionId, { actionId: b.actionId, resultJson: { saleId: "s-1" } }] });
     const find = (actionId: string) => tx.cashDeposit.findUnique({ where: { tenantId_actionId: { tenantId, actionId } } });
@@ -175,7 +176,7 @@ test("réponse du dépôt : status/resultJson après l'opération, conflict, iso
   const tenantA = randomUUID(), tenantB = randomUUID();
   await rolledBack(tenantB, async tx => {
     const a = v2("tab-a", 1), b = v2("tab-a", 2), c = v2("tab-a", 3);
-    // B : la même action, APPLIED avec un resultJson ; A ne doit jamais la voir.
+    // B : la même action, avec un accusé de la tablette (ignoré depuis R1, ligne PENDING) ; A ne doit jamais la voir.
     await deposits.depositActions(tx, { tenantId: tenantB, actions: [a] });
     await deposits.depositActions(tx, { tenantId: tenantB, actions: [], applied: [{ actionId: a.actionId, resultJson: { saleId: "b" } }] });
     await asTenant(tx, tenantA);
@@ -183,7 +184,9 @@ test("réponse du dépôt : status/resultJson après l'opération, conflict, iso
     assert.deepEqual(JSON.parse(JSON.stringify(first.results)), [a, b, c].map(x => ({ actionId: x.actionId, result: "stored", status: "PENDING" })));
     const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "s", limit: 10 });
     await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: b.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
-    await deposits.depositActions(tx, { tenantId: tenantA, actions: [], applied: [c.actionId] });
+    // R1 : l'accusé n'est honoré que si le serveur a renoncé, et seulement pour l'appareil de la ligne.
+    await tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId: tenantA, actionId: c.actionId } }, data: { lastResultCode: "REJEU_TABLETTE" } });
+    await deposits.depositActions(tx, { tenantId: tenantA, deviceId: "tab-a", actions: [], applied: [c.actionId] });
     const r = await deposits.depositActions(tx, { tenantId: tenantA, actions: [b, c, { ...a, payload: { autre: true } }] });
     assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
       { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s-1" } },
@@ -235,7 +238,9 @@ test("status : états réels, projection limitée, inconnu absent, 400, isolatio
     await deposits.depositActions(tx, { tenantId: tenantA, actions: [applied, pending, bare] });
     const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "surface-a", limit: 10 });
     await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: applied.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
-    await deposits.depositActions(tx, { tenantId: tenantA, actions: [], applied: [bare.actionId] });
+    // R1 : l'accusé n'est honoré que si le serveur a renoncé, et seulement pour l'appareil de la ligne.
+    await tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId: tenantA, actionId: bare.actionId } }, data: { lastResultCode: "REJEU_TABLETTE" } });
+    await deposits.depositActions(tx, { tenantId: tenantA, deviceId: "tab-a", actions: [], applied: [bare.actionId] });
     const unknown = randomUUID();
     const r = await deposits.depositStatuses(tx, { tenantId: tenantA, actionIds: [applied.actionId, pending.actionId, bare.actionId, unknown, applied.actionId] });
     const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
@@ -252,5 +257,76 @@ test("status : états réels, projection limitée, inconnu absent, 400, isolatio
     assert.equal(fromB.items.length, 0);
     const forged = await deposits.depositStatuses(tx, { tenantId: tenantA, actionIds: [applied.actionId] });
     assert.equal(forged.items.length, 0);
+  });
+});
+// ---- Relecture 1 : R1 (qui peut dire APPLIED, garde de l'appareil), R2 (filtre du claim, remise à zéro), R4 (conflictCount) ----
+const markPg = (tx: Tx, tenantId: string, actionId: string, lastResultCode: string | null, lastResultReason: string | null = null) =>
+  tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId, actionId } }, data: { lastResultCode, lastResultReason } });
+const rowPg = (tx: Tx, tenantId: string, actionId: string) => tx.cashDeposit.findUniqueOrThrow({ where: { tenantId_actionId: { tenantId, actionId } } });
+test("R1 : applied inventé (jamais tenté, EN_ATTENTE) ignoré ; REJEU_TABLETTE → APPLIED_PAR_TABLETTE sans resultJson ; format 1 inchangé", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const fresh = v2("tab-a", 1), waiting = v2("tab-a", 2), renounced = v2("tab-a", 3), old = legacy(), oldObj = legacy();
+    await deposits.depositActions(tx, { tenantId, actions: [fresh, waiting, renounced, old, oldObj] });
+    await markPg(tx, tenantId, waiting.actionId, "EN_ATTENTE"); await markPg(tx, tenantId, renounced.actionId, "REJEU_TABLETTE");
+    const forged = { cashDayId: randomUUID() };
+    await deposits.depositActions(tx, { tenantId, deviceId: "tab-a", actions: [], applied: [
+      { actionId: fresh.actionId, resultJson: forged }, { actionId: waiting.actionId, resultJson: forged }, { actionId: renounced.actionId, resultJson: forged },
+      old.actionId, { actionId: oldObj.actionId, resultJson: { saleId: "s" } }] });
+    for (const id of [fresh.actionId, waiting.actionId]) { const r = await rowPg(tx, tenantId, id); assert.equal(r.status, "PENDING"); assert.equal(r.resultJson, null); }
+    const r = await rowPg(tx, tenantId, renounced.actionId);
+    assert.equal(r.status, "APPLIED"); assert.equal(r.resultJson, null); assert.equal(r.lastResultCode, "APPLIED_PAR_TABLETTE");
+    assert.equal((await rowPg(tx, tenantId, old.actionId)).status, "APPLIED");
+    assert.deepEqual(JSON.parse(JSON.stringify((await rowPg(tx, tenantId, oldObj.actionId)).resultJson)), { saleId: "s" });
+    const st = await deposits.depositStatuses(tx, { tenantId, actionIds: [fresh.actionId, waiting.actionId, renounced.actionId] });
+    for (const i of st.items) assert.ok(!("resultJson" in i), JSON.stringify(i));
+  });
+});
+test("R1 appareil : AUTRE_APPAREIL inchangé, même appareil honoré, appareil déduit du lot, APPAREIL_INCONNU", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const a = v2("tab-a", 1), a2 = v2("tab-a", 2), a3 = v2("tab-a", 3);
+    await deposits.depositActions(tx, { tenantId, actions: [a, a2, a3] });
+    for (const x of [a, a2]) await markPg(tx, tenantId, x.actionId, "REJEU_TABLETTE");
+    const before = await rowPg(tx, tenantId, a.actionId);
+    const fromB = await deposits.depositActions(tx, { tenantId, deviceId: "tab-b", actions: [], applied: [a.actionId] });
+    assert.deepEqual(JSON.parse(JSON.stringify(fromB.appliedIgnores)), [{ actionId: a.actionId, code: "AUTRE_APPAREIL" }]);
+    const after = await rowPg(tx, tenantId, a.actionId);
+    assert.equal(after.status, "PENDING"); assert.equal(after.conflictCount, before.conflictCount); assert.equal(after.lastResultCode, "REJEU_TABLETTE");
+    const unknown = await deposits.depositActions(tx, { tenantId, actions: [], applied: [a.actionId] });
+    assert.deepEqual(JSON.parse(JSON.stringify(unknown.appliedIgnores)), [{ actionId: a.actionId, code: "APPAREIL_INCONNU" }]);
+    const same = await deposits.depositActions(tx, { tenantId, deviceId: "tab-a", actions: [], applied: [a.actionId] });
+    assert.equal(same.appliedIgnores.length, 0); assert.equal((await rowPg(tx, tenantId, a.actionId)).lastResultCode, "APPLIED_PAR_TABLETTE");
+    const inferred = await deposits.depositActions(tx, { tenantId, actions: [a3], applied: [a2.actionId] });
+    assert.equal(inferred.appliedIgnores.length, 0); assert.equal((await rowPg(tx, tenantId, a2.actionId)).status, "APPLIED");
+  });
+});
+test("R2 : 100 REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie le neuf ; remise à zéro sur PENDING seulement ; R4 conflictCount", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const old = Array.from({ length: 100 }, (_, i) => v2("tab-a", i + 1));
+    await deposits.depositActions(tx, { tenantId, actions: old.slice(0, 50) }); await deposits.depositActions(tx, { tenantId, actions: old.slice(50) });
+    await tx.cashDeposit.updateMany({ where: { tenantId, actionId: { in: old.map(o => o.actionId) } }, data: { lastResultCode: "REJEU_TABLETTE" } });
+    const fresh = v2("tab-a", 500, { dependsOn: [old[0].actionId] });
+    await deposits.depositActions(tx, { tenantId, actions: [fresh] });
+    const c = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 100 });
+    assert.deepEqual(c.items.map((i: any) => i.actionId), [fresh.actionId]);
+    assert.deepEqual({ ...c.items[0].dependencies[old[0].actionId] }, { status: "PENDING", resultJson: null });
+    assert.equal(c.items[0].conflictCount, 0);
+    // Remise à zéro de la marque par un redépôt seen dont clientState change.
+    const e = v2("tab-a", 600, { clientState: "error" }), done = v2("tab-a", 601, { clientState: "error" });
+    await deposits.depositActions(tx, { tenantId, actions: [e, done] });
+    await markPg(tx, tenantId, e.actionId, "NON_APPLICABLE_ERROR", "erreur tablette");
+    await deposits.depositActions(tx, { tenantId, actions: [{ ...e, clientState: "pending" }] });
+    const re = await rowPg(tx, tenantId, e.actionId); assert.equal(re.lastResultCode, null); assert.equal(re.lastResultReason, null);
+    const { token } = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 100 });
+    await deposits.recordDepositResult(tx, { tenantId, token, actionId: done.actionId, outcome: "APPLIED", resultJson: { saleId: "s-9" } });
+    await deposits.depositActions(tx, { tenantId, actions: [{ ...done, clientState: "pending" }] });
+    assert.equal((await rowPg(tx, tenantId, done.actionId)).lastResultCode, "APPLIED");
+    // R4 : redépôt au payload différent → conflictCount 1 visible dans le claim.
+    assert.equal((await deposits.depositActions(tx, { tenantId, actions: [{ ...e, payload: { annule: true } }] })).results[0].result, "conflict");
+    const again = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 100 });
+    const item = again.items.find((i: any) => i.actionId === e.actionId);
+    assert.ok(item, "re-claimable après remise à zéro"); assert.equal(item.conflictCount, 1);
   });
 });

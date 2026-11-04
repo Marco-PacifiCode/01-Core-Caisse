@@ -15,20 +15,49 @@ chaîne de chiffres), `actorId`, `actorName` (≤ 200), `receivedById` (≤ 200)
 **hors du payload et de `payloadHash`** : même payload + autre auteur → `seen`, jamais `conflict`.
 Sur un `seen`, un champ d'auteur déjà renseigné n'est jamais remplacé (complété seulement s'il est
 null). `formatVersion` absent ou `1` : comportement strictement inchangé (aucun de ces champs lu).
-Liste `applied` (≤ 1000 éléments, corps total ≤ 2 Mio) : chaque élément est soit un UUID seul
-(inchangé : PENDING → APPLIED + `appliedAt`), soit `{ actionId: UUID, resultJson: objet }` : une ligne
-encore PENDING passe APPLIED avec ce `resultJson`, `appliedAt`, `lastResultCode 'APPLIED'`,
-`lastAttemptAt`. Une ligne déjà APPLIED n'est jamais réécrite (ni `resultJson`, ni `appliedAt`).
+Liste `applied` (≤ 1000 éléments, corps total ≤ 2 Mio) : chaque élément est soit un UUID seul, soit
+`{ actionId: UUID, resultJson: objet }`. Effet selon le format de la ligne : voir « Qui peut dire APPLIED ».
+Une ligne déjà APPLIED n'est jamais réécrite (ni `resultJson`, ni `appliedAt`).
+`deviceId` facultatif au niveau du lot : `/^[a-zA-Z0-9-]{1,80}$/`, sinon 400 `INVALID_DEVICE_ID`.
 Objet malformé (actionId non UUID, `resultJson` absent ou non objet, clé inconnue) → 400 `INVALID_APPLIED`.
 `formatVersion` autre → 400 `INVALID_FORMAT_VERSION` ; `sequence` invalide → 400 `INVALID_SEQUENCE`.
 
-Réponse : `{ results, applied }`. Chaque élément de `results` (`stored`, `seen`, `conflict`) garde
+Réponse : `{ results, applied, appliedIgnores }`. Chaque élément de `results` (`stored`, `seen`, `conflict`) garde
 `{ actionId, result }` et ajoute (champs ajoutés seulement, l'ancienne tablette les ignore) :
 `status` (`'PENDING' | 'APPLIED'`) de la ligne en base **après** l'opération (accusés `applied` du
 même appel compris), et `resultJson` seulement si `status = 'APPLIED'` et `resultJson` non null
 (UUID seul accusé → `APPLIED` sans `resultJson`). Sur `conflict`, c'est le statut de la ligne existante.
 Lecture groupée unique (`findMany` sur les actionId du lot), filtrée par `tenantId` sous RLS.
 Une action `APPLIED` est accusée par la tablette sans être renvoyée.
+
+### Qui peut dire APPLIED
+
+Règle : **seul le serveur produit un `resultJson` de format 2.** Une affirmation de la tablette n'en
+produit jamais.
+
+- **Format 1** : comportement historique inchangé, sans contrôle d'appareil. UUID seul → PENDING →
+  APPLIED + `appliedAt`. Objet → APPLIED avec ce `resultJson`, `appliedAt`, `lastResultCode 'APPLIED'`,
+  `lastAttemptAt`.
+- **Format 2, règle C1** : un `applied` (UUID ou objet) n'est honoré que si le serveur a renoncé à
+  l'appliquer, c'est-à-dire si `lastResultCode` n'est ni null ni `'EN_ATTENTE'`. Sinon il est ignoré
+  sans être signalé : la ligne reste PENDING et le serveur l'appliquera.
+- **Format 2, garde de l'appareil** : si C1 passe, l'appareil qui accuse doit être celui de la ligne.
+  On prend le `deviceId` du lot. S'il est absent et que toutes les actions du lot portent le même
+  `deviceId`, on prend celui-là. Sinon l'appareil est inconnu.
+  - Appareil inconnu → ignoré, `appliedIgnores` reçoit `{ actionId, code: 'APPAREIL_INCONNU' }`.
+  - Appareil différent → ignoré, `appliedIgnores` reçoit `{ actionId, code: 'AUTRE_APPAREIL' }`.
+  - Une ligne ignorée ne change pas (pas de `conflictCount`). Le Core n'écrit aucun conflit : c'est la
+    surface qui transforme `AUTRE_APPAREIL` en conflit.
+  - Même appareil → APPLIED **sans `resultJson`** (le `resultJson` fourni est ignoré), `appliedAt`,
+    `lastAttemptAt`, `lastResultCode 'APPLIED_PAR_TABLETTE'`.
+- `appliedIgnores` vaut toujours un tableau (vide le plus souvent). Les `applied` ignorés par C1 n'y
+  figurent pas.
+
+### Remise à zéro de la marque
+
+Un redépôt `seen` (même `payloadHash`) dont `clientState` change remet `lastResultCode` et
+`lastResultReason` à null : la pièce redevient éligible au claim. Cela ne vaut que pour une ligne
+PENDING, jamais pour une ligne APPLIED.
 
 ## Bail
 
@@ -44,11 +73,18 @@ Corps : `{ tenantId, holder (texte 1..100), limit (1..100, défaut 50) }`.
    (`data.until`).
 2. Les dépôts `PENDING` de format 1 dont `lastResultCode` est null reçoivent
    `lastResultCode = 'REJEU_TABLETTE'` (aucun autre champ, statut inchangé) : la tablette les rejoue.
-3. Réponse 200 : `{ token, until, items }`. `items` = dépôts `PENDING` de format 2, triés
+3. Réponse 200 : `{ token, until, items }`. `items` = dépôts `PENDING` de format 2 dont
+   `lastResultCode` est null ou `'EN_ATTENTE'` (filtre posé dans la requête : les pièces déjà
+   écartées par l'applicateur, par exemple REJEU_TABLETTE, NON_APPLICABLE_*, CONSTRUCTION_REFUSEE ou
+   un code métier, ne bouchent plus la fenêtre), triés
    `(deviceId, sequence, clientCreatedAt, actionId)`, au plus `limit`, chacun :
    `actionId, kind, operation, entityKey, payload, dependsOn, clientState, clientErrorCode, sequence
-   (chaîne), actorId, actorName, receivedById, attempts, lastResultCode, dependencies` où
-   `dependencies[<id>] = { status, resultJson } | null` pour chaque id de `dependsOn`.
+   (chaîne), actorId, actorName, receivedById, attempts, lastResultCode, conflictCount, dependencies` où
+   `dependencies[<id>] = { status, resultJson } | null` pour chaque id de `dependsOn`. Les
+   dépendances sont lues quel que soit leur `lastResultCode`.
+   `conflictCount` > 0 signifie que la tablette a redéposé cette pièce avec un autre payload. Le Core
+   garde le premier, qui peut être périmé (vente annulée sur place, par exemple) : l'applicateur doit
+   en tenir compte.
 
 Erreurs 400 : `INVALID_HOLDER`, `INVALID_LIMIT`, `INVALID_PAYLOAD` (tenantId).
 
