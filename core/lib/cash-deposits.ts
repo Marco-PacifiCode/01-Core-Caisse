@@ -59,6 +59,7 @@ function appliedItem(v: unknown): { actionId: string; resultJson: Prisma.InputJs
   requireCash(!!r && typeof r === "object" && !Array.isArray(r), "INVALID_APPLIED");
   return { actionId: o.actionId.toLowerCase(), resultJson: r as Prisma.InputJsonObject };
 }
+const DEVICE_ID = /^[a-zA-Z0-9-]{1,80}$/;
 export function validateDepositInput(input: unknown) {
   const b = object(input), tenantId = uuid(b.tenantId);
   let bodySize = 0;
@@ -69,14 +70,18 @@ export function validateDepositInput(input: unknown) {
   // Une file vidée après accusés n'a plus que des « applied » à dire : lot d'actions vide permis, corps vide refusé.
   requireCash(b.actions.length + (b.applied?.length ?? 0) >= 1, "INVALID_ACTIONS");
   const items = (b.applied ?? []).map(appliedItem);
-  requireCash(b.deviceId === undefined || b.deviceId === null || (typeof b.deviceId === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(b.deviceId)), "INVALID_DEVICE_ID");
+  requireCash(b.deviceId === undefined || b.deviceId === null || (typeof b.deviceId === "string" && DEVICE_ID.test(b.deviceId)), "INVALID_DEVICE_ID");
   return { tenantId, deviceId: typeof b.deviceId === "string" ? b.deviceId : null, actions: b.actions.map(action), envelopes: b.actions.map(envelopeOf),
-    applied: items.map(i => i.actionId), appliedPlain: items.filter(i => !i.resultJson).map(i => i.actionId), appliedWithResult: items.filter(i => i.resultJson) };
+    // K2 : le resultJson d'un accusé de la tablette est validé (forme) mais n'est JAMAIS stocké, quel que soit le format.
+    applied: items.map(i => i.actionId) };
 }
-// Projection d'état commune (réponse du dépôt et /status) : status, et resultJson seulement si APPLIED et non null.
-function depositState(row: { status: string; resultJson: unknown } | undefined) {
+// Projection d'état commune (réponse du dépôt et /status) : status, et resultJson seulement pour une ligne de format 2
+// APPLIED par le serveur (/result : lastResultCode 'APPLIED') et resultJson non null. Jamais un resultJson venu de la tablette.
+const STATE_SELECT = { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true } as const;
+function depositState(row: { status: string; resultJson: unknown; formatVersion: number; lastResultCode: string | null } | undefined) {
   const status = row?.status === "APPLIED" ? "APPLIED" : "PENDING";
-  return { status, ...(status === "APPLIED" && row?.resultJson != null ? { resultJson: row.resultJson } : {}) };
+  const served = status === "APPLIED" && row?.formatVersion === 2 && row.lastResultCode === "APPLIED" && row.resultJson != null;
+  return { status, ...(served ? { resultJson: row!.resultJson } : {}) };
 }
 // Marque d'applicateur qui laisse une pièce éligible au claim (null = jamais tentée).
 const CLAIMABLE_CODES = ["EN_ATTENTE"] as const;
@@ -100,45 +105,48 @@ export async function depositActions(tx: CashDepositTx, input: unknown) {
       await tx.cashDeposit.update({ where, data: { conflictCount: { increment: 1 } } }); results.push({ actionId: a.actionId, result: "conflict" });
     }
   }
-  // Format 1 : comportement historique inchangé (UUID seul ou objet avec resultJson).
-  if (b.appliedPlain.length) await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: { in: b.appliedPlain }, status: "PENDING", formatVersion: 1 }, data: { status: "APPLIED", appliedAt: new Date() } });
-  // Avec resultJson : seule une ligne encore PENDING change ; une ligne APPLIED n'est jamais réécrite.
-  for (const i of b.appliedWithResult) { const at = new Date();
-    await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: i.actionId, status: "PENDING", formatVersion: 1 }, data: { status: "APPLIED", appliedAt: at, resultJson: i.resultJson!, lastResultCode: "APPLIED", lastAttemptAt: at } }); }
-  // Format 2 (R1) : seul le serveur produit un resultJson.
-  // 1) Garde de l'appareil, AVANT C1 : appareil = deviceId du lot, sinon celui, unique, de toutes les actions du lot, sinon inconnu.
-  //    Inconnu ou différent de celui de la ligne → ignoré et signalé quel que soit lastResultCode (aucune écriture, aucun conflit).
-  // 2) Même appareil, règle C1 : honoré seulement si le serveur a renoncé (lastResultCode ni null ni EN_ATTENTE), APPLIED SANS
-  //    resultJson (celui fourni est ignoré) ; sinon ignoré sans signalement, la ligne reste PENDING.
+  // Garde de l'appareil, d'abord et pour les deux formats (K5) : appareil = deviceId du lot, sinon celui, unique, de toutes les
+  // actions du lot, sinon inconnu. Différent → AUTRE_APPAREIL, quel que soit lastResultCode ; ligne inchangée.
+  // Inconnu → format 2 : APPAREIL_INCONNU, ligne inchangée ; format 1 : traité comme le même appareil (compatibilité).
+  // Même appareil :
+  //  - format 1 : la ligne passe APPLIED, resultJson jamais stocké (K2) ;
+  //  - format 2 (K1) : APPLIED ⇔ appliqué par le serveur avec son resultJson ; l'accusé est ignoré sans signalement.
   const appliedIgnores: { actionId: string; code: "AUTRE_APPAREIL" | "APPAREIL_INCONNU" }[] = [];
   if (b.applied.length) {
     const lotDevices = [...new Set(b.actions.map(a => a.deviceId))];
     const device = b.deviceId ?? (lotDevices.length === 1 ? lotDevices[0] : null);
-    // Contrôle de l'appareil AVANT C1 : un autre appareil ou un appareil inconnu est signalé quel que soit lastResultCode.
-    const targeted = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.applied }, status: "PENDING", formatVersion: 2 },
-      select: { actionId: true, deviceId: true, lastResultCode: true } });
+    const targeted = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.applied }, status: "PENDING" },
+      select: { actionId: true, deviceId: true, formatVersion: true } });
     const honored: string[] = [];
     for (const r of targeted) {
-      if (device === null) appliedIgnores.push({ actionId: r.actionId, code: "APPAREIL_INCONNU" });
+      // Format 1, appareil inconnu : APPLIED comme avant (tablettes sans deviceId ; aucun effet sur l'argent, resultJson jamais stocké).
+      if (device === null) { if (r.formatVersion === 1) honored.push(r.actionId); else appliedIgnores.push({ actionId: r.actionId, code: "APPAREIL_INCONNU" }); }
       else if (r.deviceId !== device) appliedIgnores.push({ actionId: r.actionId, code: "AUTRE_APPAREIL" });
-      // Même appareil : C1, honoré seulement si le serveur a renoncé ; sinon ignoré sans signalement.
-      else if (r.lastResultCode != null && !(CLAIMABLE_CODES as readonly string[]).includes(r.lastResultCode)) honored.push(r.actionId);
+      else if (r.formatVersion === 1) honored.push(r.actionId);
     }
-    if (honored.length) { const at = new Date();
-      await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: { in: honored }, status: "PENDING", formatVersion: 2, lastResultCode: { not: null, notIn: [...CLAIMABLE_CODES] } },
-        data: { status: "APPLIED", appliedAt: at, lastResultCode: "APPLIED_PAR_TABLETTE", lastAttemptAt: at } }); }
+    if (honored.length) await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: { in: honored }, status: "PENDING", formatVersion: 1 }, data: { status: "APPLIED", appliedAt: new Date() } });
   }
   // État en base APRÈS l'opération (accusés `applied` compris), lu en une requête, filtré par commerce (RLS en plus).
   const ids = results.map(r => r.actionId);
-  const rows = ids.length ? await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: ids } }, select: { actionId: true, status: true, resultJson: true } }) : [];
+  const rows = ids.length ? await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: ids } }, select: STATE_SELECT }) : [];
   const byId = new Map(rows.map(r => [r.actionId, r]));
   const out = results.map(r => { const row = byId.get(r.actionId);
     // Prudence : ligne introuvable (ne devrait pas arriver) → PENDING, la tablette garde l'action.
     return { ...r, ...depositState(row) }; });
   return { results: out, applied: b.applied, appliedIgnores };
 }
-export async function listDeposits(tx: CashDepositTx, input: { tenantId: string; status?: string | null; cursor?: string | null; limit?: string | number | null; withPayload?: string | null }) {
+export async function listDeposits(tx: CashDepositTx, input: { tenantId: string; status?: string | null; cursor?: string | null; limit?: string | number | null; withPayload?: string | null;
+  deviceId?: string | null; receivedFrom?: string | null }) {
   const tenantId = uuid(input.tenantId), status = input.status ?? undefined;
+  // K4 : filtres facultatifs, additifs, validés, appliqués dans la requête.
+  const deviceId = input.deviceId ?? undefined;
+  requireCash(deviceId === undefined || DEVICE_ID.test(deviceId), "INVALID_DEVICE_ID");
+  let receivedFrom: Date | undefined;
+  if (input.receivedFrom != null) {
+    // Fuseau explicite (Z ou ±hh:mm) ou date seule (comprise en UTC) ; une heure sans fuseau est refusée.
+    requireCash(/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2}))?$/.test(input.receivedFrom), "INVALID_RECEIVED_FROM");
+    receivedFrom = new Date(input.receivedFrom); requireCash(Number.isFinite(receivedFrom.getTime()), "INVALID_RECEIVED_FROM");
+  }
   requireCash(status === undefined || ["PENDING", "APPLIED"].includes(status), "INVALID_STATUS");
   const limit = Number(input.limit ?? 50); requireCash(Number.isInteger(limit) && limit >= 1 && limit <= 200, "INVALID_LIMIT");
   let cursor: { receivedAt: Date; id: string } | undefined;
@@ -149,7 +157,7 @@ export async function listDeposits(tx: CashDepositTx, input: { tenantId: string;
   const select = { id: true, tenantId: true, actionId: true, deviceId: true, deviceName: true, kind: true, operation: true, entityKey: true,
     ...(input.withPayload === "1" ? { payload: true } : {}), dependsOn: true, payloadHash: true, clientCreatedAt: true, clientState: true,
     clientErrorCode: true, receivedAt: true, lastSeenAt: true, status: true, appliedAt: true, conflictCount: true } as const;
-  const rows = await tx.cashDeposit.findMany({ where: { tenantId, ...(status ? { status } : {}), ...(cursor ? { OR: [{ receivedAt: { gt: cursor.receivedAt } }, { receivedAt: cursor.receivedAt, id: { gt: cursor.id } }] } : {}) },
+  const rows = await tx.cashDeposit.findMany({ where: { tenantId, ...(status ? { status } : {}), ...(deviceId ? { deviceId } : {}), ...(receivedFrom ? { receivedAt: { gte: receivedFrom } } : {}), ...(cursor ? { OR: [{ receivedAt: { gt: cursor.receivedAt } }, { receivedAt: cursor.receivedAt, id: { gt: cursor.id } }] } : {}) },
     select, orderBy: [{ receivedAt: "asc" }, { id: "asc" }], take: limit + 1 });
   const more = rows.length > limit, page = rows.slice(0, limit);
   return { items: page, nextCursor: more && page.length ? JSON.stringify({ receivedAt: page.at(-1)!.receivedAt, id: page.at(-1)!.id }) : null };
@@ -181,8 +189,10 @@ export async function claimDeposits(tx: CashDepositTx, input: unknown) {
     select: { actionId: true, kind: true, operation: true, entityKey: true, payload: true, dependsOn: true, clientState: true, clientErrorCode: true,
       sequence: true, actorId: true, actorName: true, receivedById: true, attempts: true, lastResultCode: true, conflictCount: true } });
   const depIds = [...new Set(rows.flatMap(r => (Array.isArray(r.dependsOn) ? r.dependsOn : []).filter(isUuid).map(x => x.toLowerCase())))];
-  const deps = depIds.length ? await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: depIds } }, select: { actionId: true, status: true, resultJson: true } }) : [];
-  const byId = new Map(deps.map(d => [d.actionId, { status: d.status, resultJson: d.resultJson ?? null }]));
+  // K3 : chaque dépendance porte aussi lastResultCode et formatVersion (dépendance renoncée visible par l'applicateur).
+  const deps = depIds.length ? await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: depIds } },
+    select: { actionId: true, status: true, resultJson: true, lastResultCode: true, formatVersion: true } }) : [];
+  const byId = new Map(deps.map(d => [d.actionId, { status: d.status, resultJson: d.resultJson ?? null, lastResultCode: d.lastResultCode ?? null, formatVersion: d.formatVersion }]));
   const items = rows.map(r => {
     const ids = Array.isArray(r.dependsOn) ? (r.dependsOn as string[]) : [];
     return { ...r, dependencies: Object.fromEntries(ids.map(id => [id, isUuid(id) ? byId.get(id.toLowerCase()) ?? null : null])) };
@@ -241,6 +251,6 @@ export function validateStatusInput(input: unknown) {
 }
 export async function depositStatuses(tx: CashDepositTx, input: unknown) {
   const b = validateStatusInput(input);
-  const rows = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.actionIds } }, select: { actionId: true, status: true, resultJson: true } });
+  const rows = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.actionIds } }, select: STATE_SELECT });
   return { items: rows.map(r => ({ actionId: r.actionId, ...depositState(r) })) };
 }

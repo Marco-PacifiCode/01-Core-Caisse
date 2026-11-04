@@ -100,7 +100,7 @@ test("bail expiré repris, ordre, format 1 marqué REJEU_TABLETTE, dépendances"
     await deposits.depositActions(tx, { tenantId, actions: [a2, b0, old, a1] });
     const first = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 10 });
     assert.deepEqual(first.items.map((i: any) => i.actionId), [a1.actionId, a2.actionId, b0.actionId]);
-    assert.deepEqual({ ...first.items[0].dependencies[a2.actionId] }, { status: "PENDING", resultJson: null });
+    assert.deepEqual({ ...first.items[0].dependencies[a2.actionId] }, { status: "PENDING", resultJson: null, lastResultCode: null, formatVersion: 2 });
     const oldRow = await tx.cashDeposit.findUnique({ where: { tenantId_actionId: { tenantId, actionId: old.actionId } } });
     assert.equal(oldRow!.status, "PENDING"); assert.equal(oldRow!.lastResultCode, "REJEU_TABLETTE"); assert.equal(oldRow!.attempts, 0);
     await assert.rejects(deposits.claimDeposits(tx, { tenantId, holder: "surface-b", limit: 10 }), (e: any) => code(e, "LEASE_HELD"));
@@ -156,19 +156,21 @@ test("enveloppe format 2 hors payloadHash : même payload, autre auteur → seen
   });
 });
 // R1 (04/11) : ce test portait l'ancien comportement sur des lignes de format 2 ; il ne vaut plus que pour le format 1.
-test("applied format 1 accusé par la tablette : objet avec resultJson, ligne APPLIED jamais réécrite", async () => {
+// K2 (relecture 2) : le resultJson d'un accusé de la tablette n'est plus jamais stocké, même en format 1.
+test("applied format 1 accusé par la tablette : objet → APPLIED sans resultJson stocké, ligne APPLIED jamais réécrite", async () => {
   const tenantId = randomUUID();
   await rolledBack(tenantId, async tx => {
     const a = legacy(), b = legacy();
     await deposits.depositActions(tx, { tenantId, actions: [a, b] });
-    await deposits.depositActions(tx, { tenantId, actions: [], applied: [a.actionId, { actionId: b.actionId, resultJson: { saleId: "s-1" } }] });
+    await deposits.depositActions(tx, { tenantId, deviceId: "tablette-v1", actions: [], applied: [a.actionId, { actionId: b.actionId, resultJson: { saleId: "s-1" } }] });
     const find = (actionId: string) => tx.cashDeposit.findUnique({ where: { tenantId_actionId: { tenantId, actionId } } });
     const ra = await find(a.actionId), rb = await find(b.actionId);
     assert.equal(ra!.status, "APPLIED"); assert.equal(ra!.resultJson, null);
-    assert.equal(rb!.status, "APPLIED"); assert.deepEqual(rb!.resultJson, { saleId: "s-1" }); assert.equal(rb!.lastResultCode, "APPLIED"); assert.ok(rb!.lastAttemptAt);
-    await deposits.depositActions(tx, { tenantId, actions: [], applied: [{ actionId: b.actionId, resultJson: { saleId: "s-2" } }] });
+    assert.equal(rb!.status, "APPLIED"); assert.equal(rb!.resultJson, null); assert.equal(rb!.lastResultCode, null);
+    assert.deepEqual(JSON.parse(JSON.stringify((await deposits.depositStatuses(tx, { tenantId, actionIds: [b.actionId] })).items)), [{ actionId: b.actionId, status: "APPLIED" }]);
+    await deposits.depositActions(tx, { tenantId, deviceId: "tablette-v1", actions: [], applied: [{ actionId: b.actionId, resultJson: { saleId: "s-2" } }] });
     const again = await find(b.actionId);
-    assert.deepEqual(again!.resultJson, { saleId: "s-1" }); assert.equal(again!.appliedAt!.getTime(), rb!.appliedAt!.getTime());
+    assert.equal(again!.resultJson, null); assert.equal(again!.appliedAt!.getTime(), rb!.appliedAt!.getTime());
     await assert.rejects(deposits.depositActions(tx, { tenantId, actions: [], applied: [{ actionId: b.actionId }] }), (e: any) => e.message === "INVALID_APPLIED");
   });
 });
@@ -190,7 +192,7 @@ test("réponse du dépôt : status/resultJson après l'opération, conflict, iso
     const r = await deposits.depositActions(tx, { tenantId: tenantA, actions: [b, c, { ...a, payload: { autre: true } }] });
     assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
       { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s-1" } },
-      { actionId: c.actionId, result: "seen", status: "APPLIED" },
+      { actionId: c.actionId, result: "seen", status: "PENDING" }, // K1 : l'accusé de la tablette ne change jamais une ligne de format 2
       { actionId: a.actionId, result: "conflict", status: "PENDING" },
     ]);
   });
@@ -234,13 +236,12 @@ test("Q5 : ouverture sur journée OPEN inchangée ; rejeu d'une ouverture appliq
 test("status : états réels, projection limitée, inconnu absent, 400, isolation RLS entre commerces", async () => {
   const tenantA = randomUUID(), tenantB = randomUUID();
   await rolledBack(tenantA, async tx => {
-    const applied = v2("tab-a", 1), pending = v2("tab-a", 2), bare = v2("tab-a", 3);
+    // K1 (relecture 2) : seule une ligne de format 1 peut être APPLIED sans resultJson par accusé de la tablette.
+    const applied = v2("tab-a", 1), pending = v2("tab-a", 2), bare = legacy();
     await deposits.depositActions(tx, { tenantId: tenantA, actions: [applied, pending, bare] });
     const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "surface-a", limit: 10 });
     await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: applied.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
-    // R1 : l'accusé n'est honoré que si le serveur a renoncé, et seulement pour l'appareil de la ligne.
-    await tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId: tenantA, actionId: bare.actionId } }, data: { lastResultCode: "REJEU_TABLETTE" } });
-    await deposits.depositActions(tx, { tenantId: tenantA, deviceId: "tab-a", actions: [], applied: [bare.actionId] });
+    await deposits.depositActions(tx, { tenantId: tenantA, deviceId: "tablette-v1", actions: [], applied: [{ actionId: bare.actionId, resultJson: { saleId: "tablette" } }] });
     const unknown = randomUUID();
     const r = await deposits.depositStatuses(tx, { tenantId: tenantA, actionIds: [applied.actionId, pending.actionId, bare.actionId, unknown, applied.actionId] });
     const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
@@ -263,7 +264,8 @@ test("status : états réels, projection limitée, inconnu absent, 400, isolatio
 const markPg = (tx: Tx, tenantId: string, actionId: string, lastResultCode: string | null, lastResultReason: string | null = null) =>
   tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId, actionId } }, data: { lastResultCode, lastResultReason } });
 const rowPg = (tx: Tx, tenantId: string, actionId: string) => tx.cashDeposit.findUniqueOrThrow({ where: { tenantId_actionId: { tenantId, actionId } } });
-test("R1 : applied inventé (jamais tenté, EN_ATTENTE) ignoré ; REJEU_TABLETTE → APPLIED_PAR_TABLETTE sans resultJson ; format 1 inchangé", async () => {
+// K1/K2 (relecture 2) : encodait l'ancien passage APPLIED par la tablette et le resultJson stocké en format 1.
+test("K1/K2 : applied de la tablette sur format 2 (jamais tenté, EN_ATTENTE, REJEU_TABLETTE) → lignes inchangées ; format 1 APPLIED sans resultJson", async () => {
   const tenantId = randomUUID();
   await rolledBack(tenantId, async tx => {
     const fresh = v2("tab-a", 1), waiting = v2("tab-a", 2), renounced = v2("tab-a", 3), old = legacy(), oldObj = legacy();
@@ -271,18 +273,19 @@ test("R1 : applied inventé (jamais tenté, EN_ATTENTE) ignoré ; REJEU_TABLETTE
     await markPg(tx, tenantId, waiting.actionId, "EN_ATTENTE"); await markPg(tx, tenantId, renounced.actionId, "REJEU_TABLETTE");
     const forged = { cashDayId: randomUUID() };
     await deposits.depositActions(tx, { tenantId, deviceId: "tab-a", actions: [], applied: [
-      { actionId: fresh.actionId, resultJson: forged }, { actionId: waiting.actionId, resultJson: forged }, { actionId: renounced.actionId, resultJson: forged },
-      old.actionId, { actionId: oldObj.actionId, resultJson: { saleId: "s" } }] });
-    for (const id of [fresh.actionId, waiting.actionId]) { const r = await rowPg(tx, tenantId, id); assert.equal(r.status, "PENDING"); assert.equal(r.resultJson, null); }
-    const r = await rowPg(tx, tenantId, renounced.actionId);
-    assert.equal(r.status, "APPLIED"); assert.equal(r.resultJson, null); assert.equal(r.lastResultCode, "APPLIED_PAR_TABLETTE");
+      { actionId: fresh.actionId, resultJson: forged }, { actionId: waiting.actionId, resultJson: forged }, { actionId: renounced.actionId, resultJson: forged }] });
+    // K5 : les lignes de format 1 sont accusées par leur propre appareil.
+    await deposits.depositActions(tx, { tenantId, deviceId: "tablette-v1", actions: [], applied: [old.actionId, { actionId: oldObj.actionId, resultJson: { saleId: "s" } }] });
+    for (const [id, code] of [[fresh.actionId, null], [waiting.actionId, "EN_ATTENTE"], [renounced.actionId, "REJEU_TABLETTE"]] as const) {
+      const r = await rowPg(tx, tenantId, id); assert.equal(r.status, "PENDING"); assert.equal(r.resultJson, null); assert.equal(r.lastResultCode, code); }
     assert.equal((await rowPg(tx, tenantId, old.actionId)).status, "APPLIED");
-    assert.deepEqual(JSON.parse(JSON.stringify((await rowPg(tx, tenantId, oldObj.actionId)).resultJson)), { saleId: "s" });
-    const st = await deposits.depositStatuses(tx, { tenantId, actionIds: [fresh.actionId, waiting.actionId, renounced.actionId] });
+    const ro = await rowPg(tx, tenantId, oldObj.actionId); assert.equal(ro.status, "APPLIED"); assert.equal(ro.resultJson, null);
+    const st = await deposits.depositStatuses(tx, { tenantId, actionIds: [fresh.actionId, waiting.actionId, renounced.actionId, oldObj.actionId] });
     for (const i of st.items) assert.ok(!("resultJson" in i), JSON.stringify(i));
   });
 });
-test("R1 appareil : AUTRE_APPAREIL inchangé, même appareil honoré, appareil déduit du lot, APPAREIL_INCONNU", async () => {
+// K1 (relecture 2) : encodait APPLIED_PAR_TABLETTE pour le même appareil ; la ligne reste désormais inchangée.
+test("R1 appareil : AUTRE_APPAREIL inchangé, même appareil inchangé et silencieux, appareil déduit du lot, APPAREIL_INCONNU", async () => {
   const tenantId = randomUUID();
   await rolledBack(tenantId, async tx => {
     const a = v2("tab-a", 1), a2 = v2("tab-a", 2), a3 = v2("tab-a", 3);
@@ -296,9 +299,10 @@ test("R1 appareil : AUTRE_APPAREIL inchangé, même appareil honoré, appareil d
     const unknown = await deposits.depositActions(tx, { tenantId, actions: [], applied: [a.actionId] });
     assert.deepEqual(JSON.parse(JSON.stringify(unknown.appliedIgnores)), [{ actionId: a.actionId, code: "APPAREIL_INCONNU" }]);
     const same = await deposits.depositActions(tx, { tenantId, deviceId: "tab-a", actions: [], applied: [a.actionId] });
-    assert.equal(same.appliedIgnores.length, 0); assert.equal((await rowPg(tx, tenantId, a.actionId)).lastResultCode, "APPLIED_PAR_TABLETTE");
+    assert.equal(same.appliedIgnores.length, 0);
+    const kept = await rowPg(tx, tenantId, a.actionId); assert.equal(kept.status, "PENDING"); assert.equal(kept.lastResultCode, "REJEU_TABLETTE");
     const inferred = await deposits.depositActions(tx, { tenantId, actions: [a3], applied: [a2.actionId] });
-    assert.equal(inferred.appliedIgnores.length, 0); assert.equal((await rowPg(tx, tenantId, a2.actionId)).status, "APPLIED");
+    assert.equal(inferred.appliedIgnores.length, 0); assert.equal((await rowPg(tx, tenantId, a2.actionId)).status, "PENDING");
   });
 });
 test("R2 : 100 REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie le neuf ; remise à zéro sur PENDING seulement ; R4 conflictCount", async () => {
@@ -311,7 +315,7 @@ test("R2 : 100 REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie le neuf ; 
     await deposits.depositActions(tx, { tenantId, actions: [fresh] });
     const c = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 100 });
     assert.deepEqual(c.items.map((i: any) => i.actionId), [fresh.actionId]);
-    assert.deepEqual({ ...c.items[0].dependencies[old[0].actionId] }, { status: "PENDING", resultJson: null });
+    assert.deepEqual({ ...c.items[0].dependencies[old[0].actionId] }, { status: "PENDING", resultJson: null, lastResultCode: "REJEU_TABLETTE", formatVersion: 2 });
     assert.equal(c.items[0].conflictCount, 0);
     // Remise à zéro de la marque par un redépôt seen dont clientState change.
     const e = v2("tab-a", 600, { clientState: "error" }), done = v2("tab-a", 601, { clientState: "error" });
@@ -349,5 +353,70 @@ test("R1 appareil avant C1 : B sur ligne de A (jamais tentée, EN_ATTENTE, REJEU
     const unknown = await deposits.depositActions(tx, { tenantId, actions: [], applied: [fresh.actionId] });
     assert.deepEqual(JSON.parse(JSON.stringify(unknown.appliedIgnores)), [{ actionId: fresh.actionId, code: "APPAREIL_INCONNU" }]);
     assert.equal((await rowPg(tx, tenantId, fresh.actionId)).status, "PENDING");
+  });
+});
+
+// ---- Relecture 2 : K2 (resultJson servi seulement si posé par /result), K3 (dépendances), K4 (filtres de la liste) ----
+test("K2/K3 : /result → /status rend le resultJson ; dépendance renoncée exposée avec lastResultCode et formatVersion", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const a = v2("tab-a", 1), dep = v2("tab-a", 2), child = v2("tab-a", 3, { dependsOn: [dep.actionId] });
+    await deposits.depositActions(tx, { tenantId, actions: [a, dep, child] });
+    const { token } = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 10 });
+    await deposits.recordDepositResult(tx, { tenantId, token, actionId: a.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
+    await deposits.recordDepositResult(tx, { tenantId, token, actionId: dep.actionId, outcome: "REFUSED", code: "REJEU_TABLETTE" });
+    const st = await deposits.depositStatuses(tx, { tenantId, actionIds: [a.actionId] });
+    assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "APPLIED", resultJson: { saleId: "s-1" } }]);
+    const c = await deposits.claimDeposits(tx, { tenantId, holder: "surface-a", limit: 10 });
+    const item = c.items.find((i: any) => i.actionId === child.actionId);
+    assert.deepEqual({ ...item.dependencies[dep.actionId] }, { status: "PENDING", resultJson: null, lastResultCode: "REJEU_TABLETTE", formatVersion: 2 });
+  });
+});
+test("K4 : listDeposits filtre deviceId et receivedFrom en base ; deviceId invalide → 400", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const a = v2("tab-a", 1), b = v2("tab-b", 1);
+    await deposits.depositActions(tx, { tenantId, actions: [a, b] });
+    await tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId, actionId: a.actionId } }, data: { receivedAt: new Date("2026-01-01T00:00:00.000Z") } });
+    const byDevice = await deposits.listDeposits(tx, { tenantId, deviceId: "tab-b" });
+    assert.deepEqual(byDevice.items.map((i: any) => i.actionId), [b.actionId]);
+    const recent = await deposits.listDeposits(tx, { tenantId, receivedFrom: "2026-06-01T00:00:00.000Z" });
+    assert.deepEqual(recent.items.map((i: any) => i.actionId), [b.actionId]);
+    const all = await deposits.listDeposits(tx, { tenantId });
+    assert.equal(all.items.length, 2);
+    await assert.rejects(deposits.listDeposits(tx, { tenantId, deviceId: "a b" }), (e: any) => e?.message === "INVALID_DEVICE_ID" && e?.status === 400);
+    await assert.rejects(deposits.listDeposits(tx, { tenantId, receivedFrom: "hier" }), (e: any) => e?.message === "INVALID_RECEIVED_FROM" && e?.status === 400);
+  });
+});
+
+// ---- K5 : garde de l'appareil sur le format 1, receivedFrom avec fuseau ----
+test("K5/K6 format 1 : autre appareil → AUTRE_APPAREIL inchangée ; même appareil → APPLIED ; sans appareil → APPLIED, resultJson null", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const old = legacy();
+    await deposits.depositActions(tx, { tenantId, actions: [old] });
+    const before = await rowPg(tx, tenantId, old.actionId);
+    const fromB = await deposits.depositActions(tx, { tenantId, deviceId: "tab-b", actions: [], applied: [{ actionId: old.actionId, resultJson: { saleId: "faux" } }] });
+    assert.deepEqual(JSON.parse(JSON.stringify(fromB.appliedIgnores)), [{ actionId: old.actionId, code: "AUTRE_APPAREIL" }]);
+    let r = await rowPg(tx, tenantId, old.actionId);
+    assert.equal(r.status, "PENDING"); assert.equal(r.resultJson, null); assert.equal(r.conflictCount, before.conflictCount); assert.equal(r.appliedAt, null);
+    const own = await deposits.depositActions(tx, { tenantId, deviceId: "tablette-v1", actions: [], applied: [{ actionId: old.actionId, resultJson: { saleId: "s" } }] });
+    assert.equal(own.appliedIgnores.length, 0);
+    r = await rowPg(tx, tenantId, old.actionId); assert.equal(r.status, "APPLIED"); assert.equal(r.resultJson, null);
+    // K6 : vieille tablette sans deviceId, lot sans actions → APPLIED comme avant, sans signalement.
+    const old2 = legacy();
+    await deposits.depositActions(tx, { tenantId, actions: [old2] });
+    const none = await deposits.depositActions(tx, { tenantId, actions: [], applied: [{ actionId: old2.actionId, resultJson: { saleId: "s" } }] });
+    assert.equal(none.appliedIgnores.length, 0);
+    const r2 = await rowPg(tx, tenantId, old2.actionId); assert.equal(r2.status, "APPLIED"); assert.equal(r2.resultJson, null);
+  });
+});
+test("K5 : receivedFrom sans fuseau → 400, date seule et fuseau explicite acceptés", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    for (const bad of ["2026-11-04T10:00:00", "2026-11-04T10:00"])
+      await assert.rejects(deposits.listDeposits(tx, { tenantId, receivedFrom: bad }), (e: any) => e?.message === "INVALID_RECEIVED_FROM" && e?.status === 400);
+    for (const ok of ["2026-11-04", "2026-11-04T10:00:00Z", "2026-11-04T10:00:00+11:00"])
+      assert.ok(Array.isArray((await deposits.listDeposits(tx, { tenantId, receivedFrom: ok })).items));
   });
 });

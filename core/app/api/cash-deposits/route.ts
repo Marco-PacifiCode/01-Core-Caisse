@@ -12,5 +12,6 @@ export function POST(req: NextRequest) {
   });
 }
 export function GET(req: NextRequest) {
-  return cashRead(req, (tx, tenantId, q) => listDeposits(tx, { tenantId, status: q.get("status"), cursor: q.get("cursor"), limit: q.get("limit"), withPayload: q.get("withPayload") }));
+  return cashRead(req, (tx, tenantId, q) => listDeposits(tx, { tenantId, status: q.get("status"), cursor: q.get("cursor"), limit: q.get("limit"), withPayload: q.get("withPayload"),
+    deviceId: q.get("deviceId"), receivedFrom: q.get("receivedFrom") }));
 }

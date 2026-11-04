@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { claimDeposits, depositActions, depositStatuses, recordDepositResult, releaseLease, validateDepositInput, validateStatusInput } from "./cash-deposits.ts";
+import { claimDeposits, depositActions, depositStatuses, listDeposits, recordDepositResult, releaseLease, validateDepositInput, validateStatusInput } from "./cash-deposits.ts";
 
 // Persistance simulée en mémoire (style de cash-deposits.test.ts) : un seul commerce par fixture.
 function fixture() {
@@ -65,7 +65,7 @@ test("claim : bail exclusif, expiré repris, ordre, REJEU_TABLETTE sans changer 
   await depositActions(f.tx, { tenantId, actions: [first, second, legacy] });
   const c = await claimDeposits(f.tx, { tenantId, holder: "surface-1", limit: 10 });
   assert.deepEqual(c.items.map((i: any) => i.actionId), [second.actionId, first.actionId]);
-  assert.deepEqual(c.items[0].dependencies[first.actionId], { status: "PENDING", resultJson: null });
+  assert.deepEqual(c.items[0].dependencies[first.actionId], { status: "PENDING", resultJson: null, lastResultCode: null, formatVersion: 2 });
   assert.equal(Object.values(c.items[0].dependencies)[1], null);
   assert.equal(f.rows.get(legacy.actionId).lastResultCode, "REJEU_TABLETTE"); assert.equal(f.rows.get(legacy.actionId).status, "PENDING");
   await assert.rejects(claimDeposits(f.tx, { tenantId, holder: "surface-2", limit: 10 }), (e: any) => e.message === "LEASE_HELD" && e.status === 409);
@@ -101,16 +101,17 @@ test("result refuse une ligne de format 1", async () => {
   await assert.rejects(recordDepositResult(f.tx, { tenantId, token, actionId: legacy.actionId, outcome: "APPLIED", resultJson: {} }), (e: any) => e.message === "FORMAT_NOT_APPLICABLE");
 });
 // R1 (04/11) : ce test portait l'ancien comportement sur des lignes de format 2 ; il ne vaut plus que pour le format 1.
-test("applied format 1 : UUID seul inchangé, objet avec resultJson, ligne APPLIED jamais réécrite, objet malformé refusé", async () => {
+// K2 (relecture 2) : le resultJson d'un accusé de la tablette n'est plus jamais stocké, même en format 1.
+test("applied format 1 : UUID seul et objet → APPLIED sans resultJson stocké, ligne APPLIED jamais réécrite, objet malformé refusé", async () => {
   const f = fixture(), a = v1(), b = v1(), c = v2(3);
   await depositActions(f.tx, { tenantId, actions: [a, b, c] });
-  await depositActions(f.tx, { tenantId, actions: [], applied: [a.actionId, { actionId: b.actionId.toUpperCase(), resultJson: { cashDayId: "d1" } }] });
+  await depositActions(f.tx, { tenantId, deviceId: "t", actions: [], applied: [a.actionId, { actionId: b.actionId.toUpperCase(), resultJson: { cashDayId: "d1" } }] });
   assert.equal(f.rows.get(a.actionId).status, "APPLIED"); assert.equal(f.rows.get(a.actionId).resultJson, null);
   const rb = f.rows.get(b.actionId);
-  assert.equal(rb.status, "APPLIED"); assert.deepEqual(rb.resultJson, { cashDayId: "d1" }); assert.equal(rb.lastResultCode, "APPLIED"); assert.ok(rb.lastAttemptAt && rb.appliedAt);
+  assert.equal(rb.status, "APPLIED"); assert.equal(rb.resultJson, null); assert.equal(rb.lastResultCode, null); assert.ok(rb.appliedAt);
   await new Promise(r => setTimeout(r, 5));
-  await depositActions(f.tx, { tenantId, actions: [], applied: [{ actionId: b.actionId, resultJson: { cashDayId: "autre" } }] });
-  assert.deepEqual(f.rows.get(b.actionId).resultJson, { cashDayId: "d1" }); assert.equal(f.rows.get(b.actionId).appliedAt, rb.appliedAt);
+  await depositActions(f.tx, { tenantId, deviceId: "t", actions: [], applied: [{ actionId: b.actionId, resultJson: { cashDayId: "autre" } }] });
+  assert.equal(f.rows.get(b.actionId).resultJson, null); assert.equal(f.rows.get(b.actionId).appliedAt, rb.appliedAt);
   for (const bad of [{ actionId: c.actionId }, { actionId: c.actionId, resultJson: [] }, { actionId: "x", resultJson: {} }, { actionId: c.actionId, resultJson: {}, autre: 1 }, 5, null])
     assert.throws(() => validateDepositInput({ tenantId, actions: [], applied: [bad] }), (e: any) => e.message === "INVALID_APPLIED" && e.status === 400);
   assert.equal(f.rows.get(c.actionId).status, "PENDING");
@@ -123,13 +124,13 @@ test("réponse du dépôt : status et resultJson de la ligne après l'opération
   await depositActions(f.tx, { tenantId, actions: [b, c] });
   const { token } = await claimDeposits(f.tx, { tenantId, holder: "s", limit: 10 });
   await recordDepositResult(f.tx, { tenantId, token, actionId: b.actionId, outcome: "APPLIED", resultJson: { saleId: "s1" } });
-  // R1 : l'accusé de la tablette n'est honoré que si le serveur a renoncé (marque posée).
+  // K1 : l'accusé de la tablette ne change jamais une ligne de format 2, même renoncée.
   f.rows.set(c.actionId, { ...f.rows.get(c.actionId), lastResultCode: "NON_APPLICABLE_ERROR" });
   await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [c.actionId] });
   const r = await depositActions(f.tx, { tenantId, actions: [b, c, { ...a, payload: { autre: true } }] });
   assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
     { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s1" } },
-    { actionId: c.actionId, result: "seen", status: "APPLIED" },
+    { actionId: c.actionId, result: "seen", status: "PENDING" },
     { actionId: a.actionId, result: "conflict", status: "PENDING" },
   ]);
 });
@@ -148,7 +149,7 @@ function statusTx(rows: any[]) {
 const fullRow = (extra: any) => ({ tenantId, actionId: randomUUID(), payload: { secret: 1 }, payloadHash: "h", actorId: "u1", actorName: "Alice",
   sequence: 1n, formatVersion: 2, resultJson: null, status: "PENDING", ...extra });
 test("status : APPLIED+resultJson, PENDING, APPLIED sans resultJson, inconnu et autre commerce absents", async () => {
-  const applied = fullRow({ status: "APPLIED", resultJson: { saleId: "s1", n: [1, 2] } }), pending = fullRow({}),
+  const applied = fullRow({ status: "APPLIED", lastResultCode: "APPLIED", resultJson: { saleId: "s1", n: [1, 2] } }), pending = fullRow({}),
     bare = fullRow({ status: "APPLIED" }), other = fullRow({ tenantId: randomUUID(), status: "APPLIED", resultJson: { x: 1 } }), unknown = randomUUID();
   const { tx, calls } = statusTx([applied, pending, bare, other]);
   const r = await depositStatuses(tx, { tenantId, actionIds: [applied.actionId, pending.actionId.toUpperCase(), bare.actionId, other.actionId, unknown, applied.actionId] });
@@ -159,7 +160,7 @@ test("status : APPLIED+resultJson, PENDING, APPLIED sans resultJson, inconnu et 
   assert.ok(!byId.has(other.actionId) && !byId.has(unknown)); assert.equal(r.items.length, 3);
   for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson"].includes(k)), JSON.stringify(i));
   assert.equal(calls.length, 1);
-  assert.deepEqual({ ...calls[0].select }, { actionId: true, status: true, resultJson: true });
+  assert.deepEqual({ ...calls[0].select }, { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true });
   assert.ok(!("payload" in calls[0].select) && !("payloadHash" in calls[0].select));
   assert.equal(calls[0].where.tenantId, tenantId); assert.equal(calls[0].where.actionId.in.length, 5); // doublon retiré, casse normalisée
 });
@@ -197,22 +198,25 @@ test("R1 : applied inventé sur format 2 jamais tenté ou EN_ATTENTE → reste P
     assert.deepEqual({ ...r.results[0] }, { actionId: a.actionId, result: "seen", status: "PENDING" });
   }
 });
-test("R1 : format 2 REJEU_TABLETTE → APPLIED sans resultJson, APPLIED_PAR_TABLETTE ; /status sans resultJson de la tablette", async () => {
+// K1 (relecture 2) : encodait APPLIED_PAR_TABLETTE ; désormais la ligne de format 2 ne change jamais.
+test("K1 : même appareil sur une ligne REJEU_TABLETTE → ligne inchangée, aucun signalement ; /status sans resultJson de la tablette", async () => {
   const f = fixture(), a = v2(1);
   await depositActions(f.tx, { tenantId, actions: [a] }); mark(f, a.actionId, "REJEU_TABLETTE");
-  await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [{ actionId: a.actionId, resultJson: { cashDayId: "invente" } }] });
-  const row = f.rows.get(a.actionId);
-  assert.equal(row.status, "APPLIED"); assert.equal(row.resultJson, null); assert.equal(row.lastResultCode, "APPLIED_PAR_TABLETTE"); assert.ok(row.appliedAt);
+  const before = { ...f.rows.get(a.actionId) };
+  const r = await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [{ actionId: a.actionId, resultJson: { cashDayId: "invente" } }] });
+  assert.deepEqual(r.appliedIgnores, []); assert.deepEqual([...r.applied], [a.actionId]);
+  assert.deepEqual({ ...f.rows.get(a.actionId) }, before);
   const st = await depositStatuses(f.tx, { tenantId, actionIds: [a.actionId] });
-  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "APPLIED" }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "PENDING" }]);
 });
-test("R1 : format 1 inchangé (UUID seul et objet avec resultJson)", async () => {
+test("K2 : format 1 accusé avec un resultJson → APPLIED, resultJson null en base, /status sans resultJson", async () => {
   const f = fixture(), a = v1(), b = v1();
   await depositActions(f.tx, { tenantId, actions: [a, b] });
-  await depositActions(f.tx, { tenantId, actions: [], applied: [a.actionId, { actionId: b.actionId, resultJson: { saleId: "s" } }] });
+  await depositActions(f.tx, { tenantId, deviceId: "t", actions: [], applied: [a.actionId, { actionId: b.actionId, resultJson: { saleId: "s" } }] });
   assert.equal(f.rows.get(a.actionId).status, "APPLIED"); assert.equal(f.rows.get(a.actionId).resultJson, null);
-  assert.equal(f.rows.get(b.actionId).status, "APPLIED"); assert.deepEqual(f.rows.get(b.actionId).resultJson, { saleId: "s" });
-  assert.equal(f.rows.get(b.actionId).lastResultCode, "APPLIED");
+  assert.equal(f.rows.get(b.actionId).status, "APPLIED"); assert.equal(f.rows.get(b.actionId).resultJson, null);
+  const st = await depositStatuses(f.tx, { tenantId, actionIds: [b.actionId] });
+  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: b.actionId, status: "APPLIED" }]);
 });
 test("R2 : 100 dépôts REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie le neuf ; dépendances lues quelle que soit la marque", async () => {
   const f = fixture(), old = Array.from({ length: 100 }, (_, i) => v2(i + 1));
@@ -222,7 +226,7 @@ test("R2 : 100 dépôts REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie l
   await depositActions(f.tx, { tenantId, actions: [fresh] });
   const c = await claimDeposits(f.tx, { tenantId, holder: "s", limit: 100 });
   assert.deepEqual(c.items.map((i: any) => i.actionId), [fresh.actionId]);
-  assert.deepEqual(c.items[0].dependencies[old[0].actionId], { status: "PENDING", resultJson: null });
+  assert.deepEqual(c.items[0].dependencies[old[0].actionId], { status: "PENDING", resultJson: null, lastResultCode: "REJEU_TABLETTE", formatVersion: 2 });
 });
 test("R2 : redépôt seen avec clientState error → pending efface NON_APPLICABLE_ERROR et rend re-claimable ; APPLIED jamais remis à zéro", async () => {
   const f = fixture(), a = v2(1, { clientState: "error" }), b = v2(2, { clientState: "error" });
@@ -245,7 +249,8 @@ test("R4 : conflictCount dans les items du claim, 1 après un redépôt au paylo
 });
 
 // ---- Garde de l'appareil (R1, ajout Archi) ----
-test("appareil : B accuse la ligne REJEU_TABLETTE de A → inchangée, AUTRE_APPAREIL ; même appareil → APPLIED_PAR_TABLETTE", async () => {
+// K1 (relecture 2) : encodait APPLIED_PAR_TABLETTE pour le même appareil ; la ligne reste désormais inchangée.
+test("appareil : B accuse la ligne REJEU_TABLETTE de A → inchangée, AUTRE_APPAREIL ; même appareil → inchangée, silence", async () => {
   const f = fixture(), a = v2(1);
   await depositActions(f.tx, { tenantId, actions: [a] }); mark(f, a.actionId, "REJEU_TABLETTE");
   const before = { ...f.rows.get(a.actionId) };
@@ -253,8 +258,7 @@ test("appareil : B accuse la ligne REJEU_TABLETTE de A → inchangée, AUTRE_APP
   assert.deepEqual(r.appliedIgnores.map(i => ({ ...i })), [{ actionId: a.actionId, code: "AUTRE_APPAREIL" }]);
   assert.deepEqual({ ...f.rows.get(a.actionId) }, before, "ligne inchangée, pas de conflictCount");
   const ok = await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [a.actionId] });
-  assert.deepEqual(ok.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).lastResultCode, "APPLIED_PAR_TABLETTE");
-  assert.equal(f.rows.get(a.actionId).status, "APPLIED");
+  assert.deepEqual(ok.appliedIgnores, []); assert.deepEqual({ ...f.rows.get(a.actionId) }, before);
 });
 test("appareil : déduit des actions du lot (toutes de A) ; lot mixte ou vide sans deviceId → APPAREIL_INCONNU", async () => {
   const f = fixture(), a = v2(1), x = v2(2), y = v2(3);
@@ -266,7 +270,7 @@ test("appareil : déduit des actions du lot (toutes de A) ; lot mixte ou vide sa
   assert.deepEqual(none.appliedIgnores.map(i => ({ ...i })), [{ actionId: a.actionId, code: "APPAREIL_INCONNU" }]);
   assert.equal(f.rows.get(a.actionId).status, "PENDING");
   const inferred = await depositActions(f.tx, { tenantId, actions: [x, y], applied: [a.actionId] });
-  assert.deepEqual(inferred.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).lastResultCode, "APPLIED_PAR_TABLETTE");
+  assert.deepEqual(inferred.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).lastResultCode, "REJEU_TABLETTE"); assert.equal(f.rows.get(a.actionId).status, "PENDING");
 });
 test("appareil avant C1 : B sur une ligne de A jamais tentée / EN_ATTENTE / REJEU_TABLETTE → AUTRE_APPAREIL, inchangée", async () => {
   for (const code of [null, "EN_ATTENTE", "REJEU_TABLETTE"]) {
@@ -287,11 +291,51 @@ test("appareil avant C1 : A sur sa ligne jamais tentée → ignorée sans signal
   assert.deepEqual(none.appliedIgnores.map(i => ({ ...i })), [{ actionId: a.actionId, code: "APPAREIL_INCONNU" }]);
   assert.equal(f.rows.get(a.actionId).status, "PENDING"); assert.equal(f.rows.get(a.actionId).lastResultCode, null);
 });
-test("appareil : format 1 sans contrôle ; deviceId invalide → 400", async () => {
+// K5 : la garde de l'appareil vaut aussi pour le format 1 (ce test encodait « format 1 sans contrôle »).
+test("K5 format 1 : B sur la ligne de A → AUTRE_APPAREIL inchangée ; A → APPLIED sans resultJson ; deviceId invalide → 400", async () => {
   const f = fixture(), a = v2(1), legacy = v1();
   await depositActions(f.tx, { tenantId, actions: [a, legacy] });
-  const r = await depositActions(f.tx, { tenantId, deviceId: "tab-b", actions: [], applied: [legacy.actionId] });
-  assert.deepEqual(r.appliedIgnores, []); assert.equal(f.rows.get(legacy.actionId).status, "APPLIED");
+  const before = { ...f.rows.get(legacy.actionId) };
+  const r = await depositActions(f.tx, { tenantId, deviceId: "tab-b", actions: [], applied: [{ actionId: legacy.actionId, resultJson: { saleId: "faux" } }] });
+  assert.deepEqual(r.appliedIgnores.map(i => ({ ...i })), [{ actionId: legacy.actionId, code: "AUTRE_APPAREIL" }]);
+  assert.deepEqual({ ...f.rows.get(legacy.actionId) }, before);
+  const own = await depositActions(f.tx, { tenantId, deviceId: "t", actions: [], applied: [{ actionId: legacy.actionId, resultJson: { saleId: "s" } }] });
+  assert.deepEqual(own.appliedIgnores, []);
+  assert.equal(f.rows.get(legacy.actionId).status, "APPLIED"); assert.equal(f.rows.get(legacy.actionId).resultJson, null);
   for (const bad of ["", "a b", "x".repeat(81), 5, "é"])
     assert.throws(() => validateDepositInput({ tenantId, deviceId: bad, actions: [], applied: [a.actionId] }), (e: any) => e.message === "INVALID_DEVICE_ID" && e.status === 400);
+});
+
+// ---- Relecture 2 : K2 (resultJson servi seulement si posé par /result), K4 (filtres de la liste) ----
+test("K2 : ligne de format 2 APPLIED par /result → /status rend son resultJson", async () => {
+  const f = fixture(), a = v2(1);
+  await depositActions(f.tx, { tenantId, actions: [a] });
+  const { token } = await claimDeposits(f.tx, { tenantId, holder: "s", limit: 10 });
+  await recordDepositResult(f.tx, { tenantId, token, actionId: a.actionId, outcome: "APPLIED", resultJson: { saleId: "s1" } });
+  const st = await depositStatuses(f.tx, { tenantId, actionIds: [a.actionId] });
+  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "APPLIED", resultJson: { saleId: "s1" } }]);
+});
+test("K4 : listDeposits filtre deviceId et receivedFrom dans la requête ; invalides → 400 ; sans eux inchangé", async () => {
+  const calls: any[] = [];
+  const tx: any = { cashDeposit: { findMany: async (args: any) => { calls.push(args); return []; } } };
+  await listDeposits(tx, { tenantId, status: "PENDING", deviceId: "tab-a", receivedFrom: "2026-11-04T10:00:00.000Z" });
+  assert.equal(calls[0].where.deviceId, "tab-a");
+  assert.equal(calls[0].where.receivedAt.gte.toISOString(), "2026-11-04T10:00:00.000Z");
+  await listDeposits(tx, { tenantId, status: "PENDING" });
+  assert.deepEqual(Object.keys(calls[1].where).sort(), ["status", "tenantId"]);
+  for (const bad of ["", "a b", "x".repeat(81), "é"])
+    await assert.rejects(listDeposits(tx, { tenantId, deviceId: bad }), (e: any) => e.message === "INVALID_DEVICE_ID" && e.status === 400);
+  await listDeposits(tx, { tenantId, receivedFrom: "2026-11-04" });
+  assert.equal(calls.at(-1).where.receivedAt.gte.toISOString(), "2026-11-04T00:00:00.000Z", "date seule = UTC");
+  await listDeposits(tx, { tenantId, receivedFrom: "2026-11-04T10:00:00+11:00" });
+  assert.equal(calls.at(-1).where.receivedAt.gte.toISOString(), "2026-11-03T23:00:00.000Z");
+  for (const bad of ["hier", "2026-13-45", "2026-11-04T25:00:00Z", "12345", "2026-11-04T10:00:00", "2026-11-04T10:00"])
+    await assert.rejects(listDeposits(tx, { tenantId, receivedFrom: bad }), (e: any) => e.message === "INVALID_RECEIVED_FROM" && e.status === 400);
+});
+test("K6 format 1 sans appareil (vieille tablette, lot sans actions) → APPLIED, resultJson null, sans signalement", async () => {
+  const f = fixture(), legacy = v1();
+  await depositActions(f.tx, { tenantId, actions: [legacy] });
+  const r = await depositActions(f.tx, { tenantId, actions: [], applied: [{ actionId: legacy.actionId, resultJson: { saleId: "s" } }] });
+  assert.deepEqual(r.appliedIgnores, []);
+  assert.equal(f.rows.get(legacy.actionId).status, "APPLIED"); assert.equal(f.rows.get(legacy.actionId).resultJson, null);
 });
