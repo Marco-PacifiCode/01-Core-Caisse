@@ -72,6 +72,11 @@ export function validateDepositInput(input: unknown) {
   return { tenantId, actions: b.actions.map(action), envelopes: b.actions.map(envelopeOf),
     applied: items.map(i => i.actionId), appliedPlain: items.filter(i => !i.resultJson).map(i => i.actionId), appliedWithResult: items.filter(i => i.resultJson) };
 }
+// Projection d'état commune (réponse du dépôt et /status) : status, et resultJson seulement si APPLIED et non null.
+function depositState(row: { status: string; resultJson: unknown } | undefined) {
+  const status = row?.status === "APPLIED" ? "APPLIED" : "PENDING";
+  return { status, ...(status === "APPLIED" && row?.resultJson != null ? { resultJson: row.resultJson } : {}) };
+}
 export async function depositActions(tx: CashDepositTx, input: unknown) {
   const b = validateDepositInput(input), results: { actionId: string; result: string }[] = [];
   await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'cash-deposit:' + b.tenantId}, 0))::text`;
@@ -100,8 +105,7 @@ export async function depositActions(tx: CashDepositTx, input: unknown) {
   const byId = new Map(rows.map(r => [r.actionId, r]));
   const out = results.map(r => { const row = byId.get(r.actionId);
     // Prudence : ligne introuvable (ne devrait pas arriver) → PENDING, la tablette garde l'action.
-    const status = row?.status === "APPLIED" ? "APPLIED" : "PENDING";
-    return { ...r, status, ...(status === "APPLIED" && row?.resultJson != null ? { resultJson: row.resultJson } : {}) }; });
+    return { ...r, ...depositState(row) }; });
   return { results: out, applied: b.applied };
 }
 export async function listDeposits(tx: CashDepositTx, input: { tenantId: string; status?: string | null; cursor?: string | null; limit?: string | number | null; withPayload?: string | null }) {
@@ -196,4 +200,17 @@ export async function releaseLease(tx: CashDepositTx, input: unknown) {
   // Libérer = expirer le bail (aucune suppression) ; un autre applicateur peut le reprendre aussitôt.
   const released = await tx.cashDepositLease.updateMany({ where: { tenantId, token, until: { gt: new Date() } }, data: { until: new Date() } });
   return { released: released.count === 1 };
+}
+
+// ---- État des dépôts (lecture seule, aucune écriture) : POST /api/cash-deposits/status. ----
+export const MAX_STATUS_IDS = 1000;
+export function validateStatusInput(input: unknown) {
+  const b = object(input), ids = b.actionIds;
+  requireCash(Array.isArray(ids) && ids.length >= 1 && ids.length <= MAX_STATUS_IDS && ids.every(isUuid), "INVALID_ACTION_IDS");
+  return { tenantId: uuid(b.tenantId), actionIds: [...new Set((ids as string[]).map(id => id.toLowerCase()))] };
+}
+export async function depositStatuses(tx: CashDepositTx, input: unknown) {
+  const b = validateStatusInput(input);
+  const rows = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.actionIds } }, select: { actionId: true, status: true, resultJson: true } });
+  return { items: rows.map(r => ({ actionId: r.actionId, ...depositState(r) })) };
 }

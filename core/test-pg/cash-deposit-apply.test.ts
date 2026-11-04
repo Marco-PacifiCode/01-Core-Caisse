@@ -228,3 +228,29 @@ test("Q5 : ouverture sur journée OPEN inchangée ; rejeu d'une ouverture appliq
     assert.equal(c.openings, 2); assert.equal(c.openingFacts, 2); assert.equal(c.conflicts, 0);
   });
 });
+test("status : états réels, projection limitée, inconnu absent, 400, isolation RLS entre commerces", async () => {
+  const tenantA = randomUUID(), tenantB = randomUUID();
+  await rolledBack(tenantA, async tx => {
+    const applied = v2("tab-a", 1), pending = v2("tab-a", 2), bare = v2("tab-a", 3);
+    await deposits.depositActions(tx, { tenantId: tenantA, actions: [applied, pending, bare] });
+    const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "surface-a", limit: 10 });
+    await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: applied.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
+    await deposits.depositActions(tx, { tenantId: tenantA, actions: [], applied: [bare.actionId] });
+    const unknown = randomUUID();
+    const r = await deposits.depositStatuses(tx, { tenantId: tenantA, actionIds: [applied.actionId, pending.actionId, bare.actionId, unknown, applied.actionId] });
+    const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
+    assert.equal(r.items.length, 3); assert.ok(!byId.has(unknown));
+    assert.deepEqual(JSON.parse(JSON.stringify(byId.get(applied.actionId))), { actionId: applied.actionId, status: "APPLIED", resultJson: { saleId: "s-1" } });
+    assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING" });
+    assert.deepEqual({ ...byId.get(bare.actionId) }, { actionId: bare.actionId, status: "APPLIED" });
+    for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson"].includes(k)));
+    for (const bad of [{ tenantId: tenantA, actionIds: [] }, { tenantId: tenantA, actionIds: Array.from({ length: 1001 }, () => randomUUID()) }, { tenantId: tenantA, actionIds: ["x"] }])
+      await assert.rejects(deposits.depositStatuses(tx, bad), (e: any) => e?.status === 400);
+    // Commerce B : ni par son propre tenantId (RLS), ni en demandant les ids de A.
+    await asTenant(tx, tenantB);
+    const fromB = await deposits.depositStatuses(tx, { tenantId: tenantB, actionIds: [applied.actionId, pending.actionId] });
+    assert.equal(fromB.items.length, 0);
+    const forged = await deposits.depositStatuses(tx, { tenantId: tenantA, actionIds: [applied.actionId] });
+    assert.equal(forged.items.length, 0);
+  });
+});

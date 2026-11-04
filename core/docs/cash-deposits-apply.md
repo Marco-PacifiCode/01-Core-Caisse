@@ -73,6 +73,22 @@ Réponse 200 : `{ actionId, status: "APPLIED" | "PENDING", idempotent }`.
 Corps : `{ tenantId, token }`. Expire le bail si le token correspond et qu'il est en cours.
 Réponse 200 : `{ released: true | false }`.
 
+## État des dépôts (`POST /api/cash-deposits/status`)
+
+Route légère pour que la tablette apprenne qu'une pièce déjà déposée est devenue `APPLIED` sans
+redéposer la pièce complète.
+
+- Corps : `{ tenantId: uuid, actionIds: uuid[] }`, de 1 à 1000 éléments ; doublons retirés, casse
+  normalisée. Liste vide, > 1000, ou id non UUID → 400 `INVALID_ACTION_IDS` ; `tenantId` invalide → 400.
+- Réponse 200 : `{ items: [{ actionId, status, resultJson? }] }`. `resultJson` seulement si
+  `status = "APPLIED"` et `resultJson` non null (même projection que la réponse du dépôt).
+  Un `actionId` inconnu, ou d'un autre commerce, est **absent** de `items` (l'ordre n'est pas garanti).
+- Garde : même garde S2S que les autres routes `/api/cash-deposits` (`cashHttp` → `hasServiceKey`,
+  `X-Core-Key`, 401 sinon), lecture sous `withTenant(tenantId)` (RLS).
+- Une seule requête (`findMany` filtrée sur `tenantId` et `actionId in (…)`), `select` limité à
+  `actionId`, `status`, `resultJson`. **Aucune écriture.** Jamais de `payload`, `payloadHash`,
+  enveloppe ni auteur.
+
 ## Ordre conseillé côté applicateur
 
 `claim` → pour chaque item dans l'ordre rendu : appliquer, puis `result` → `claim` à nouveau avant

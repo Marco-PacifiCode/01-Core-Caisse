@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { claimDeposits, depositActions, recordDepositResult, releaseLease, validateDepositInput } from "./cash-deposits.ts";
+import { readFileSync } from "node:fs";
+import { claimDeposits, depositActions, depositStatuses, recordDepositResult, releaseLease, validateDepositInput, validateStatusInput } from "./cash-deposits.ts";
 
 // Persistance simulée en mémoire (style de cash-deposits.test.ts) : un seul commerce par fixture.
 function fixture() {
@@ -124,4 +125,55 @@ test("réponse du dépôt : status et resultJson de la ligne après l'opération
     { actionId: c.actionId, result: "seen", status: "APPLIED" },
     { actionId: a.actionId, result: "conflict", status: "PENDING" },
   ]);
+});
+
+// ---- État des dépôts : POST /api/cash-deposits/status ----
+// Faux tx qui enregistre chaque findMany et applique le `select` (projection réelle), toute écriture est interdite.
+function statusTx(rows: any[]) {
+  const calls: any[] = [], no = async () => { throw new Error("ÉCRITURE_INTERDITE"); };
+  const tx: any = { cashDeposit: {
+    findMany: async (args: any) => { calls.push(args);
+      return rows.filter(r => r.tenantId === args.where.tenantId && args.where.actionId.in.includes(r.actionId))
+        .map(r => Object.fromEntries(Object.keys(args.select).filter(k => args.select[k]).map(k => [k, r[k] ?? null]))); },
+    create: no, update: no, updateMany: no, upsert: no, delete: no, deleteMany: no } };
+  return { tx, calls };
+}
+const fullRow = (extra: any) => ({ tenantId, actionId: randomUUID(), payload: { secret: 1 }, payloadHash: "h", actorId: "u1", actorName: "Alice",
+  sequence: 1n, formatVersion: 2, resultJson: null, status: "PENDING", ...extra });
+test("status : APPLIED+resultJson, PENDING, APPLIED sans resultJson, inconnu et autre commerce absents", async () => {
+  const applied = fullRow({ status: "APPLIED", resultJson: { saleId: "s1", n: [1, 2] } }), pending = fullRow({}),
+    bare = fullRow({ status: "APPLIED" }), other = fullRow({ tenantId: randomUUID(), status: "APPLIED", resultJson: { x: 1 } }), unknown = randomUUID();
+  const { tx, calls } = statusTx([applied, pending, bare, other]);
+  const r = await depositStatuses(tx, { tenantId, actionIds: [applied.actionId, pending.actionId.toUpperCase(), bare.actionId, other.actionId, unknown, applied.actionId] });
+  const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
+  assert.deepEqual({ ...byId.get(applied.actionId) }, { actionId: applied.actionId, status: "APPLIED", resultJson: { saleId: "s1", n: [1, 2] } });
+  assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING" });
+  assert.deepEqual({ ...byId.get(bare.actionId) }, { actionId: bare.actionId, status: "APPLIED" });
+  assert.ok(!byId.has(other.actionId) && !byId.has(unknown)); assert.equal(r.items.length, 3);
+  for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson"].includes(k)), JSON.stringify(i));
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ ...calls[0].select }, { actionId: true, status: true, resultJson: true });
+  assert.ok(!("payload" in calls[0].select) && !("payloadHash" in calls[0].select));
+  assert.equal(calls[0].where.tenantId, tenantId); assert.equal(calls[0].where.actionId.in.length, 5); // doublon retiré, casse normalisée
+});
+test("status : une seule requête pour 1000 ids", async () => {
+  const { tx, calls } = statusTx([]), ids = Array.from({ length: 1000 }, () => randomUUID());
+  assert.deepEqual({ ...(await depositStatuses(tx, { tenantId, actionIds: ids })) }, { items: [] });
+  assert.equal(calls.length, 1); assert.equal(calls[0].where.actionId.in.length, 1000);
+});
+test("status : 0 ou 1001 ids, id non uuid, tenant invalide → 400", async () => {
+  const ok = randomUUID();
+  for (const bad of [{ tenantId, actionIds: [] }, { tenantId, actionIds: Array.from({ length: 1001 }, () => randomUUID()) }, { tenantId, actionIds: [ok, "x"] },
+    { tenantId, actionIds: [5] }, { tenantId, actionIds: ok }, { tenantId }, { tenantId: "x", actionIds: [ok] }, null, []]) {
+    assert.throws(() => validateStatusInput(bad), (e: any) => e.status === 400);
+    await assert.rejects(depositStatuses(statusTx([]).tx, bad), (e: any) => e.status === 400);
+  }
+  assert.throws(() => validateStatusInput({ tenantId, actionIds: [] }), (e: any) => e.message === "INVALID_ACTION_IDS");
+});
+test("status : route sous la garde cashHttp (X-Core-Key), withTenant, aucune écriture", () => {
+  const route = readFileSync(new URL("../app/api/cash-deposits/status/route.ts", import.meta.url), "utf8");
+  assert.match(route, /return cashHttp\(req,/); assert.match(route, /withTenant\(tenantId, tx => depositStatuses\(tx, raw\)\)/);
+  assert.match(readFileSync(new URL("./cash-shared-http.ts", import.meta.url), "utf8"), /if \(!hasServiceKey\(req\)\) return response\(\{ ok: false, error: "Unauthorized" \}, 401\)/);
+  const src = readFileSync(new URL("./cash-deposits.ts", import.meta.url), "utf8"), fn = src.slice(src.indexOf("export async function depositStatuses"));
+  assert.doesNotMatch(fn, /\.(create|update|updateMany|upsert|delete|deleteMany)\(|\$executeRaw|\$queryRaw/);
 });
