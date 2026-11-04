@@ -1,5 +1,7 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+> ⛔ **main exige la migration 2026110400000 avant tout ship ; ship pendant le gel = depuis 8eb09fb** (voir « En cours »).
+
 ## 🔓 2026-10-31 — Réouverture du jour même en mode Caisse — ✅ EN LIGNE (14 h 58 NC, main `1b46ea1`, PR 113, tag `deploy/core-caisse/20261031T035806Z-1b46ea1ee6c8`)
 - Incident Rôtisserie du 31/10 : le gérant avait fermé le jour même par erreur, et la réouverture était réservée au mode Administration, ce qui bloquait le commerce. Décision de Marco : « Il ne faut jamais bloquer une réouverture, ça bloque le commerce » + « Tout compte, le jour même ».
 - `reopenCashDay` (core/lib/cash-days.ts) : le chemin `administration === true` est inchangé (DAY_MISMATCH hors du jour, DAY_ALREADY_OPEN 409). Nouveau : `reopenMode: "CAISSE_JOUR_MEME"` + actorId, accepté seulement pour le jour du commerce aujourd'hui et un occurredAt du même jour. Sinon : 200 `{ ignored: true, code: "REOUVERTURE_TARDIVE" }` + un conflit idempotent (tenant:jour:actionId), rien n'est rouvert. Journée déjà OPEN : 200 `ignored` sans conflit. Tout autre mode, ou un actorId absent : MODE_CAISSE 403. Le snapshot REOPEN porte reopenMode et l'auteur.
@@ -107,6 +109,7 @@ Clone du poste rendu **propre sur `main`** après le run. Aucune migration, aucu
 - **Livraison** (accords QCM de Marco, tracés dans `_queue/reviews/`) : 1re tentative sur `2cc4a81` remise en arrière par le moteur — témoin rouge AUSSI sur l'ancienne version : produit de démo salondemo à 0 (`INSUFFICIENT_STOCK`), chaque témoin en consommant une unité. Réassort IN de 60 par l'API Core-Stock, puis correctif du témoin (`ca3900d`, réassort idempotent sous 5 unités). 2e livraison verte : salondemo et caissedemo (journée rouverte, Z écart 0) en 14 s. Partis avec : remboursement partiel refusé pendant la synchro (`168bde2`), migration `posteId` (déjà jouée), `id` en `dbgenerated` (DEFAULT vérifié en prod).
 
 ## En cours
+- ⛔ **main exige la migration 2026110400000 avant tout ship ; ship pendant le gel = depuis 8eb09fb.** Depuis le 04/11 (PR 116 `5c26aa2` + PR 117 `bfd39f4`, lot 2A « le serveur applique les dépôts », décision Marco), Prisma lit les nouvelles colonnes de CashDeposit et la table CashDepositLease : `migrate-local.sh core-caisse 2026110400000_cash_deposit_apply` (additive) AVANT le ship, et rls.sql modifié = QCM à part (destructive_operation). Contrat : `core/docs/cash-deposits-apply.md`. Rien de livré au 04/11.
 
 - **✅ Dépôt CashDeposit (29/10)** : EN LIGNE 16 h 18 (711530a), migration et RLS jouées avant (voir en tête).
 - **Caisse journalière unique de la Rôtisserie (lot L4)** : ✅ fusionnée et DÉPLOYÉE le 16/10 au soir avec `27f3fd6` (chantier « caisse unique »). Historique des 15 relectures : `AGENT_BRIEF_ARCHIVE.md` (section du 18/10).
