@@ -87,6 +87,11 @@ export async function openCashDay(tx: CashTx, b: ActionInput) {
       "SOURCE_CONFLICT", 409);
     requireCash(prior.deviceId === b.deviceId && prior.deviceName === deviceName && prior.actorId === author.actorId
       && prior.actorName === author.actorName && prior.occurredAt.getTime() === occurredAt.getTime(), "SOURCE_CONFLICT", 409);
+  } else if (locked.currentSession.status === "CLOSED") {
+    // Q5 : ouverture rejouée sur une journée close (Z fait) — jamais de refus, ni CashDayOpening ni fait OPENING,
+    // un seul conflit par journée et par cycle (recordCashConflict est idempotent sur actionName).
+    conflicts.push({ actionName: `${day.id}:${locked.cycle}:OUVERTURE_JOUR_CLOS`, tenantId, scope: locked.scope,
+      businessDay: locked.businessDay, code: "OUVERTURE_JOUR_CLOS" });
   } else {
     await tx.cashDayOpening.create({ data: { tenantId, cashDayId: day.id, sourceKey, localSessionKey, deviceId: b.deviceId, deviceName,
       ...author, occurredAt, openingFloatXpf } });

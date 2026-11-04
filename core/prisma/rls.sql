@@ -59,3 +59,14 @@ DROP INDEX IF EXISTS "idx_sale_sync_pending";
 CREATE INDEX "idx_sale_sync_pending"
   ON "Sale" ("paidAt")
   WHERE "status" = 'PAID' AND ("comptaSyncedAt" IS NULL OR "stockSyncedAt" IS NULL);
+
+-- Bail d'application des dépôts (2026-11-04) : même isolation que CashDeposit (ENABLE + FORCE,
+-- politique par app.current_tenant). Bloc additif et rejouable : la politique n'est créée que si absente.
+DO $$
+BEGIN
+  EXECUTE 'ALTER TABLE "CashDepositLease" ENABLE ROW LEVEL SECURITY;';
+  EXECUTE 'ALTER TABLE "CashDepositLease" FORCE ROW LEVEL SECURITY;';
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = current_schema() AND tablename = 'CashDepositLease' AND policyname = 'tenant_isolation') THEN
+    EXECUTE 'CREATE POLICY tenant_isolation ON "CashDepositLease" USING ("tenantId" = NULLIF(current_setting(''app.current_tenant'', true), '''')::uuid) WITH CHECK ("tenantId" = NULLIF(current_setting(''app.current_tenant'', true), '''')::uuid);';
+  END IF;
+END $$;
