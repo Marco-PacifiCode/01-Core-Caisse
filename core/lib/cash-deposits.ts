@@ -94,7 +94,15 @@ export async function depositActions(tx: CashDepositTx, input: unknown) {
   // Avec resultJson : seule une ligne encore PENDING change ; une ligne APPLIED n'est jamais réécrite.
   for (const i of b.appliedWithResult) { const at = new Date();
     await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: i.actionId, status: "PENDING" }, data: { status: "APPLIED", appliedAt: at, resultJson: i.resultJson!, lastResultCode: "APPLIED", lastAttemptAt: at } }); }
-  return { results, applied: b.applied };
+  // État en base APRÈS l'opération (accusés `applied` compris), lu en une requête, filtré par commerce (RLS en plus).
+  const ids = results.map(r => r.actionId);
+  const rows = ids.length ? await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: ids } }, select: { actionId: true, status: true, resultJson: true } }) : [];
+  const byId = new Map(rows.map(r => [r.actionId, r]));
+  const out = results.map(r => { const row = byId.get(r.actionId);
+    // Prudence : ligne introuvable (ne devrait pas arriver) → PENDING, la tablette garde l'action.
+    const status = row?.status === "APPLIED" ? "APPLIED" : "PENDING";
+    return { ...r, status, ...(status === "APPLIED" && row?.resultJson != null ? { resultJson: row.resultJson } : {}) }; });
+  return { results: out, applied: b.applied };
 }
 export async function listDeposits(tx: CashDepositTx, input: { tenantId: string; status?: string | null; cursor?: string | null; limit?: string | number | null; withPayload?: string | null }) {
   const tenantId = uuid(input.tenantId), status = input.status ?? undefined;

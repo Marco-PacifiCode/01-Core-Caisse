@@ -109,3 +109,19 @@ test("applied : UUID seul inchangé, objet avec resultJson, ligne APPLIED jamais
     assert.throws(() => validateDepositInput({ tenantId, actions: [], applied: [bad] }), (e: any) => e.message === "INVALID_APPLIED" && e.status === 400);
   assert.equal(f.rows.get(c.actionId).status, "PENDING");
 });
+test("réponse du dépôt : status et resultJson de la ligne après l'opération", async () => {
+  const f = fixture(), a = v2(1), b = v2(2), c = v2(3);
+  const first = await depositActions(f.tx, { tenantId, actions: [a] });
+  assert.deepEqual({ ...first.results[0] }, { actionId: a.actionId, result: "stored", status: "PENDING" });
+  assert.ok(!("resultJson" in first.results[0]));
+  await depositActions(f.tx, { tenantId, actions: [b, c] });
+  const { token } = await claimDeposits(f.tx, { tenantId, holder: "s", limit: 10 });
+  await recordDepositResult(f.tx, { tenantId, token, actionId: b.actionId, outcome: "APPLIED", resultJson: { saleId: "s1" } });
+  await depositActions(f.tx, { tenantId, actions: [], applied: [c.actionId] });
+  const r = await depositActions(f.tx, { tenantId, actions: [b, c, { ...a, payload: { autre: true } }] });
+  assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
+    { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s1" } },
+    { actionId: c.actionId, result: "seen", status: "APPLIED" },
+    { actionId: a.actionId, result: "conflict", status: "PENDING" },
+  ]);
+});

@@ -171,6 +171,27 @@ test("applied accusé par la tablette : objet avec resultJson, ligne APPLIED jam
     await assert.rejects(deposits.depositActions(tx, { tenantId, actions: [], applied: [{ actionId: b.actionId }] }), (e: any) => e.message === "INVALID_APPLIED");
   });
 });
+test("réponse du dépôt : status/resultJson après l'opération, conflict, isolation de tenant", async () => {
+  const tenantA = randomUUID(), tenantB = randomUUID();
+  await rolledBack(tenantB, async tx => {
+    const a = v2("tab-a", 1), b = v2("tab-a", 2), c = v2("tab-a", 3);
+    // B : la même action, APPLIED avec un resultJson ; A ne doit jamais la voir.
+    await deposits.depositActions(tx, { tenantId: tenantB, actions: [a] });
+    await deposits.depositActions(tx, { tenantId: tenantB, actions: [], applied: [{ actionId: a.actionId, resultJson: { saleId: "b" } }] });
+    await asTenant(tx, tenantA);
+    const first = await deposits.depositActions(tx, { tenantId: tenantA, actions: [a, b, c] });
+    assert.deepEqual(JSON.parse(JSON.stringify(first.results)), [a, b, c].map(x => ({ actionId: x.actionId, result: "stored", status: "PENDING" })));
+    const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "s", limit: 10 });
+    await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: b.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
+    await deposits.depositActions(tx, { tenantId: tenantA, actions: [], applied: [c.actionId] });
+    const r = await deposits.depositActions(tx, { tenantId: tenantA, actions: [b, c, { ...a, payload: { autre: true } }] });
+    assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
+      { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s-1" } },
+      { actionId: c.actionId, result: "seen", status: "APPLIED" },
+      { actionId: a.actionId, result: "conflict", status: "PENDING" },
+    ]);
+  });
+});
 const counts = async (tx: Tx, tenantId: string, cashDayId: string) => ({
   openings: await tx.cashDayOpening.count({ where: { tenantId, cashDayId } }),
   openingFacts: await tx.cashDayEvent.count({ where: { tenantId, cashDayId, kind: "OPENING" } }),
