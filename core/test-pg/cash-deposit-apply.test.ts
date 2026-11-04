@@ -420,3 +420,24 @@ test("K5 : receivedFrom sans fuseau → 400, date seule et fuseau explicite acce
       assert.ok(Array.isArray((await deposits.listDeposits(tx, { tenantId, receivedFrom: ok })).items));
   });
 });
+test("depositState en base : resultJson d'avant (format 1, ou format 2 sans lastResultCode 'APPLIED') jamais servi ; format 2 'APPLIED' servi", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const old = legacy(), legacyV2 = v2("tab-a", 1), byTablet = v2("tab-a", 2), server = v2("tab-a", 3);
+    await deposits.depositActions(tx, { tenantId, actions: [old, legacyV2, byTablet, server] });
+    const seed = (actionId: string, resultJson: Record<string, string>, lastResultCode: string | null) =>
+      tx.cashDeposit.update({ where: { tenantId_actionId: { tenantId, actionId } }, data: { status: "APPLIED", appliedAt: now, resultJson, lastResultCode } });
+    await seed(old.actionId, { saleId: "ancien-f1" }, "APPLIED");
+    await seed(legacyV2.actionId, { saleId: "ancien-f2" }, null);
+    await seed(byTablet.actionId, { saleId: "tablette" }, "APPLIED_PAR_TABLETTE");
+    await seed(server.actionId, { saleId: "serveur" }, "APPLIED");
+    const ids = [old.actionId, legacyV2.actionId, byTablet.actionId, server.actionId];
+    const expected: any[] = [old, legacyV2, byTablet].map(x => ({ actionId: x.actionId, status: "APPLIED" }));
+    expected.push({ actionId: server.actionId, status: "APPLIED", resultJson: { saleId: "serveur" } });
+    const st = await deposits.depositStatuses(tx, { tenantId, actionIds: ids });
+    const byId = new Map(JSON.parse(JSON.stringify(st.items)).map((i: any) => [i.actionId, i]));
+    assert.deepEqual(ids.map(id => byId.get(id)), expected, "/status");
+    const r = await deposits.depositActions(tx, { tenantId, actions: [old, legacyV2, byTablet, server] });
+    assert.deepEqual(JSON.parse(JSON.stringify(r.results)).map(({ result, ...x }: any) => x), expected, "réponse du dépôt");
+  });
+});

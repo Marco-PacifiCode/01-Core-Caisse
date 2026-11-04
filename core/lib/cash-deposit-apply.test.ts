@@ -339,3 +339,21 @@ test("K6 format 1 sans appareil (vieille tablette, lot sans actions) → APPLIED
   assert.deepEqual(r.appliedIgnores, []);
   assert.equal(f.rows.get(legacy.actionId).status, "APPLIED"); assert.equal(f.rows.get(legacy.actionId).resultJson, null);
 });
+// Garde du filtre de service de depositState : un resultJson en base n'est servi que pour format 2 + lastResultCode 'APPLIED'.
+test("depositState : resultJson d'avant (format 1, ou format 2 sans lastResultCode 'APPLIED') jamais servi ; format 2 'APPLIED' servi", async () => {
+  const f = fixture(), old = v1(), legacyV2 = v2(1), byTablet = v2(2), server = v2(3);
+  await depositActions(f.tx, { tenantId, actions: [old, legacyV2, byTablet, server] });
+  const seed = (id: string, extra: any) => f.rows.set(id, { ...f.rows.get(id), status: "APPLIED", appliedAt: new Date(), ...extra });
+  seed(old.actionId, { resultJson: { saleId: "ancien-f1" }, lastResultCode: "APPLIED" });
+  seed(legacyV2.actionId, { resultJson: { saleId: "ancien-f2" }, lastResultCode: null });
+  seed(byTablet.actionId, { resultJson: { saleId: "tablette" }, lastResultCode: "APPLIED_PAR_TABLETTE" });
+  seed(server.actionId, { resultJson: { saleId: "serveur" }, lastResultCode: "APPLIED" });
+  const ids = [old.actionId, legacyV2.actionId, byTablet.actionId, server.actionId];
+  const expected = [old, legacyV2, byTablet].map(x => ({ actionId: x.actionId, status: "APPLIED" }))
+    .concat([{ actionId: server.actionId, status: "APPLIED", resultJson: { saleId: "serveur" } } as any]);
+  const st = await depositStatuses(f.tx, { tenantId, actionIds: ids });
+  const byId = new Map(st.items.map((i: any) => [i.actionId, JSON.parse(JSON.stringify(i))]));
+  assert.deepEqual(ids.map(id => byId.get(id)), expected, "/status");
+  const r = await depositActions(f.tx, { tenantId, actions: [old, legacyV2, byTablet, server] });
+  assert.deepEqual(JSON.parse(JSON.stringify(r.results)).map(({ result, ...x }: any) => x), expected, "réponse du dépôt");
+});
