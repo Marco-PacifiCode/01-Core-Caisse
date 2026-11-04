@@ -156,7 +156,9 @@ export async function listDeposits(tx: CashDepositTx, input: { tenantId: string;
   }
   const select = { id: true, tenantId: true, actionId: true, deviceId: true, deviceName: true, kind: true, operation: true, entityKey: true,
     ...(input.withPayload === "1" ? { payload: true } : {}), dependsOn: true, payloadHash: true, clientCreatedAt: true, clientState: true,
-    clientErrorCode: true, receivedAt: true, lastSeenAt: true, status: true, appliedAt: true, conflictCount: true } as const;
+    clientErrorCode: true, receivedAt: true, lastSeenAt: true, status: true, appliedAt: true, conflictCount: true,
+    // Règle de clôture de l'applicateur : renoncée (lastResultCode) ou format 1 → Z au rejeu de la tablette.
+    formatVersion: true, lastResultCode: true } as const;
   const rows = await tx.cashDeposit.findMany({ where: { tenantId, ...(status ? { status } : {}), ...(deviceId ? { deviceId } : {}), ...(receivedFrom ? { receivedAt: { gte: receivedFrom } } : {}), ...(cursor ? { OR: [{ receivedAt: { gt: cursor.receivedAt } }, { receivedAt: cursor.receivedAt, id: { gt: cursor.id } }] } : {}) },
     select, orderBy: [{ receivedAt: "asc" }, { id: "asc" }], take: limit + 1 });
   const more = rows.length > limit, page = rows.slice(0, limit);
