@@ -330,3 +330,24 @@ test("R2 : 100 REJEU_TABLETTE puis 1 neuf → claim limit 100 renvoie le neuf ; 
     assert.ok(item, "re-claimable après remise à zéro"); assert.equal(item.conflictCount, 1);
   });
 });
+test("R1 appareil avant C1 : B sur ligne de A (jamais tentée, EN_ATTENTE, REJEU_TABLETTE) → AUTRE_APPAREIL ; A sur sa ligne jamais tentée → silence ; inconnu → APPAREIL_INCONNU", async () => {
+  const tenantId = randomUUID();
+  await rolledBack(tenantId, async tx => {
+    const fresh = v2("tab-a", 1), waiting = v2("tab-a", 2), renounced = v2("tab-a", 3);
+    await deposits.depositActions(tx, { tenantId, actions: [fresh, waiting, renounced] });
+    await markPg(tx, tenantId, waiting.actionId, "EN_ATTENTE"); await markPg(tx, tenantId, renounced.actionId, "REJEU_TABLETTE");
+    const ids = [fresh.actionId, waiting.actionId, renounced.actionId];
+    const before = await Promise.all(ids.map(id => rowPg(tx, tenantId, id)));
+    const fromB = await deposits.depositActions(tx, { tenantId, deviceId: "tab-b", actions: [], applied: ids.map(actionId => ({ actionId, resultJson: { saleId: "faux" } })) });
+    const got = JSON.parse(JSON.stringify(fromB.appliedIgnores)).sort((x: any, y: any) => x.actionId.localeCompare(y.actionId));
+    assert.deepEqual(got, [...ids].sort().map(actionId => ({ actionId, code: "AUTRE_APPAREIL" })));
+    for (const [i, id] of ids.entries()) { const r = await rowPg(tx, tenantId, id);
+      assert.equal(r.status, "PENDING"); assert.equal(r.resultJson, null); assert.equal(r.lastResultCode, before[i].lastResultCode); assert.equal(r.conflictCount, before[i].conflictCount); }
+    const own = await deposits.depositActions(tx, { tenantId, deviceId: "tab-a", actions: [], applied: [fresh.actionId] });
+    assert.equal(own.appliedIgnores.length, 0);
+    const r = await rowPg(tx, tenantId, fresh.actionId); assert.equal(r.status, "PENDING"); assert.equal(r.lastResultCode, null);
+    const unknown = await deposits.depositActions(tx, { tenantId, actions: [], applied: [fresh.actionId] });
+    assert.deepEqual(JSON.parse(JSON.stringify(unknown.appliedIgnores)), [{ actionId: fresh.actionId, code: "APPAREIL_INCONNU" }]);
+    assert.equal((await rowPg(tx, tenantId, fresh.actionId)).status, "PENDING");
+  });
+});

@@ -38,20 +38,22 @@ produit jamais.
 - **Format 1** : comportement historique inchangé, sans contrôle d'appareil. UUID seul → PENDING →
   APPLIED + `appliedAt`. Objet → APPLIED avec ce `resultJson`, `appliedAt`, `lastResultCode 'APPLIED'`,
   `lastAttemptAt`.
-- **Format 2, règle C1** : un `applied` (UUID ou objet) n'est honoré que si le serveur a renoncé à
-  l'appliquer, c'est-à-dire si `lastResultCode` n'est ni null ni `'EN_ATTENTE'`. Sinon il est ignoré
-  sans être signalé : la ligne reste PENDING et le serveur l'appliquera.
-- **Format 2, garde de l'appareil** : si C1 passe, l'appareil qui accuse doit être celui de la ligne.
-  On prend le `deviceId` du lot. S'il est absent et que toutes les actions du lot portent le même
-  `deviceId`, on prend celui-là. Sinon l'appareil est inconnu.
+- **Format 2, 1) garde de l'appareil, contrôlée AVANT C1** : l'appareil qui accuse doit être celui
+  de la ligne. On prend le `deviceId` du lot. S'il est absent et que toutes les actions du lot portent
+  le même `deviceId`, on prend celui-là. Sinon l'appareil est inconnu. Quel que soit `lastResultCode`
+  (null, `'EN_ATTENTE'` ou marque de renoncement) :
   - Appareil inconnu → ignoré, `appliedIgnores` reçoit `{ actionId, code: 'APPAREIL_INCONNU' }`.
   - Appareil différent → ignoré, `appliedIgnores` reçoit `{ actionId, code: 'AUTRE_APPAREIL' }`.
   - Une ligne ignorée ne change pas (pas de `conflictCount`). Le Core n'écrit aucun conflit : c'est la
     surface qui transforme `AUTRE_APPAREIL` en conflit.
-  - Même appareil → APPLIED **sans `resultJson`** (le `resultJson` fourni est ignoré), `appliedAt`,
-    `lastAttemptAt`, `lastResultCode 'APPLIED_PAR_TABLETTE'`.
-- `appliedIgnores` vaut toujours un tableau (vide le plus souvent). Les `applied` ignorés par C1 n'y
-  figurent pas.
+- **Format 2, 2) même appareil, règle C1** : l'`applied` (UUID ou objet) n'est honoré que si le serveur
+  a renoncé à l'appliquer, c'est-à-dire si `lastResultCode` n'est ni null ni `'EN_ATTENTE'`. La ligne
+  passe alors APPLIED **sans `resultJson`** (le `resultJson` fourni est ignoré), avec `appliedAt`,
+  `lastAttemptAt` et `lastResultCode 'APPLIED_PAR_TABLETTE'`. Sinon l'`applied` est ignoré sans
+  signalement : la ligne reste PENDING et le serveur l'appliquera.
+- `appliedIgnores` vaut toujours un tableau (vide le plus souvent). Seules les lignes de format 2
+  encore PENDING sont contrôlées : un `applied` sur une ligne déjà APPLIED, inconnue ou d'un autre
+  commerce n'y figure pas.
 
 ### Remise à zéro de la marque
 

@@ -105,21 +105,24 @@ export async function depositActions(tx: CashDepositTx, input: unknown) {
   // Avec resultJson : seule une ligne encore PENDING change ; une ligne APPLIED n'est jamais réécrite.
   for (const i of b.appliedWithResult) { const at = new Date();
     await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: i.actionId, status: "PENDING", formatVersion: 1 }, data: { status: "APPLIED", appliedAt: at, resultJson: i.resultJson!, lastResultCode: "APPLIED", lastAttemptAt: at } }); }
-  // Format 2 (R1) : seul le serveur produit un resultJson. L'affirmation de la tablette n'est honorée que si le serveur a renoncé
-  // (lastResultCode ni null ni EN_ATTENTE) : APPLIED SANS resultJson (le resultJson fourni est ignoré). Sinon ignorée, la ligne reste PENDING.
-  // Garde de l'appareil : seule la tablette propriétaire de la ligne peut l'accuser. Appareil = deviceId du lot, sinon celui,
-  // unique, de toutes les actions du lot ; sinon inconnu. Appareil absent ou différent → ignoré et signalé (aucune écriture, aucun conflit).
+  // Format 2 (R1) : seul le serveur produit un resultJson.
+  // 1) Garde de l'appareil, AVANT C1 : appareil = deviceId du lot, sinon celui, unique, de toutes les actions du lot, sinon inconnu.
+  //    Inconnu ou différent de celui de la ligne → ignoré et signalé quel que soit lastResultCode (aucune écriture, aucun conflit).
+  // 2) Même appareil, règle C1 : honoré seulement si le serveur a renoncé (lastResultCode ni null ni EN_ATTENTE), APPLIED SANS
+  //    resultJson (celui fourni est ignoré) ; sinon ignoré sans signalement, la ligne reste PENDING.
   const appliedIgnores: { actionId: string; code: "AUTRE_APPAREIL" | "APPAREIL_INCONNU" }[] = [];
   if (b.applied.length) {
     const lotDevices = [...new Set(b.actions.map(a => a.deviceId))];
     const device = b.deviceId ?? (lotDevices.length === 1 ? lotDevices[0] : null);
-    const renounced = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.applied }, status: "PENDING", formatVersion: 2,
-      lastResultCode: { not: null, notIn: [...CLAIMABLE_CODES] } }, select: { actionId: true, deviceId: true } });
+    // Contrôle de l'appareil AVANT C1 : un autre appareil ou un appareil inconnu est signalé quel que soit lastResultCode.
+    const targeted = await tx.cashDeposit.findMany({ where: { tenantId: b.tenantId, actionId: { in: b.applied }, status: "PENDING", formatVersion: 2 },
+      select: { actionId: true, deviceId: true, lastResultCode: true } });
     const honored: string[] = [];
-    for (const r of renounced) {
+    for (const r of targeted) {
       if (device === null) appliedIgnores.push({ actionId: r.actionId, code: "APPAREIL_INCONNU" });
       else if (r.deviceId !== device) appliedIgnores.push({ actionId: r.actionId, code: "AUTRE_APPAREIL" });
-      else honored.push(r.actionId);
+      // Même appareil : C1, honoré seulement si le serveur a renoncé ; sinon ignoré sans signalement.
+      else if (r.lastResultCode != null && !(CLAIMABLE_CODES as readonly string[]).includes(r.lastResultCode)) honored.push(r.actionId);
     }
     if (honored.length) { const at = new Date();
       await tx.cashDeposit.updateMany({ where: { tenantId: b.tenantId, actionId: { in: honored }, status: "PENDING", formatVersion: 2, lastResultCode: { not: null, notIn: [...CLAIMABLE_CODES] } },

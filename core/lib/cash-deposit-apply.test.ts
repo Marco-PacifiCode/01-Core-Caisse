@@ -268,11 +268,30 @@ test("appareil : déduit des actions du lot (toutes de A) ; lot mixte ou vide sa
   const inferred = await depositActions(f.tx, { tenantId, actions: [x, y], applied: [a.actionId] });
   assert.deepEqual(inferred.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).lastResultCode, "APPLIED_PAR_TABLETTE");
 });
-test("appareil : C1 passe d'abord (jamais tenté → ni appliqué ni signalé) ; format 1 sans contrôle ; deviceId invalide → 400", async () => {
+test("appareil avant C1 : B sur une ligne de A jamais tentée / EN_ATTENTE / REJEU_TABLETTE → AUTRE_APPAREIL, inchangée", async () => {
+  for (const code of [null, "EN_ATTENTE", "REJEU_TABLETTE"]) {
+    const f = fixture(), a = v2(1);
+    await depositActions(f.tx, { tenantId, actions: [a] }); mark(f, a.actionId, code);
+    const before = { ...f.rows.get(a.actionId) };
+    const r = await depositActions(f.tx, { tenantId, deviceId: "tab-b", actions: [], applied: [{ actionId: a.actionId, resultJson: { saleId: "faux" } }] });
+    assert.deepEqual(r.appliedIgnores.map(i => ({ ...i })), [{ actionId: a.actionId, code: "AUTRE_APPAREIL" }], String(code));
+    assert.deepEqual({ ...f.rows.get(a.actionId) }, before, String(code));
+  }
+});
+test("appareil avant C1 : A sur sa ligne jamais tentée → ignorée sans signalement ; inconnu sur ligne jamais tentée → APPAREIL_INCONNU", async () => {
+  const f = fixture(), a = v2(1);
+  await depositActions(f.tx, { tenantId, actions: [a] });
+  const own = await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [a.actionId] });
+  assert.deepEqual(own.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).status, "PENDING"); assert.equal(f.rows.get(a.actionId).lastResultCode, null);
+  const none = await depositActions(f.tx, { tenantId, actions: [], applied: [a.actionId] });
+  assert.deepEqual(none.appliedIgnores.map(i => ({ ...i })), [{ actionId: a.actionId, code: "APPAREIL_INCONNU" }]);
+  assert.equal(f.rows.get(a.actionId).status, "PENDING"); assert.equal(f.rows.get(a.actionId).lastResultCode, null);
+});
+test("appareil : format 1 sans contrôle ; deviceId invalide → 400", async () => {
   const f = fixture(), a = v2(1), legacy = v1();
   await depositActions(f.tx, { tenantId, actions: [a, legacy] });
-  const r = await depositActions(f.tx, { tenantId, deviceId: "tab-b", actions: [], applied: [a.actionId, legacy.actionId] });
-  assert.deepEqual(r.appliedIgnores, []); assert.equal(f.rows.get(a.actionId).status, "PENDING"); assert.equal(f.rows.get(legacy.actionId).status, "APPLIED");
+  const r = await depositActions(f.tx, { tenantId, deviceId: "tab-b", actions: [], applied: [legacy.actionId] });
+  assert.deepEqual(r.appliedIgnores, []); assert.equal(f.rows.get(legacy.actionId).status, "APPLIED");
   for (const bad of ["", "a b", "x".repeat(81), 5, "é"])
     assert.throws(() => validateDepositInput({ tenantId, deviceId: bad, actions: [], applied: [a.actionId] }), (e: any) => e.message === "INVALID_DEVICE_ID" && e.status === 400);
 });
