@@ -72,6 +72,8 @@ additifs, appliqués dans la requête :
   avec un fuseau explicite (`Z` ou `±hh:mm`) ; filtre `receivedAt >= receivedFrom`. Une heure sans
   fuseau, ou une date invalide, donne 400 `INVALID_RECEIVED_FROM`.
 Sans ces filtres, le comportement ne change pas.
+Chaque élément porte aussi `formatVersion` et `lastResultCode` (champs ajoutés) : la règle de clôture de
+l'applicateur envoie le Z au rejeu de la tablette dès qu'une pièce du jour est renoncée ou de format 1.
 
 ## Bail
 
