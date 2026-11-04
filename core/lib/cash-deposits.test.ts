@@ -36,6 +36,7 @@ test("décide stored, seen, conflict et applied", async () => {
   const rows = new Map<string, any>(); let now = Date.now();
   const tx: any = { $queryRaw: async () => [], cashDeposit: {
     findUnique: async ({ where }: any) => rows.get(where.tenantId_actionId.actionId) ?? null,
+    findMany: async ({ where }: any) => [...rows.values()].filter((row: any) => row.tenantId === where.tenantId && where.actionId.in.includes(row.actionId)),
     create: async ({ data }: any) => { rows.set(data.actionId, { ...data, lastSeenAt: new Date(now), status: "PENDING" }); },
     update: async ({ where, data }: any) => { const row = rows.get(where.tenantId_actionId.actionId); rows.set(row.actionId, { ...row, ...data, conflictCount: data.conflictCount?.increment ? (row.conflictCount ?? 0) + data.conflictCount.increment : row.conflictCount ?? 0 }); },
     updateMany: async ({ where, data }: any) => { for (const id of where.actionId.in) { const row = rows.get(id); if (row?.tenantId === where.tenantId && (!where.status || row.status === where.status)) rows.set(id, { ...row, ...data }); } },

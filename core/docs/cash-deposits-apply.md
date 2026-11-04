@@ -22,6 +22,14 @@ encore PENDING passe APPLIED avec ce `resultJson`, `appliedAt`, `lastResultCode 
 Objet malformé (actionId non UUID, `resultJson` absent ou non objet, clé inconnue) → 400 `INVALID_APPLIED`.
 `formatVersion` autre → 400 `INVALID_FORMAT_VERSION` ; `sequence` invalide → 400 `INVALID_SEQUENCE`.
 
+Réponse : `{ results, applied }`. Chaque élément de `results` (`stored`, `seen`, `conflict`) garde
+`{ actionId, result }` et ajoute (champs ajoutés seulement, l'ancienne tablette les ignore) :
+`status` (`'PENDING' | 'APPLIED'`) de la ligne en base **après** l'opération (accusés `applied` du
+même appel compris), et `resultJson` seulement si `status = 'APPLIED'` et `resultJson` non null
+(UUID seul accusé → `APPLIED` sans `resultJson`). Sur `conflict`, c'est le statut de la ligne existante.
+Lecture groupée unique (`findMany` sur les actionId du lot), filtrée par `tenantId` sous RLS.
+Une action `APPLIED` est accusée par la tablette sans être renvoyée.
+
 ## Bail
 
 Une ligne `CashDepositLease` par commerce : `holder`, `token`, `until`. Durée : 60 s, renouvelée à
