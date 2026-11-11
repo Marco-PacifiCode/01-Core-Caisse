@@ -39,11 +39,19 @@ DO $$ BEGIN
     REVOKE ALL ON "TenantMaquette" FROM core_caisse_app;
     GRANT SELECT ON "TenantMaquette" TO core_caisse_app;
   END IF;
+  -- Cron de reprise (lib/repair-sweep.ts, CRON_DATABASE_URL) : il exclut les maquettes de ses requêtes
+  -- multi-tenants et doit donc LIRE le registre. SELECT seul.
+  -- ⚠️ À VÉRIFIER À LA LIVRAISON : le registre doit rester lisible par le rôle RÉEL de
+  -- CRON_DATABASE_URL (mesuré le 11/11 : aucun rôle core_caisse_cron en prod ; rôles BYPASSRLS =
+  -- postgres, geckopilote_owner). Sinon le passage du cron échoue (erreur remontée, pas d'exclusion muette).
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'core_caisse_cron') THEN
+    GRANT SELECT ON "TenantMaquette" TO core_caisse_cron;
+  END IF;
 END $$;
 
 -- ── Inscription ──────────────────────────────────────────────────────────────────────────────────
 -- Vrai = inscrit maintenant ; faux = déjà inscrit. Refus si le tenant a déjà une vente, un
--- remboursement ou un fait l4 : une démo ne devient jamais un vrai commerce, et un vrai commerce
+-- remboursement, un fait l4 ou la moindre autre ligne : une démo ne devient jamais un vrai commerce, et un vrai commerce
 -- ne devient jamais une démo.
 CREATE OR REPLACE FUNCTION inscrire_tenant_maquette(p_tenant uuid) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $fn$
@@ -64,7 +72,17 @@ BEGIN
     RETURN false;
   END IF;
 
-  FOREACH t IN ARRAY ARRAY['CashDayEvent', 'CashDayClosure', 'CashDayOpening', 'CashDaySession', 'Sale', 'PartialRefund'] LOOP
+  -- TOUTES les tables portant "tenantId" (hors registre) : un vrai marchand sans vente mais avec des
+  -- bons, des postes ou des réglages n'est jamais inscrit (lib/maquette.test.ts casse si une manque).
+  FOREACH t IN ARRAY ARRAY[
+-- BEGIN:inscription
+    'CashDayEvent', 'CashDayClosure', 'CashDayOpening', 'CashDaySession', 'PartialRefund', 'SaleLine',
+    'SalePayment', 'VoidAction', 'Sale', 'PickupOrder', 'CashMovement', 'CashSessionReopen',
+    'CashDay', 'CashSession', 'LoyaltyEntry', 'LoyaltyAccount', 'LoyaltyProgram', 'GiftCard',
+    'GiftCardOrder', 'Poste', 'CashSettings', 'CaisseSyncAction', 'ParkedBasket', 'CashDeposit',
+    'CashDepositLease'
+-- END:inscription
+  ] LOOP
     EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM %I WHERE "tenantId" = $1)', t) INTO v_existe USING p_tenant;
     IF v_existe THEN
       RAISE EXCEPTION 'MAQUETTE_INSCRIPTION_REFUSEE : le tenant a deja des lignes dans %', t
@@ -103,7 +121,9 @@ DECLARE
   v_stmt_avant text := pg_catalog.current_setting('statement_timeout');
 BEGIN
   -- Jamais de queue devant les caisses : un verrou tenu fait échouer l'effacement (repris la nuit suivante).
-  PERFORM pg_catalog.set_config('lock_timeout', '3s', true);
+  -- 500 ms, SOUS le deadlock_timeout (1 s) : sur tout autre verrou, c'est toujours cette fonction qui
+  -- abandonne la première, jamais une écriture de caisse.
+  PERFORM pg_catalog.set_config('lock_timeout', '500ms', true);
   PERFORM pg_catalog.set_config('statement_timeout', '30s', true);
   IF p_tenant IS NULL THEN
     RAISE EXCEPTION 'MAQUETTE_NON_INSCRITE : tenant absent' USING ERRCODE = 'check_violation';
@@ -152,6 +172,16 @@ BEGIN
     RAISE EXCEPTION 'MAQUETTE_PLAFOND : % lignes', v_total USING ERRCODE = 'check_violation';
   END IF;
 
+  -- Les 4 verrous de table d'un coup ou pas du tout (NOWAIT) : la fonction n'attend jamais une caisse
+  -- pendant qu'une caisse l'attend, donc aucun cycle (40P01) possible. Une caisse qui écrit à cet
+  -- instant → échec immédiat 55P03 → 503 CAISSE_OCCUPEE, nouvel essai la nuit suivante. Les verrous
+  -- de ligne ne concernent que les lignes du tenant de démo.
+  -- Pendant l'effacement, les écritures des AUTRES caisses attendent (au plus la durée de l'instruction).
+  -- Mesuré le 2026-11-11 sur base jetable postgres:16 (poste de dev) : démo de 30 jours × 40 tickets
+  -- (1 200 ventes, ~6 200 lignes avec lignes de vente, règlements et faits l4) → médiane de 3 essais
+  -- 217 ms (180, 217, 221 ms).
+  LOCK TABLE "CashDayEvent", "CashDayClosure", "CashDayOpening", "CashDaySession" IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+
 -- BEGIN:desactivation
   ALTER TABLE "CashDayEvent" DISABLE TRIGGER cash_event_immutable;
   ALTER TABLE "CashDayClosure" DISABLE TRIGGER cash_closure_immutable;
@@ -176,6 +206,12 @@ BEGIN
   GET DIAGNOSTICS n = ROW_COUNT; v_compteurs := v_compteurs || jsonb_build_object('SalePayment', n);
   DELETE FROM "VoidAction" WHERE "tenantId" = p_tenant;
   GET DIAGNOSTICS n = ROW_COUNT; v_compteurs := v_compteurs || jsonb_build_object('VoidAction', n);
+  -- La suppression d'une Sale cascade vers SaleLine/SalePayment par une clé simple (saleId). Une ligne
+  -- d'un AUTRE tenant ne serait atteinte que si des données étaient déjà incohérentes entre tenants.
+  -- Mesuré en prod le 2026-11-11, tenant par tenant sous RLS (46 tenants, 14 avec ventes) : 0 SaleLine
+  -- et 0 SalePayment dont le tenant diffère de celui de leur vente. Durcissement (FK composites
+  -- tenantId+saleId) : chantier à part. Limite de la mesure : seuls les tenants connus de Core-Auth
+  -- ont été lus ; un tenant présent dans Caisse mais absent de Core-Auth ne l'a pas été.
   UPDATE "PickupOrder" SET "saleId" = NULL WHERE "tenantId" = p_tenant AND "saleId" IS NOT NULL;
   DELETE FROM "Sale" WHERE "tenantId" = p_tenant;
   GET DIAGNOSTICS n = ROW_COUNT; v_compteurs := v_compteurs || jsonb_build_object('Sale', n);

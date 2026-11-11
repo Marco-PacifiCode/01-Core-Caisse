@@ -245,9 +245,12 @@ test("effacement : seuls les 4 déclencheurs l4 sont désactivés, et tous réac
   assert.deepEqual(reactives, attendus);
   assert.equal((corps.match(/DISABLE TRIGGER/g) ?? []).length, 4, "aucun DISABLE TRIGGER ALL/USER");
   assert.doesNotMatch(corps, /session_replication_role/);
+  // Les 4 verrous de table pris d'un coup, sans attente, AVANT le premier ALTER.
+  const lock = corps.indexOf('LOCK TABLE "CashDayEvent", "CashDayClosure", "CashDayOpening", "CashDaySession" IN SHARE ROW EXCLUSIVE MODE NOWAIT;');
+  assert.ok(lock > 0 && lock < corps.indexOf("ALTER TABLE"), "LOCK … NOWAIT avant tout ALTER");
   // lock_timeout / statement_timeout posés AVANT le premier ALTER.
   const premierAlter = corps.indexOf("ALTER TABLE");
-  assert.ok(corps.indexOf("set_config('lock_timeout', '3s', true)") > 0 && corps.indexOf("set_config('lock_timeout', '3s', true)") < premierAlter);
+  assert.ok(corps.indexOf("set_config('lock_timeout', '500ms', true)") > 0 && corps.indexOf("set_config('lock_timeout', '500ms', true)") < premierAlter);
   assert.ok(corps.indexOf("set_config('statement_timeout', '30s', true)") > 0 && corps.indexOf("set_config('statement_timeout', '30s', true)") < premierAlter);
   // Le contexte du tenant est posé avant les contrôles.
   assert.ok(corps.indexOf("set_config('app.current_tenant', p_tenant::text, true)") < corps.indexOf("FROM \"TenantMaquette\""));
@@ -263,6 +266,10 @@ test("effacement : couvre TOUTES les tables de schema.prisma portant tenantId (u
   assert.deepEqual([...effacees].sort(), avecTenant);
   assert.deepEqual([...comptees].sort(), avecTenant);
   assert.deepEqual(comptees, effacees, "comptage et effacement dans le même ordre");
+  // Inscription : refus sur la MOINDRE ligne de n'importe quelle table portant tenantId.
+  const debutInscr = SQL.indexOf("CREATE OR REPLACE FUNCTION inscrire_tenant_maquette");
+  const inscription = [...entre(SQL.slice(debutInscr, SQL.indexOf("$fn$;", debutInscr)), "inscription").matchAll(/'(\w+)'/g)].map((m) => m[1]);
+  assert.deepEqual([...inscription].sort(), avecTenant, "inscription : toutes les tables portant tenantId");
   // Enfants avant parents.
   const avant = (a: string, b: string) => assert.ok(effacees.indexOf(a) < effacees.indexOf(b), `${a} avant ${b}`);
   for (const [a, b] of [["CashDayEvent", "Sale"], ["CashDayEvent", "PartialRefund"], ["CashDayEvent", "CashDay"], ["CashDayClosure", "CashSession"],
@@ -273,11 +280,23 @@ test("effacement : couvre TOUTES les tables de schema.prisma portant tenantId (u
   assert.ok(corps.indexOf('DELETE FROM "TenantMaquette"') > corps.indexOf("-- END:reactivation"));
 });
 
+test("cron de reprise : sélection, neutralisations et compteur excluent les maquettes", () => {
+  const src = readFileSync(path.join(ICI, "repair-sweep.ts"), "utf8");
+  assert.match(src, /where: sansMaquettes\(pendingSalesWhere\(\), maquettes\)/);
+  assert.match(src, /where: sansMaquettes\(\{ status: "VOID".*\}, maquettes\)/);
+  assert.match(src, /count\(\{ where: sansMaquettes\(stuckSalesWhere\(\), maquettes\) \}\)/);
+  assert.equal((src.match(/cronPrisma\.sale\.(findMany|count)\(/g) ?? []).length, 3, "aucune autre requête multi-tenant non filtrée");
+  // Lecture du registre en échec : l'erreur remonte (pas de try/catch qui garderait tout).
+  assert.match(src, /const maquettes = await tenantsMaquette\(cronPrisma\);/);
+  assert.doesNotMatch(src.slice(src.indexOf("sweepPendingSales"), src.indexOf("tenantsMaquette(cronPrisma)") + 40), /catch/);
+  assert.match(SQL, /GRANT SELECT ON "TenantMaquette" TO core_caisse_cron;/);
+  assert.doesNotMatch(SQL, /GRANT (INSERT|UPDATE|DELETE|ALL)[^;]*TO core_caisse_cron/);
+});
+
 test("inscription : refus si ventes, remboursements ou faits l4 ; aucun droit d'écriture direct", () => {
   const debut = SQL.indexOf("CREATE OR REPLACE FUNCTION inscrire_tenant_maquette");
   const corps = SQL.slice(debut, SQL.indexOf("$fn$;", debut));
   assert.match(corps, /SECURITY DEFINER/);
-  assert.match(corps, /ARRAY\['CashDayEvent', 'CashDayClosure', 'CashDayOpening', 'CashDaySession', 'Sale', 'PartialRefund'\]/);
   assert.match(corps, /MAQUETTE_INSCRIPTION_REFUSEE/);
   assert.match(SQL, /REVOKE ALL ON "TenantMaquette" FROM core_caisse_app;\s*GRANT SELECT ON "TenantMaquette" TO core_caisse_app;/);
   assert.doesNotMatch(SQL, /GRANT (INSERT|UPDATE|DELETE|ALL)[^;]*"TenantMaquette"/);

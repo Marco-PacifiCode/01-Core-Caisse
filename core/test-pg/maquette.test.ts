@@ -18,6 +18,12 @@
 //       `set_config('app.current_tenant', p_tenant::text, true)` posé avant les contrôles
 //       → « (b) non inscrit … » échoue (tout lu hors contexte paraît vide : compteurs à zéro au lieu
 //       du refus ; (f) échoue aussi, rien n'est effacé).
+//   correctif « inscription sur toute table » : retirer 'GiftCard' et 'CashSettings' de la liste
+//       d'inscrire_tenant_maquette → « (g) un tenant sans vente mais avec un bon cadeau … » échoue.
+//   correctif « deadlock » : retirer NOWAIT du LOCK TABLE de effacer_tenant_maquette
+//       → « deadlock : caisse d'un AUTRE tenant … » échoue (l'effacement attend la caisse).
+//   correctif « cron » : faire rendre `where` sans filtre à sansMaquettes (lib/maquette-exclusion.ts)
+//       → « cron de reprise : vente en attente d'un tenant INSCRIT … » échoue.
 //   garde 5 (droits) : `GRANT INSERT, DELETE ON "TenantMaquette" TO core_caisse_app`
 //       → « (d) le rôle applicatif ne peut ni INSERT … » échoue.
 //
@@ -100,15 +106,32 @@ async function compter(t: string): Promise<Record<string, number>> {
   });
 }
 const total = (c: Record<string, number>) => Object.values(c).reduce((s, n) => s + n, 0);
-const effacer = (t: string, client: PrismaClient = prisma, contexte = t) =>
+const effacerUneFois = (t: string, client: PrismaClient = prisma, contexte = t) =>
   chez(contexte, tx => tx.$queryRaw<{ c: Record<string, number> }[]>`SELECT effacer_tenant_maquette(${t}::uuid) AS c`, client).then(r => r[0].c);
+/** Comme le traitement de nuit : réessaie quand une caisse (d'un autre fichier de test) écrit à l'instant (NOWAIT → 55P03). */
+async function effacer(t: string, client: PrismaClient = prisma, contexte = t): Promise<Record<string, number>> {
+  for (let essai = 1; ; essai++) {
+    try { return await effacerUneFois(t, client, contexte); } catch (e) {
+      if (essai >= 30 || !/could not obtain lock/i.test(String((e as Error)?.message ?? e))) throw e;
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+}
 /** Effacement appelé depuis le contexte d'un AUTRE tenant : la fonction doit poser le sien, puis rendre celui de l'appelant. */
-const effacerDepuis = (contexte: string, t: string) => chez(contexte, async tx => {
+const effacerDepuisUneFois = (contexte: string, t: string) => chez(contexte, async tx => {
   const [{ c }] = await tx.$queryRaw<{ c: Record<string, number> }[]>`SELECT effacer_tenant_maquette(${t}::uuid) AS c`;
   const [{ apres }] = await tx.$queryRaw<{ apres: string }[]>`SELECT current_setting('app.current_tenant', true) AS apres`;
   assert.equal(apres, contexte, "contexte de l'appelant rétabli");
   return c;
 });
+async function effacerDepuis(contexte: string, t: string): Promise<Record<string, number>> {
+  for (let essai = 1; ; essai++) {
+    try { return await effacerDepuisUneFois(contexte, t); } catch (e) {
+      if (essai >= 30 || !/could not obtain lock/i.test(String((e as Error)?.message ?? e))) throw e;
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+}
 const inscrire = (t: string) =>
   chez(t, tx => tx.$queryRaw<{ i: boolean }[]>`SELECT inscrire_tenant_maquette(${t}::uuid) AS i`).then(r => r[0].i);
 const inscrit = (t: string) => chez(t, tx => tx.tenantMaquette.findUnique({ where: { tenantId: t } }));
@@ -261,6 +284,89 @@ test("(g) l'inscription d'un tenant qui a déjà une vente ou un fait l4 est ref
   assert.equal(await inscrit(avecFait), null);
 });
 
+test("(g) un tenant sans vente mais avec un bon cadeau, ou seulement des réglages : inscription refusée, rien effacé", async () => {
+  const bon = randomUUID(), reglages = randomUUID();
+  await chez(bon, tx => tx.$executeRaw`INSERT INTO "GiftCard" ("id","tenantId","code","amountXpf") VALUES (${randomUUID()}::uuid, ${bon}::uuid, 'BON-PG-1', 10000)`);
+  await chez(reglages, tx => tx.$executeRaw`INSERT INTO "CashSettings" ("tenantId","updatedAt") VALUES (${reglages}::uuid, now())`);
+  for (const t of [bon, reglages]) {
+    const avant = await compter(t);
+    assert.equal(total(avant), 1);
+    await refuse(inscrire(t), /MAQUETTE_INSCRIPTION_REFUSEE/);
+    assert.equal(await inscrit(t), null);
+    await refuse(effacer(t), /MAQUETTE_NON_INSCRITE/);
+    assert.deepEqual(await compter(t), avant);
+  }
+});
+
+test("cron de reprise : vente en attente d'un tenant INSCRIT ni sélectionnée ni comptée ; celle d'un vrai marchand l'est", async () => {
+  assert.ok(process.env.CRON_DATABASE_URL, "CRON_DATABASE_URL obligatoire (rôle BYPASSRLS du cron)");
+  const cron = new PrismaClient({ datasources: { db: { url: process.env.CRON_DATABASE_URL } } });
+  try {
+    const policy = load("repair-policy"), exclusion = load("maquette-exclusion");
+    const demo = randomUUID(), reel = randomUUID();
+    assert.equal(await inscrire(demo), true);
+    const pendante = (t: string, extra = "") => chez(t, tx => tx.$executeRawUnsafe(
+      `INSERT INTO "Sale" ("id","tenantId","status","totalXpf","subtotalXpf","updatedAt","paidAt"${extra ? ',"syncError","invoiceId"' : ""})
+       VALUES ($1::uuid, $2::uuid, '${extra ? "VOID" : "PAID"}', 1000, 1000, now(), now()${extra ? ", $3, 'FAC-1'" : ""})`,
+      ...(extra ? [randomUUID(), t, extra] : [randomUUID(), t])));
+    for (const t of [demo, reel]) {
+      await pendante(t);
+      await pendante(t, `${load("sync").NEUTRALISATION_MARKER} pg`);
+    }
+    const maquettes = await exclusion.tenantsMaquette(cron);
+    // Registre illisible (rôle sans SELECT) : l'erreur remonte, aucune exclusion muette.
+    if (process.env.MAQUETTE_ETRANGER_URL) {
+      const etranger = new PrismaClient({ datasources: { db: { url: process.env.MAQUETTE_ETRANGER_URL } } });
+      try { await refuse(exclusion.tenantsMaquette(etranger), /permission denied|42501/); } finally { await etranger.$disconnect(); }
+    }
+    assert.ok(maquettes.includes(demo) && !maquettes.includes(reel));
+    const ids = async (where: any) => new Set((await cron.sale.findMany({ where, select: { tenantId: true }, take: 100000 })).map(s => s.tenantId));
+    const sel = await ids(exclusion.sansMaquettes(policy.pendingSalesWhere(new Date(), {}), maquettes));
+    assert.ok(sel.has(reel) && !sel.has(demo), "sélection");
+    const neut = await ids(exclusion.sansMaquettes({ status: "VOID", syncError: { startsWith: load("sync").NEUTRALISATION_MARKER }, invoiceId: { not: null }, creditNoteId: null }, maquettes));
+    assert.ok(neut.has(reel) && !neut.has(demo), "neutralisations");
+    // Compteur des ventes enlisées : seuil abaissé à 1 tentative, ventes passées à 5 tentatives.
+    for (const t of [demo, reel]) await chez(t, tx => tx.$executeRaw`UPDATE "Sale" SET "syncAttempts" = 5 WHERE "tenantId" = ${t}::uuid`);
+    const stuck = exclusion.sansMaquettes(policy.stuckSalesWhere({ REPAIR_BACKOFF_AFTER_ATTEMPTS: "1" }), maquettes);
+    const compte = (t: string) => cron.sale.count({ where: { AND: [stuck, { tenantId: t }] } });
+    assert.equal(await compte(demo), 0, "compteur");
+    assert.equal(await compte(reel), 1, "compteur vrai marchand");
+    await chez(demo, tx => tx.$executeRaw`DELETE FROM "Sale" WHERE "tenantId" = ${demo}::uuid`);
+    await effacer(demo);
+  } finally { await cron.$disconnect(); }
+});
+
+test("deadlock : caisse d'un AUTRE tenant en cours d'écriture → effacement refusé tout de suite (55P03), la caisse commite", async () => {
+  const t = randomUUID(), caisse = randomUUID();
+  await semer(t);
+  const { jour, vente } = await venteReelle(caisse);
+  const avant = await compter(t);
+  let liberer!: () => void;
+  const tenu = new Promise<void>(r => { liberer = r; });
+  let ecrit!: () => void;
+  const ecriture = new Promise<void>(r => { ecrit = r; });
+  const ref = randomUUID();
+  const autre = chez(caisse, async tx => {
+    await tx.$executeRaw`INSERT INTO "CashDayEvent" ("id","tenantId","cashDayId","sequence","kind","sourceRef","saleId","deviceId","occurredAt","cashDeltaXpf","snapshot")
+      VALUES (${randomUUID()}::uuid, ${caisse}::uuid, ${jour}::uuid, 2, 'SALE_PAID', ${ref}, ${vente}::uuid, 'pg', now(), 500, '{}'::jsonb)`;
+    ecrit();
+    await tenu;
+  }, second);
+  await ecriture;
+  const debut = Date.now();
+  try {
+    // NOWAIT : « could not obtain lock » (et non l’attente puis « lock timeout »).
+    await refuse(effacerUneFois(t), /could not obtain lock/i);
+  } finally { liberer(); }
+  await autre; // la caisse commite normalement
+  assert.ok(Date.now() - debut < 2000, `échec immédiat attendu (${Date.now() - debut} ms)`);
+  const [{ n }] = await chez(caisse, tx => tx.$queryRaw<{ n: number }[]>`SELECT count(*)::int AS n FROM "CashDayEvent" WHERE "tenantId" = ${caisse}::uuid AND "sourceRef" = ${ref}`);
+  assert.equal(n, 1, "écriture de caisse commitée");
+  assert.deepEqual(await compter(t), avant);
+  await declencheursActifs();
+  await effacer(t);
+});
+
 test("(a) verrou tenu sur CashDayEvent pendant l'appel : échec en ~3 s (lock_timeout), rien d'effacé, déclencheurs actifs", async () => {
   const t = randomUUID();
   await semer(t);
@@ -310,4 +416,19 @@ test("(a) erreur AU MILIEU de la fonction (déclencheurs déjà désactivés) : 
   await declencheursActifs();
   await effacer(t);
   await declencheursActifs();
+});
+
+// Mesure (MAQUETTE_MESURE=1 seulement) : durée d'un effacement type, 30 jours × 40 tickets, 3 essais.
+test("mesure : durée d'un effacement type (30 jours, 40 tickets par jour)", { skip: !process.env.MAQUETTE_MESURE && "MAQUETTE_MESURE=1 pour mesurer" }, async (t) => {
+  const durees: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const tenant = randomUUID();
+    const r = await semer(tenant, { ...JEU, ticketsParJour: { min: 40, max: 40 }, jours: 30 });
+    const n = total(await compter(tenant));
+    const debut = Date.now();
+    await effacer(tenant);
+    durees.push(Date.now() - debut);
+    t.diagnostic(`essai ${i + 1} : ${(r as any).compteurs.ventes} ventes, ${n} lignes, effacement ${durees.at(-1)} ms`);
+  }
+  t.diagnostic(`médiane ${[...durees].sort((a, b) => a - b)[1]} ms`);
 });

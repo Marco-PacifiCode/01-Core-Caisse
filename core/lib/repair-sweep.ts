@@ -21,6 +21,7 @@ import { PrismaClient } from "@prisma/client";
 import { repairSale } from "./caisse";
 import { NEUTRALISATION_MARKER } from "./sync";
 import { log } from "./log";
+import { sansMaquettes, tenantsMaquette } from "./maquette-exclusion";
 import {
   PENDING_SALES_ORDER,
   backoffAfterAttempts,
@@ -56,14 +57,18 @@ export type RepairSweepReport = {
  * dédupliquent. `limit` borne un passage (défaut 200) — le passage suivant reprend le reste.
  */
 export async function sweepPendingSales(limit = 200): Promise<RepairSweepReport> {
+  // Démo privée (11/11) : les tenants maquette ne sont ni repris, ni neutralisés, ni comptés.
+  // Lecture du registre en échec → l'erreur REMONTE : le passage échoue et sera rejoué, comme pour
+  // toute erreur de base (jamais de reprise « sans exclusion »).
+  const maquettes = await tenantsMaquette(cronPrisma);
   const pending = await cronPrisma.sale.findMany({
-    where: pendingSalesWhere(),
+    where: sansMaquettes(pendingSalesWhere(), maquettes),
     select: { id: true, tenantId: true },
     orderBy: PENDING_SALES_ORDER,
     take: limit,
   });
   const neutralizations = await cronPrisma.sale.findMany({
-    where: { status: "VOID", syncError: { startsWith: NEUTRALISATION_MARKER }, invoiceId: { not: null }, creditNoteId: null },
+    where: sansMaquettes({ status: "VOID", syncError: { startsWith: NEUTRALISATION_MARKER }, invoiceId: { not: null }, creditNoteId: null }, maquettes),
     select: { id: true, tenantId: true },
     orderBy: PENDING_SALES_ORDER,
     take: Math.min(limit, NEUTRALIZATION_BATCH_LIMIT),
@@ -72,7 +77,7 @@ export async function sweepPendingSales(limit = 200): Promise<RepairSweepReport>
   // Comptage SÉPARÉ des ventes qui s'enlisent (indépendant de la fenêtre et du backoff) : sans ça,
   // une vente insoluble redevient invisible dès qu'elle est écartée de la fenêtre — on remplacerait
   // une famine bruyante par un enlisement silencieux.
-  const stuck = await cronPrisma.sale.count({ where: stuckSalesWhere() });
+  const stuck = await cronPrisma.sale.count({ where: sansMaquettes(stuckSalesWhere(), maquettes) });
 
   const report: RepairSweepReport = { scanned: pending.length + neutralizations.length, repaired: 0, stillPending: 0, failures: [], stuck };
 
