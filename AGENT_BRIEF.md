@@ -1,5 +1,12 @@
 # AGENT_BRIEF — 01-Core-Caisse
 
+## 🎭 2026-11-11 — Démo privée : registre et effacement borné d'un tenant `maquette` — ⛔ SUR BRANCHE, NON FUSIONNÉ, NON LIVRÉ
+- Branche `claude/codex-demo-caisse-maquette`. Plan : `PacifiCode/admin/gabarits/maquette/PLAN-DEMO-PRIVEE.md` ; check-list : `C:/dev/_ia/lectures/demo-privee/LIVRAISON.md`.
+- Décision 00-Architecture (option C + 6 gardes) : `caisse_l4_immutable` intacte. Registre `TenantMaquette` alimenté seulement par `inscrire_tenant_maquette(uuid)` (refus dès la moindre ligne du tenant) ; `effacer_tenant_maquette(uuid)` : LOCK des 4 tables l4 d'un coup en NOWAIT puis lock_timeout 500 ms (jamais d'attente devant une caisse : 503 CAISSE_OCCUPEE), DISABLE/ENABLE des 4 déclencheurs dans sa transaction, `WHERE "tenantId" = p_tenant` seulement. Effacement type (30 j × 40 tickets) : 217 ms.
+- Migration additive `20261111130000_tenant_maquette` (à jouer AVANT le ship). Cron repair-sweep : exclut les tenants inscrits ; À LA LIVRAISON, le rôle réel du cron doit pouvoir lire le registre (nom par `SELECT current_user`, jamais par le .env).
+- FK SaleLine/SalePayment à clé simple : option A d'Archi (0 ligne incohérente mesurée en prod le 11/11) ; FK composites = chantier à part.
+- Preuves : 931/931, test:pg 70/70 sur 3 passes sans deadlock, sabotages attrapés ; relecture advanced GPT corrigée.
+
 > ✅ **Lot 2A EN LIGNE le 05/11 à 22 h 44 NC** (c85b27b, migration 2026110400000 jouée avant) : la prod a les colonnes et la table de bail ; plus de contrainte d'ordre pour les prochains ships.
 
 ## 🧾 2026-11-04 — Lot 2A : le serveur applique les dépôts — ✅ EN LIGNE le 05/11 à 22 h 44 NC (main `c85b27b`, PR 116, 117, 119, 120 ; tag `deploy/core-caisse/20261105T114432Z-c85b27b63e39`)
