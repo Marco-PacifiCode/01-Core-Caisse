@@ -2,6 +2,12 @@
 
 > ✅ **Lot 2A EN LIGNE le 05/11 à 22 h 44 NC** (c85b27b, migration 2026110400000 jouée avant) : la prod a les colonnes et la table de bail ; plus de contrainte d'ordre pour les prochains ships.
 
+## 🔒 12/11 — Montée de sécurité Next.js 16.4.6 + sharp 0.35.5 — ✅ EN LIGNE @fb659b4 depuis 00 h 13
+- **Quoi** : `next` 16.2.9 → **16.4.6** (PR #122) ; `sharp` 0.35.5 vient avec lui. Seuls `core/package.json` et le verrou de paquets changent.
+- **Pourquoi** : avis de sécurité publiés sur `next` et `sharp`. Montée faite le 11/11 sur toutes les apps Next (Marco : « Next.js d'abord »), sans changer de version majeure.
+- **Livré** le 12/11 à 00 h 13 (QCM de Marco, VAS-Y d'Archi, ci-local GREEN). Une tentative, rien d'autre emporté (hors brief).
+- Témoins verts : Core-Caisse (salon de démo : prestation encaissée puis annulée avec avoir ; caisse de démo : journée ouverte, vente, prestation encaissée puis annulée, clôture à écart nul), puis Métissage Food, mixydemo, MixyTruck, Palais Gourmand et la Rôtisserie rejoués par le moteur. Relu dans l'app servie : next 16.4.6 et sharp 0.35.5 chargés depuis l'app elle-même.
+
 ## 🧾 2026-11-04 — Lot 2A : le serveur applique les dépôts — ✅ EN LIGNE le 05/11 à 22 h 44 NC (main `c85b27b`, PR 116, 117, 119, 120 ; tag `deploy/core-caisse/20261105T114432Z-c85b27b63e39`)
 - Règle durable (relecture ADVANCED 2/2, Archi) : **APPLIED de format 2 ⇔ appliqué par le serveur, via /result, avec son resultJson**. Un `applied` de la tablette ne change jamais une ligne de format 2. Le resultJson d'une tablette n'est jamais stocké, quel que soit le format. `/status` et la réponse du dépôt ne servent un resultJson que pour une ligne de format 2 dont lastResultCode = 'APPLIED' (`depositState`, cash-deposits.ts:81).
 - Garde de l'appareil, d'abord (deviceId du lot, ou celui commun aux actions du lot) : un autre appareil donne `appliedIgnores` AUTRE_APPAREIL, avec la ligne inchangée ; un appareil inconnu donne APPAREIL_INCONNU pour le format 2. Pour le format 1, un appareil inconnu est APPLIED comme avant (vieilles tablettes, aucun effet sur l'argent) ; un appareil différent est refusé.
