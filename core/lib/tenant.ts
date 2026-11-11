@@ -82,11 +82,14 @@ export function assertTenantId(tenantId: string): string {
 export async function withTenant<T>(
   tenantId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
+  // Optionnel (démo privée, 11/11) : délai d'une transaction longue (semis, effacement d'une maquette).
+  // Absent = comportement d'origine, inchangé.
+  options?: { timeout?: number; maxWait?: number },
 ): Promise<T> {
   const safeTenantId = assertTenantId(tenantId);
   await verifierPortee(safeTenantId, cleServiceCourante);
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT set_config('app.current_tenant', ${safeTenantId}, true)`;
     return fn(tx);
-  });
+  }, options);
 }

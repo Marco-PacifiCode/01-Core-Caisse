@@ -44,8 +44,37 @@ function lireCles(): Entree[] {
   return entrees;
 }
 
+/** `true` si `cle` a l'empreinte d'une entrée de SERVICE_KEYS_JSON (sans exclusion de la clé maquette). */
+export function cleDansServiceKeys(cle: string): boolean {
+  const h = createHash("sha256").update(cle, "utf8").digest();
+  let trouve = false;
+  for (const e of lireCles()) if (timingSafeEqual(e.empreinte, h)) trouve = true;
+  return trouve;
+}
+
+/**
+ * Clé de la démo privée (MAQUETTE_API_KEY), si elle est exploitable : posée ET distincte de toute
+ * clé générale (CORE_CAISSE_API_KEY, SERVICE_KEYS_JSON). Une clé en collision n'est PAS une clé
+ * maquette : elle n'ouvre pas /api/maquette/* (503) et reste une clé générale ordinaire.
+ */
+export function cleMaquetteConfiguree(env: Record<string, string | undefined> = process.env): string | null {
+  const cle = env.MAQUETTE_API_KEY;
+  if (!cle) return null;
+  if (env.CORE_CAISSE_API_KEY && egalTempsConstant(cle, env.CORE_CAISSE_API_KEY)) return null;
+  if (cleDansServiceKeys(cle)) return null;
+  return cle;
+}
+
+/** `true` si `cle` est la clé maquette : refusée par le contrôle général et la lecture nominative. */
+export function estCleMaquette(cle: string | null | undefined, env: Record<string, string | undefined> = process.env): boolean {
+  if (!cle) return false;
+  const attendue = cleMaquetteConfiguree(env);
+  return !!attendue && egalTempsConstant(cle, attendue);
+}
+
 export function identifierCle(cle: string | null | undefined): Appelant | null {
   if (!cle) return null;
+  if (estCleMaquette(cle)) return null;
   const h = createHash("sha256").update(cle, "utf8").digest();
   let trouve: Entree | undefined;
   for (const e of lireCles()) {

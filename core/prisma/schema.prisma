@@ -809,3 +809,12 @@ model CashDepositLease {
   token String @db.Uuid
   until DateTime @db.Timestamptz(3)
 }
+
+// Démo privée (11/11) : registre des tenants MAQUETTE (copie de démo d'un prospect, effacée 30 jours
+// après sa création). Inscription SEULEMENT par la fonction SQL inscrire_tenant_maquette(uuid) ;
+// retrait SEULEMENT par effacer_tenant_maquette(uuid), après effacement. Le rôle applicatif n'a que
+// SELECT (migration 20261111130000_tenant_maquette).
+model TenantMaquette {
+  tenantId  String   @id @db.Uuid
+  inscritLe DateTime @default(now()) @db.Timestamptz(6)
+}

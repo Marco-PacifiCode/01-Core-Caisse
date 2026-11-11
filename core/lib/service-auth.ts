@@ -1,10 +1,12 @@
 import type { NextRequest } from "next/server";
-import { cleHistoriqueAcceptee, egalTempsConstant, entrerAppel, identifierCle } from "./cles-service.ts";
+import { cleHistoriqueAcceptee, egalTempsConstant, entrerAppel, estCleMaquette, identifierCle } from "./cles-service.ts";
 
 /** Authentification S2S nominative ou historique par en-tête X-Core-Key. */
 export function hasServiceKey(req: NextRequest): boolean {
   const apiKey = req.headers.get("x-core-key");
   if (!apiKey) return false;
+  // La clé de la démo privée n'ouvre QUE /api/maquette/* (lib/maquette.ts#checkCleMaquette).
+  if (estCleMaquette(apiKey)) return false;
   const appelant = identifierCle(apiKey);
   if (appelant) {
     entrerAppel(req, appelant, apiKey);
