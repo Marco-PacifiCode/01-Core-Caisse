@@ -82,9 +82,9 @@ export function assertTenantId(tenantId: string): string {
 export async function withTenant<T>(
   tenantId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
-  // Optionnel (démo privée, 11/11) : délai d'une transaction longue (semis, effacement d'une maquette).
+  // Optionnel : délais pour semis/effacement ; isolation renforcée pour le seul effacement maquette.
   // Absent = comportement d'origine, inchangé.
-  options?: { timeout?: number; maxWait?: number },
+  options?: { timeout?: number; maxWait?: number; isolationLevel?: Prisma.TransactionIsolationLevel },
 ): Promise<T> {
   const safeTenantId = assertTenantId(tenantId);
   await verifierPortee(safeTenantId, cleServiceCourante);

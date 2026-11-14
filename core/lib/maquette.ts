@@ -15,7 +15,7 @@
 // Argent : XPF entiers, jamais de centimes. Ventes fictives seulement.
 
 import { createHash } from "node:crypto";
-import { cleMaquetteConfiguree, egalTempsConstant } from "./cles-service.ts";
+import { egalTempsConstant, motifCleMaquetteRefusee } from "./cles-service.ts";
 
 export const HOTE_DEMO = /^demo-[a-z0-9-]+\.pacificode\.nc$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -99,12 +99,16 @@ export function statutRefus(refus: RefusMaquette, sens: "semer" | "effacer"): nu
 
 /**
  * Contrôle de la clé des routes /api/maquette/* : seule MAQUETTE_API_KEY (X-Core-Key, temps constant).
- * Variable absente, ou égale à CORE_CAISSE_API_KEY ou à une clé de SERVICE_KEYS_JSON → 503 (mal
- * configuré : on n'ouvre rien). Toute autre clé, y compris une clé générale valide → 401.
+ * Variable absente, courte ou en collision → 401 (mal
+ * configuré : même refus qu'une clé invalide).
  */
 export function checkCleMaquette(req: { headers: Headers }, env: Record<string, string | undefined> = process.env): { ok: true } | { ok: false; status: 401 | 503 } {
-  const attendue = cleMaquetteConfiguree(env);
-  if (!attendue) return { ok: false, status: 503 };
+  const motif = motifCleMaquetteRefusee(env);
+  if (motif) {
+    console.warn(`maquette_cle_refusee motif=${motif}`);
+    return { ok: false, status: 401 };
+  }
+  const attendue = env.MAQUETTE_API_KEY!;
   const cle = req.headers.get("x-core-key");
   if (!cle || !egalTempsConstant(cle, attendue)) return { ok: false, status: 401 };
   return { ok: true };
@@ -213,9 +217,9 @@ export function codeMaquette(err: unknown): string | null {
 
 /**
  * Dépassement de lock_timeout (SQLSTATE 55P03 : une caisse tient un verrou) ou de statement_timeout
- * (57014 : l'effacement a dépassé sa fenêtre) → 503 CAISSE_OCCUPEE, retenté la nuit suivante.
+ * (57014), ou sérialisation concurrente (40001 / Prisma P2034) → 503 CAISSE_OCCUPEE.
  */
 export function estVerrouOccupe(err: unknown): boolean {
   const texte = String((err as Error)?.message ?? err) + JSON.stringify((err as { meta?: unknown })?.meta ?? null);
-  return /55P03|57014|lock timeout|statement timeout/i.test(texte);
+  return /55P03|57014|40001|P2034|could not serialize|lock timeout|statement timeout/i.test(texte + String((err as { code?: unknown })?.code ?? ""));
 }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { withTenant } from "@/lib/tenant";
+import { effacerMaquette } from "@/lib/maquette-effacement";
 import { log } from "@/lib/log";
 import { checkCleMaquette, codeMaquette, estUuid, estVerrouOccupe, statutRefus, verifierPourEffacer } from "@/lib/maquette";
 
@@ -32,15 +32,8 @@ export async function POST(req: NextRequest) {
   if (!verdict.ok) return NextResponse.json({ error: verdict.refus }, { status: statutRefus(verdict.refus, "effacer") });
 
   try {
-    const lignes = await withTenant(tenantId, async (tx) => {
-      // Borne l'instruction d'effacement ELLE-MÊME : un statement_timeout posé à l'intérieur de
-      // la fonction ne vaut que pour les instructions suivantes, pas pour celle qui l'exécute.
-      // Les déclencheurs désactivés tiennent un verrou sur les 4 tables l4 de TOUS les tenants
-      // jusqu'à la fin de la transaction : la fenêtre ne doit jamais dépasser quelques secondes.
-      await tx.$executeRaw`SELECT set_config('statement_timeout', '10s', true)`;
-      return tx.$queryRaw<{ compteurs: Record<string, number> }[]>`SELECT effacer_tenant_maquette(${tenantId}::uuid) AS compteurs`;
-    }, { timeout: 15_000, maxWait: 5_000 });
-    return NextResponse.json({ efface: true, compteurs: lignes[0]?.compteurs ?? {} });
+    const compteurs = await effacerMaquette(tenantId);
+    return NextResponse.json({ efface: true, compteurs });
   } catch (err) {
     const code = codeMaquette(err);
     if (code) return NextResponse.json({ error: code }, { status: 409 });

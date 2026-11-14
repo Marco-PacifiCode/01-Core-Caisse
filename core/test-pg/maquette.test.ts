@@ -49,14 +49,14 @@ const ETRANGER = process.env.MAQUETTE_ROLE_ETRANGER ?? "caisse_etranger";
 // ── Chargement des fonctions métier (même mécanique que cash-deposit-apply.test.ts) ───────────────
 const require = createRequire(import.meta.url), lib = fileURLToPath(new URL("../lib/", import.meta.url));
 let currentTx: Tx | null = null;
-function chez<T>(tenantId: string, fn: (tx: Tx) => Promise<T>, client: PrismaClient = prisma) {
+function chez<T>(tenantId: string, fn: (tx: Tx) => Promise<T>, client: PrismaClient = prisma, options: { isolationLevel?: Prisma.TransactionIsolationLevel; timeout?: number; maxWait?: number } = {}) {
   return client.$transaction(async tx => {
     await tx.$executeRaw`SELECT set_config('app.current_tenant', ${tenantId}, true)`;
     return fn(tx);
-  }, { maxWait: 20000, timeout: 120000 });
+  }, { maxWait: 20000, timeout: 120000, ...options });
 }
-function transaction<T>(tenantId: string, fn: (tx: Tx) => Promise<T>) {
-  return currentTx ? fn(currentTx) : chez(tenantId, fn);
+function transaction<T>(tenantId: string, fn: (tx: Tx) => Promise<T>, options = {}) {
+  return currentTx ? fn(currentTx) : chez(tenantId, fn, prisma, options);
 }
 const native: Record<string, any> = {}, cache = new Map<string, any>();
 function load(file: string): any {
@@ -431,4 +431,45 @@ test("mesure : durée d'un effacement type (30 jours, 40 tickets par jour)", { s
     t.diagnostic(`essai ${i + 1} : ${(r as any).compteurs.ventes} ventes, ${n} lignes, effacement ${durees.at(-1)} ms`);
   }
   t.diagnostic(`médiane ${[...durees].sort((a, b) => a - b)[1]} ms`);
+});
+
+// SABOTAGE : retirer RepeatableRead de maquette-effacement.ts ; READ COMMITTED efface
+// silencieusement l'enfant invisible et le refus CAISSE_OCCUPEE attendu disparaît.
+test("cascade concurrente : rollback intégral puis compteurs exacts, voisin ordinaire intact", async () => {
+  const a = randomUUID(), b = randomUUID();
+  await semer(a);
+  await venteReelle(b);
+  const avant = await compter(a), voisin = await compter(b);
+  const [{ id: saleId }] = await chez(a, tx => tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Sale" WHERE "tenantId" = ${a}::uuid LIMIT 1`);
+  const effacement = load("maquette-effacement");
+  let insertion = false, erreur: unknown;
+  try {
+    await effacement.effacerMaquette(a, async () => {
+      // Autre connexion, commit AVANT l'effacement : aucun verrou retenu, aucun cycle 40P01.
+      await chez(a, async tx => {
+        const [{ tenant, isolation, bypass }] = await tx.$queryRaw<{ tenant: string; isolation: string; bypass: boolean }[]>`SELECT
+          current_setting('app.current_tenant') AS tenant, current_setting('transaction_isolation') AS isolation,
+          (rolsuper OR rolbypassrls) AS bypass FROM pg_roles WHERE rolname = current_user`;
+        assert.equal(tenant, a); assert.equal(bypass, false);
+        assert.equal(isolation, "read committed", "les autres transactions gardent leur niveau");
+        await tx.$executeRaw`INSERT INTO "SaleLine" (id,"tenantId","saleId",kind,label,qty,"unitXpf","lineXpf")
+          VALUES (${randomUUID()}::uuid, ${a}::uuid, ${saleId}::uuid, 'PRODUCT', 'Fictif concurrent', 1, 100, 100)`;
+      }, second);
+      insertion = true;
+    });
+  } catch (e) { erreur = e; }
+  assert.equal(insertion, true);
+  assert.ok(erreur, "la cascade concurrente doit annuler l'effacement");
+  assert.doesNotMatch(String((erreur as Error).message), /40P01|deadlock/i);
+  assert.equal(maquette.estVerrouOccupe(erreur), true, "503 CAISSE_OCCUPEE comme la route");
+  assert.match(String((erreur as Error).message) + JSON.stringify((erreur as any).meta), /40001|P2034|could not serialize/i);
+  const apres = await compter(a);
+  assert.deepEqual(apres, { ...avant, SaleLine: avant.SaleLine + 1 });
+  assert.ok(await inscrit(a));
+  await declencheursActifs();
+  const compteurs = await effacement.effacerMaquette(a);
+  assert.deepEqual(compteurs, apres);
+  assert.equal(total(await compter(a)), 0);
+  assert.equal(await inscrit(a), null);
+  assert.deepEqual(await compter(b), voisin);
 });

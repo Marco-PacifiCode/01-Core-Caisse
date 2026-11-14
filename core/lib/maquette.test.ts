@@ -94,40 +94,40 @@ const req = (cle: string | null, chemin = "/api/maquette/semer") =>
   ({ headers: new Headers(cle === null ? {} : { "x-core-key": cle }), url: `http://service.invalid${chemin}` }) as unknown as NextRequest;
 const empreinte = (c: string) => createHash("sha256").update(c).digest("hex");
 
-test("clé maquette : absente → 503 ; égale à une clé générale → 503 ; clé générale → 401 ; bonne → ok", () => {
-  process.env.CORE_CAISSE_API_KEY = "factice-generale";
-  process.env.SERVICE_KEYS_JSON = JSON.stringify({ A: { sha256: empreinte("factice-nominative"), tenants: [T] } });
-  assert.deepEqual(checkCleMaquette(req("factice-generale")), { ok: false, status: 503 });
-  process.env.MAQUETTE_API_KEY = "factice-generale";
-  assert.deepEqual(checkCleMaquette(req("factice-generale")), { ok: false, status: 503 });
-  process.env.MAQUETTE_API_KEY = "factice-nominative";
-  assert.deepEqual(checkCleMaquette(req("factice-nominative")), { ok: false, status: 503 });
-  process.env.MAQUETTE_API_KEY = "factice-maquette";
-  assert.deepEqual(checkCleMaquette(req("factice-generale")), { ok: false, status: 401 });
-  assert.deepEqual(checkCleMaquette(req("factice-nominative")), { ok: false, status: 401 });
+test("clé maquette : absente → 401 ; égale à une clé générale → 401 ; clé générale → 401 ; bonne → ok", () => {
+  process.env.CORE_CAISSE_API_KEY = "factice-generale-01234567890123456789";
+  process.env.SERVICE_KEYS_JSON = JSON.stringify({ A: { sha256: empreinte("factice-nominative-01234567890123456789"), tenants: [T] } });
+  assert.deepEqual(checkCleMaquette(req("factice-generale-01234567890123456789")), { ok: false, status: 401 });
+  process.env.MAQUETTE_API_KEY = "factice-generale-01234567890123456789";
+  assert.deepEqual(checkCleMaquette(req("factice-generale-01234567890123456789")), { ok: false, status: 401 });
+  process.env.MAQUETTE_API_KEY = "factice-nominative-01234567890123456789";
+  assert.deepEqual(checkCleMaquette(req("factice-nominative-01234567890123456789")), { ok: false, status: 401 });
+  process.env.MAQUETTE_API_KEY = "factice-maquette-01234567890123456789";
+  assert.deepEqual(checkCleMaquette(req("factice-generale-01234567890123456789")), { ok: false, status: 401 });
+  assert.deepEqual(checkCleMaquette(req("factice-nominative-01234567890123456789")), { ok: false, status: 401 });
   assert.deepEqual(checkCleMaquette(req(null)), { ok: false, status: 401 });
   assert.deepEqual(checkCleMaquette(req("factice-maquettE")), { ok: false, status: 401 });
-  assert.deepEqual(checkCleMaquette(req("factice-maquette")), { ok: true });
+  assert.deepEqual(checkCleMaquette(req("factice-maquette-01234567890123456789")), { ok: true });
 });
 
 test("clé maquette REFUSÉE par le contrôle général et la lecture nominative", () => {
-  process.env.CORE_CAISSE_API_KEY = "factice-generale";
-  process.env.MAQUETTE_API_KEY = "factice-maquette";
+  process.env.CORE_CAISSE_API_KEY = "factice-generale-01234567890123456789";
+  process.env.MAQUETTE_API_KEY = "factice-maquette-01234567890123456789";
   // Même déclarée par erreur comme clé historique ou nominative, elle ne passe pas… sauf collision,
-  // auquel cas elle n'est plus une clé maquette (503 sur /api/maquette/*) et reste une clé générale.
-  assert.equal(hasServiceKey(req("factice-maquette", "/api/sales")), false);
-  assert.equal(identifierCle("factice-maquette"), null);
-  assert.equal(hasServiceKey(req("factice-generale", "/api/sales")), true, "un vrai appelant n'est pas touché");
-  process.env.SERVICE_KEYS_JSON = JSON.stringify({ A: { sha256: empreinte("factice-nominative"), tenants: [T] } });
-  assert.deepEqual(identifierCle("factice-nominative"), { nom: "A", tenants: [T] });
-  assert.equal(hasServiceKey(req("factice-maquette", "/api/sales")), false);
+  // auquel cas elle n'est plus une clé maquette (401 sur /api/maquette/*) et reste une clé générale.
+  assert.equal(hasServiceKey(req("factice-maquette-01234567890123456789", "/api/sales")), false);
+  assert.equal(identifierCle("factice-maquette-01234567890123456789"), null);
+  assert.equal(hasServiceKey(req("factice-generale-01234567890123456789", "/api/sales")), true, "un vrai appelant n'est pas touché");
+  process.env.SERVICE_KEYS_JSON = JSON.stringify({ A: { sha256: empreinte("factice-nominative-01234567890123456789"), tenants: [T] } });
+  assert.deepEqual(identifierCle("factice-nominative-01234567890123456789"), { nom: "A", tenants: [T] });
+  assert.equal(hasServiceKey(req("factice-maquette-01234567890123456789", "/api/sales")), false);
 });
 
 test("collision de configuration : la clé générale garde ses droits, la maquette n'ouvre rien", () => {
-  process.env.CORE_CAISSE_API_KEY = "factice-generale";
-  process.env.MAQUETTE_API_KEY = "factice-generale";
-  assert.equal(hasServiceKey(req("factice-generale", "/api/sales")), true);
-  assert.deepEqual(checkCleMaquette(req("factice-generale")), { ok: false, status: 503 });
+  process.env.CORE_CAISSE_API_KEY = "factice-generale-01234567890123456789";
+  process.env.MAQUETTE_API_KEY = "factice-generale-01234567890123456789";
+  assert.equal(hasServiceKey(req("factice-generale-01234567890123456789", "/api/sales")), true);
+  assert.deepEqual(checkCleMaquette(req("factice-generale-01234567890123456789")), { ok: false, status: 401 });
 });
 
 // ── Jeu ──────────────────────────────────────────────────────────────────────────────────────────
@@ -329,4 +329,40 @@ test("caisse_l4_immutable et ses 4 déclencheurs : identiques à l'octet, défin
     assert.doesNotMatch(sql, /(CREATE|DROP)\s+TRIGGER\s+(IF\s+EXISTS\s+)?cash_\w+_immutable/i, f);
     assert.doesNotMatch(sql, /ALTER\s+TRIGGER\s+cash_\w+_immutable/i, f);
   }
+});
+
+// SABOTAGE : enlever le contrôle collision/courte → refus ou journal exact ci-dessous en échec.
+test("configuration maquette : refus uniforme, une seule ligne sans valeur, accès général conservé", () => {
+  const longue = "factice-cle-longue-01234567890123456789";
+  const nominale = "factice-nominale-01234567890123456789";
+  process.env.CORE_CAISSE_API_KEY = longue;
+  process.env.SERVICE_KEYS_JSON = JSON.stringify({ A: { sha256: empreinte(nominale), tenants: [T] } });
+  const lignes: string[] = [], warn = console.warn;
+  console.warn = (ligne) => { lignes.push(String(ligne)); };
+  try {
+    for (const [cle, motif] of [[undefined, "absente"], ["x".repeat(31), "courte"], [longue, "collision"], [nominale, "collision"]] as const) {
+      if (cle === undefined) delete process.env.MAQUETTE_API_KEY;
+      else process.env.MAQUETTE_API_KEY = cle;
+      lignes.length = 0;
+      assert.deepEqual(checkCleMaquette(req(cle ?? "invalide")), { ok: false, status: 401 });
+      assert.deepEqual(lignes, [`maquette_cle_refusee motif=${motif}`]);
+      if (motif === "collision") {
+        assert.equal(hasServiceKey(req(cle!, "/api/sales")), true);
+        assert.equal(lignes.length, 1, "le contrôle général ne journalise pas un refus maquette");
+      }
+    }
+    process.env.MAQUETTE_API_KEY = "m".repeat(32);
+    lignes.length = 0;
+    assert.deepEqual(checkCleMaquette(req("m".repeat(32))), { ok: true });
+    assert.deepEqual(checkCleMaquette(req("invalide")), { ok: false, status: 401 });
+    assert.deepEqual(lignes, []);
+  } finally { console.warn = warn; }
+});
+
+// SABOTAGE : retirer 40001/P2034 de estVerrouOccupe → le contrat 503 CAISSE_OCCUPEE casse.
+test("sérialisation SQL et Prisma : même traitement que caisse occupée", () => {
+  assert.equal(estVerrouOccupe({ code: "40001" }), true);
+  assert.equal(estVerrouOccupe({ code: "P2034" }), true);
+  assert.equal(estVerrouOccupe({ meta: { code: "40001" } }), true);
+  assert.equal(estVerrouOccupe(new Error("autre erreur")), false);
 });
