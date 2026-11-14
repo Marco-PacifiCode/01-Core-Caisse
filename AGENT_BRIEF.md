@@ -6,6 +6,7 @@
 - Migration additive `20261111130000_tenant_maquette` (à jouer AVANT le ship). Cron repair-sweep : exclut les tenants inscrits ; À LA LIVRAISON, le rôle réel du cron doit pouvoir lire le registre (nom par `SELECT current_user`, jamais par le .env).
 - FK SaleLine/SalePayment à clé simple : option A d'Archi (0 ligne incohérente mesurée en prod le 11/11) ; FK composites = chantier à part.
 - Preuves : 931/931, test:pg 70/70 sur 3 passes sans deadlock, sabotages attrapés ; relecture advanced GPT corrigée.
+- 14/11 — 2e relecture advanced (GPT Sol) corrigée : l'appel de `effacer_tenant_maquette` passe en REPEATABLE READ (40001 → 503 CAISSE_OCCUPEE, rien d'effacé) ; clé maquette refusée si courte ou égale à CORE_CAISSE_API_KEY ou à SERVICE_KEYS_JSON. Migration inchangée. Preuves : tsc 0, 933/933, test:pg 71/71 en 3 passes sans 40P01, 4 sabotages attrapés. Limites acceptées (décisions d'Archi) : FK composites des ventes en chantier à part ; inscription possible par le rôle applicatif d'un tenant vide ; repair-sweep lit le registre en début de passage.
 
 > ✅ **Lot 2A EN LIGNE le 05/11 à 22 h 44 NC** (c85b27b, migration 2026110400000 jouée avant) : la prod a les colonnes et la table de bail ; plus de contrainte d'ordre pour les prochains ships.
 
