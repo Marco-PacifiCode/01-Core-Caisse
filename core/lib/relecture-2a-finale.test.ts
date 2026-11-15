@@ -116,5 +116,5 @@ test("F6 accusé ignoré renvoyé dans applied ; renoncement ultérieur : PENDIN
   await depositActions(f.tx, { tenantId, deviceId: "tab-a", actions: [], applied: [{ actionId: v.actionId, resultJson: { v: 2 } }] });
   const s = await depositStatuses(f.tx, { tenantId, actionIds: [v.actionId] });
   assert.equal(f.rows.get(v.actionId).status, "PENDING"); assert.equal(f.rows.get(v.actionId).resultJson, null);
-  assert.deepEqual(JSON.parse(JSON.stringify(s.items)), [{ actionId: v.actionId, status: "PENDING" }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(s.items)), [{ actionId: v.actionId, status: "PENDING", rejeuTablette: true }]);
 });

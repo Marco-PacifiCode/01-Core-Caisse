@@ -119,7 +119,7 @@ test("applied format 1 : UUID seul et objet → APPLIED sans resultJson stocké,
 test("réponse du dépôt : status et resultJson de la ligne après l'opération", async () => {
   const f = fixture(), a = v2(1), b = v2(2), c = v2(3);
   const first = await depositActions(f.tx, { tenantId, actions: [a] });
-  assert.deepEqual({ ...first.results[0] }, { actionId: a.actionId, result: "stored", status: "PENDING" });
+  assert.deepEqual({ ...first.results[0] }, { actionId: a.actionId, result: "stored", status: "PENDING", rejeuTablette: false });
   assert.ok(!("resultJson" in first.results[0]));
   await depositActions(f.tx, { tenantId, actions: [b, c] });
   const { token } = await claimDeposits(f.tx, { tenantId, holder: "s", limit: 10 });
@@ -130,8 +130,8 @@ test("réponse du dépôt : status et resultJson de la ligne après l'opération
   const r = await depositActions(f.tx, { tenantId, actions: [b, c, { ...a, payload: { autre: true } }] });
   assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
     { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s1" } },
-    { actionId: c.actionId, result: "seen", status: "PENDING" },
-    { actionId: a.actionId, result: "conflict", status: "PENDING" },
+    { actionId: c.actionId, result: "seen", status: "PENDING", rejeuTablette: true },
+    { actionId: a.actionId, result: "conflict", status: "PENDING", rejeuTablette: true },
   ]);
 });
 
@@ -155,12 +155,12 @@ test("status : APPLIED+resultJson, PENDING, APPLIED sans resultJson, inconnu et 
   const r = await depositStatuses(tx, { tenantId, actionIds: [applied.actionId, pending.actionId.toUpperCase(), bare.actionId, other.actionId, unknown, applied.actionId] });
   const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
   assert.deepEqual({ ...byId.get(applied.actionId) }, { actionId: applied.actionId, status: "APPLIED", resultJson: { saleId: "s1", n: [1, 2] } });
-  assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING" });
+  assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING", rejeuTablette: false });
   assert.deepEqual({ ...byId.get(bare.actionId) }, { actionId: bare.actionId, status: "APPLIED" });
   assert.ok(!byId.has(other.actionId) && !byId.has(unknown)); assert.equal(r.items.length, 3);
-  for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson"].includes(k)), JSON.stringify(i));
+  for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson", "rejeuTablette"].includes(k)), JSON.stringify(i));
   assert.equal(calls.length, 1);
-  assert.deepEqual({ ...calls[0].select }, { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true });
+  assert.deepEqual({ ...calls[0].select }, { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true, conflictCount: true });
   assert.ok(!("payload" in calls[0].select) && !("payloadHash" in calls[0].select));
   assert.equal(calls[0].where.tenantId, tenantId); assert.equal(calls[0].where.actionId.in.length, 5); // doublon retiré, casse normalisée
 });
@@ -195,7 +195,7 @@ test("R1 : applied inventé sur format 2 jamais tenté ou EN_ATTENTE → reste P
     const r = await depositActions(f.tx, { tenantId, actions: [a], applied: [{ actionId: a.actionId, resultJson: { saleId: "faux" } }, b.actionId] });
     for (const id of [a.actionId, b.actionId]) { const row = f.rows.get(id);
       assert.equal(row.status, "PENDING", String(code)); assert.equal(row.resultJson, null); assert.equal(row.lastResultCode, code); }
-    assert.deepEqual({ ...r.results[0] }, { actionId: a.actionId, result: "seen", status: "PENDING" });
+    assert.deepEqual({ ...r.results[0] }, { actionId: a.actionId, result: "seen", status: "PENDING", rejeuTablette: false });
   }
 });
 // K1 (relecture 2) : encodait APPLIED_PAR_TABLETTE ; désormais la ligne de format 2 ne change jamais.
@@ -207,7 +207,7 @@ test("K1 : même appareil sur une ligne REJEU_TABLETTE → ligne inchangée, auc
   assert.deepEqual(r.appliedIgnores, []); assert.deepEqual([...r.applied], [a.actionId]);
   assert.deepEqual({ ...f.rows.get(a.actionId) }, before);
   const st = await depositStatuses(f.tx, { tenantId, actionIds: [a.actionId] });
-  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "PENDING" }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(st.items)), [{ actionId: a.actionId, status: "PENDING", rejeuTablette: true }]);
 });
 test("K2 : format 1 accusé avec un resultJson → APPLIED, resultJson null en base, /status sans resultJson", async () => {
   const f = fixture(), a = v1(), b = v1();
