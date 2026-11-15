@@ -77,11 +77,12 @@ export function validateDepositInput(input: unknown) {
 }
 // Projection d'état commune (réponse du dépôt et /status) : status, et resultJson seulement pour une ligne de format 2
 // APPLIED par le serveur (/result : lastResultCode 'APPLIED') et resultJson non null. Jamais un resultJson venu de la tablette.
-const STATE_SELECT = { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true } as const;
-function depositState(row: { status: string; resultJson: unknown; formatVersion: number; lastResultCode: string | null } | undefined) {
+const STATE_SELECT = { actionId: true, status: true, resultJson: true, formatVersion: true, lastResultCode: true, conflictCount: true } as const;
+function depositState(row: { status: string; resultJson: unknown; formatVersion: number; lastResultCode: string | null; conflictCount: number } | undefined) {
   const status = row?.status === "APPLIED" ? "APPLIED" : "PENDING";
   const served = status === "APPLIED" && row?.formatVersion === 2 && row.lastResultCode === "APPLIED" && row.resultJson != null;
-  return { status, ...(served ? { resultJson: row!.resultJson } : {}) };
+  return { status, ...(row && status === "PENDING" ? { rejeuTablette: row.formatVersion !== 2 || row.conflictCount > 0
+    || (row.lastResultCode !== null && !CLAIMABLE_CODES.some(code => code === row.lastResultCode)) } : {}), ...(served ? { resultJson: row!.resultJson } : {}) };
 }
 // Marque d'applicateur qui laisse une pièce éligible au claim (null = jamais tentée).
 const CLAIMABLE_CODES = ["EN_ATTENTE"] as const;

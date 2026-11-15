@@ -183,7 +183,7 @@ test("réponse du dépôt : status/resultJson après l'opération, conflict, iso
     await deposits.depositActions(tx, { tenantId: tenantB, actions: [], applied: [{ actionId: a.actionId, resultJson: { saleId: "b" } }] });
     await asTenant(tx, tenantA);
     const first = await deposits.depositActions(tx, { tenantId: tenantA, actions: [a, b, c] });
-    assert.deepEqual(JSON.parse(JSON.stringify(first.results)), [a, b, c].map(x => ({ actionId: x.actionId, result: "stored", status: "PENDING" })));
+    assert.deepEqual(JSON.parse(JSON.stringify(first.results)), [a, b, c].map(x => ({ actionId: x.actionId, result: "stored", status: "PENDING", rejeuTablette: false })));
     const { token } = await deposits.claimDeposits(tx, { tenantId: tenantA, holder: "s", limit: 10 });
     await deposits.recordDepositResult(tx, { tenantId: tenantA, token, actionId: b.actionId, outcome: "APPLIED", resultJson: { saleId: "s-1" } });
     // R1 : l'accusé n'est honoré que si le serveur a renoncé, et seulement pour l'appareil de la ligne.
@@ -192,8 +192,8 @@ test("réponse du dépôt : status/resultJson après l'opération, conflict, iso
     const r = await deposits.depositActions(tx, { tenantId: tenantA, actions: [b, c, { ...a, payload: { autre: true } }] });
     assert.deepEqual(JSON.parse(JSON.stringify(r.results)), [
       { actionId: b.actionId, result: "seen", status: "APPLIED", resultJson: { saleId: "s-1" } },
-      { actionId: c.actionId, result: "seen", status: "PENDING" }, // K1 : l'accusé de la tablette ne change jamais une ligne de format 2
-      { actionId: a.actionId, result: "conflict", status: "PENDING" },
+      { actionId: c.actionId, result: "seen", status: "PENDING", rejeuTablette: true }, // K1 : l'accusé de la tablette ne change jamais une ligne de format 2
+      { actionId: a.actionId, result: "conflict", status: "PENDING", rejeuTablette: true },
     ]);
   });
 });
@@ -247,9 +247,9 @@ test("status : états réels, projection limitée, inconnu absent, 400, isolatio
     const byId = new Map(r.items.map((i: any) => [i.actionId, i]));
     assert.equal(r.items.length, 3); assert.ok(!byId.has(unknown));
     assert.deepEqual(JSON.parse(JSON.stringify(byId.get(applied.actionId))), { actionId: applied.actionId, status: "APPLIED", resultJson: { saleId: "s-1" } });
-    assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING" });
+    assert.deepEqual({ ...byId.get(pending.actionId) }, { actionId: pending.actionId, status: "PENDING", rejeuTablette: false });
     assert.deepEqual({ ...byId.get(bare.actionId) }, { actionId: bare.actionId, status: "APPLIED" });
-    for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson"].includes(k)));
+    for (const i of r.items) assert.ok(Object.keys(i).every(k => ["actionId", "status", "resultJson", "rejeuTablette"].includes(k)));
     for (const bad of [{ tenantId: tenantA, actionIds: [] }, { tenantId: tenantA, actionIds: Array.from({ length: 1001 }, () => randomUUID()) }, { tenantId: tenantA, actionIds: ["x"] }])
       await assert.rejects(deposits.depositStatuses(tx, bad), (e: any) => e?.status === 400);
     // Commerce B : ni par son propre tenantId (RLS), ni en demandant les ids de A.

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash } from "node:crypto";
 import { canonical } from "./cash-day-projection.ts";
-import { depositActions, validateDepositInput, readDepositBody, MAX_BODY_BYTES } from "./cash-deposits.ts";
+import { depositStatuses, recordDepositResult, depositActions, validateDepositInput, readDepositBody, MAX_BODY_BYTES } from "./cash-deposits.ts";
 
 const tenantId = randomUUID();
 const makeAction = (actionId = randomUUID(), payload: any = { a: 1, b: 2 }) => ({ actionId, deviceId: "tablet", kind: "SALE", payload });
@@ -60,4 +60,52 @@ test("décide stored, seen, conflict et applied", async () => {
 test("rejette un corps supérieur à 2 Mio avec 413", async () => {
   const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array(MAX_BODY_BYTES + 1)); controller.close(); } });
   await assert.rejects(() => readDepositBody(stream), (e: any) => e.status === 413);
+});
+
+test("rejeuTablette : dépôt, renoncement, attente, application, format et conflit", async () => {
+  const rows = new Map<string, any>(), token = randomUUID();
+  const tx: any = { $queryRaw: async () => [], cashDepositLease: {
+    findUnique: async () => ({ token, until: new Date(Date.now() + 60_000) }),
+  }, cashDeposit: {
+    findUnique: async ({ where }: any) => rows.get(where.tenantId_actionId.actionId) ?? null,
+    findMany: async ({ where, select }: any) => {
+      assert.equal(select.conflictCount, true, "la projection lit conflictCount");
+      return [...rows.values()].filter(row => row.tenantId === where.tenantId && where.actionId.in.includes(row.actionId))
+        .map(row => Object.fromEntries(Object.keys(select).map(key => [key, row[key]])));
+    },
+    create: async ({ data }: any) => { rows.set(data.actionId, { formatVersion: 1, conflictCount: 0, lastResultCode: null, resultJson: null, status: "PENDING", ...data }); },
+    update: async ({ where, data }: any) => {
+      const row = rows.get(where.tenantId_actionId.actionId);
+      rows.set(row.actionId, { ...row, ...data, conflictCount: data.conflictCount?.increment ? row.conflictCount + data.conflictCount.increment : row.conflictCount });
+    },
+  } };
+  const a = { ...makeAction(), formatVersion: 2, sequence: 1, clientState: "queued" };
+  const deposit = (action: any) => depositActions(tx, { tenantId, actions: [action] });
+  const state = async () => (await depositStatuses(tx, { tenantId, actionIds: [a.actionId] })).items[0];
+  const result = (outcome: string, extra: any) => recordDepositResult(tx, { tenantId, token, actionId: a.actionId, outcome, ...extra });
+  assert.deepEqual((await deposit(a)).results[0], { actionId: a.actionId, result: "stored", status: "PENDING", rejeuTablette: false });
+  await result("REFUSED", { code: "REJEU_TABLETTE" });
+  assert.deepEqual(await state(), { actionId: a.actionId, status: "PENDING", rejeuTablette: true });
+  assert.equal((await deposit(a)).results[0].rejeuTablette, true, "un seen sans changement conserve le renoncement");
+  assert.equal((await deposit({ ...a, clientState: "retry" })).results[0].rejeuTablette, false);
+  assert.equal((await state()).rejeuTablette, false);
+  await result("WAITING", { code: "EN_ATTENTE" });
+  assert.equal((await state()).rejeuTablette, false);
+  await result("REFUSED", { code: "CODE_METIER" });
+  assert.equal((await state()).rejeuTablette, true, "tout code hors CLAIMABLE_CODES renonce");
+  await deposit({ ...a, payload: { changed: true } });
+  await result("WAITING", { code: "EN_ATTENTE" });
+  assert.equal((await state()).rejeuTablette, true, "un conflit impose le rejeu même en attente");
+  const resultJson = { saleId: randomUUID() };
+  await result("APPLIED", { resultJson });
+  assert.deepEqual(await state(), { actionId: a.actionId, status: "APPLIED", resultJson });
+  assert.deepEqual((await deposit(a)).results[0], { actionId: a.actionId, result: "seen", status: "APPLIED", resultJson });
+  const legacy = makeAction();
+  assert.equal((await deposit(legacy)).results[0].rejeuTablette, true);
+  assert.deepEqual((await depositStatuses(tx, { tenantId, actionIds: [legacy.actionId] })).items,
+    [{ actionId: legacy.actionId, status: "PENDING", rejeuTablette: true }]);
+  assert.deepEqual((await depositStatuses(tx, { tenantId, actionIds: [randomUUID()] })).items, []);
+  const missingTx: any = { ...tx, cashDeposit: { ...tx.cashDeposit, findMany: async () => [] } };
+  assert.deepEqual((await depositActions(missingTx, { tenantId, actions: [a] })).results[0],
+    { actionId: a.actionId, result: "seen", status: "PENDING" });
 });
