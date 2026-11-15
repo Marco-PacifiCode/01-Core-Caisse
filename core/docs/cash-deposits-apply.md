@@ -31,6 +31,15 @@ même appel compris), et `resultJson` seulement pour une ligne de format 2 APPLI
 Lecture groupée unique (`findMany` sur les actionId du lot), filtrée par `tenantId` sous RLS.
 Une action `APPLIED` est accusée par la tablette sans être renvoyée.
 
+### rejeuTablette
+
+Dans `results[]` du dépôt et `items[]` de `/status`, chaque ligne PENDING porte le booléen
+`rejeuTablette` : `true` si `formatVersion !== 2`, `conflictCount > 0`, ou si `lastResultCode`
+est non null et différent de `EN_ATTENTE` ; sinon `false` (le serveur reste chargé de la pièce).
+Le champ est absent pour une ligne APPLIED ou inconnue ; `resultJson` reste servi comme avant.
+Un redépôt `seen` avec un `clientState` différent remet la marque à null : sans conflit et en
+format 2, `rejeuTablette` redevient `false`.
+
 ### Qui peut dire APPLIED
 
 Règle : **une ligne de format 2 est APPLIED si et seulement si le serveur l'a appliquée (`/result`),
@@ -134,14 +143,14 @@ redéposer la pièce complète.
 
 - Corps : `{ tenantId: uuid, actionIds: uuid[] }`, de 1 à 1000 éléments ; doublons retirés, casse
   normalisée. Liste vide, > 1000, ou id non UUID → 400 `INVALID_ACTION_IDS` ; `tenantId` invalide → 400.
-- Réponse 200 : `{ items: [{ actionId, status, resultJson? }] }`. `resultJson` seulement pour une
+- Réponse 200 : `{ items: [{ actionId, status, rejeuTablette?, resultJson? }] }`. `resultJson` seulement pour une
   ligne de format 2 APPLIED par `/result` (`lastResultCode = 'APPLIED'`) dont le `resultJson` est non
   null : même projection que la réponse du dépôt.
   Un `actionId` inconnu, ou d'un autre commerce, est **absent** de `items` (l'ordre n'est pas garanti).
 - Garde : même garde S2S que les autres routes `/api/cash-deposits` (`cashHttp` → `hasServiceKey`,
   `X-Core-Key`, 401 sinon), lecture sous `withTenant(tenantId)` (RLS).
 - Une seule requête (`findMany` filtrée sur `tenantId` et `actionId in (…)`), `select` limité à
-  `actionId`, `status`, `resultJson`, `formatVersion`, `lastResultCode` (ces deux derniers servent à
+  `actionId`, `status`, `resultJson`, `formatVersion`, `lastResultCode`, `conflictCount` (ces trois derniers servent à
   la projection et ne sont pas renvoyés). **Aucune écriture.** Jamais de `payload`, `payloadHash`,
   enveloppe ni auteur.
 

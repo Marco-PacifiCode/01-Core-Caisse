@@ -28,6 +28,8 @@ test("idempotence, conflit, applied, pagination sans payload et isolation RLS", 
     await new Promise(resolve => setTimeout(resolve, 10));
     const seen = await tx(tenant, client => depositActions(client, { tenantId: tenant, actions: [action(actionId)] }));
     assert.equal(seen.results[0].result, "seen");
+    assert.equal(seen.results[0].status, "PENDING");
+    assert.equal(seen.results[0].rejeuTablette, true, "format 1 : rejeu par la tablette");
     const afterSeen = await tx(tenant, client => client.cashDeposit.findUnique({ where: { tenantId_actionId: { tenantId: tenant, actionId } } }));
     assert.ok(afterSeen.lastSeenAt > before.lastSeenAt);
     await tx(tenant, client => depositActions(client, { tenantId: tenant, actions: [action(actionId, { sample: 2 })] }));
