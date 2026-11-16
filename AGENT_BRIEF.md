@@ -2,11 +2,12 @@
 
 > ✅ **Lot 2A EN LIGNE le 05/11 à 22 h 44 NC** (c85b27b, migration 2026110400000 jouée avant) : la prod a les colonnes et la table de bail ; plus de contrainte d'ordre pour les prochains ships.
 
-## 📦 15/11 — État d'un dépôt : `rejeuTablette` (qui enregistre la pièce) — ✅ CODÉ, branche `claude/codex-rejeu-tablette`, ⛔ NON LIVRÉ
+## 📦 15/11 — État d'un dépôt : `rejeuTablette` (qui enregistre la pièce) — ✅ EN LIGNE @619957d depuis le 16/11 (lot du jour)
+- **Livraison** : PR 124 fusionnée (main `619957d`, ci-local GREEN `5777efb`), livrée au lot du 16/11 sur l'accord de Marco (QCM du lot, « Tout », 16 h 39 NC) ; demande `_queue/ship/s-20261116-0200-core-caisse.json`. Version servie relue le 16/11 à 22 h 15 NC : `619957d`.
 - **Pourquoi** (Marco, 15/11 : « on garde que le bulk c'est plus fiable ») : mesuré à la Rôtisserie le 15/11, la tablette dépose en bloc, le serveur enregistre, et la tablette renvoie quand même chaque pièce une par une : elle ne savait pas si le serveur allait l'enregistrer.
 - **Ce qui change** : `depositState` (`core/lib/cash-deposits.ts`) ajoute `rejeuTablette` à chaque ligne PENDING des `results[]` du dépôt et des `items[]` de `/status`. `true` = le serveur y renonce (format 1, `conflictCount > 0`, ou `lastResultCode` hors `EN_ATTENTE`) ; `false` = il va l'enregistrer. Absent pour APPLIED ou inconnue. Additif : aucune migration, aucun champ existant changé.
 - **Preuve** : test « rejeuTablette : dépôt, renoncement, attente, application, format et conflit » (rouge sur l'ancien code) ; `test:pg` complété (format 1). Doc : `core/docs/cash-deposits-apply.md`.
-- **Suite** : la surface Rôtisserie lit ce champ (lot « bloc seul », son brief). Sans effet tant que la surface ne le lit pas. Livraison au lot (Core = production).
+- **Suite** : la surface Rôtisserie lit ce champ (lot « bloc seul », son brief), en ligne le même jour (`e48bf24`). Guet côté Rôtisserie au prochain service de la tablette : pas encore concluant le 16/11 à 22 h 15 NC (aucun dépôt depuis le 15/11 au matin).
 
 ## 🔒 12/11 — Montée de sécurité Next.js 16.4.6 + sharp 0.35.5 — ✅ EN LIGNE @fb659b4 depuis 00 h 13
 - **Quoi** : `next` 16.2.9 → **16.4.6** (PR #122) ; `sharp` 0.35.5 vient avec lui. Seuls `core/package.json` et le verrou de paquets changent.
