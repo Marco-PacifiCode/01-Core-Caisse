@@ -7,8 +7,8 @@ export const dynamic = "force-dynamic";
 
 /**
  * GET /api/postes?tenantId=...
- * Consommation du quota de postes + registre.
- * → { cle: "CAISSE", quoi, niveau, plafond, utilise, postes: [{ posteId, libelle, actif, horsQuota, creeLe }] }
+ * Consommation du quota de caisses + registre.
+ * → { cle: "CAISSE", quoi, niveau, plafond, utilise, postes: [{ posteId, libelle, caisse, actif, horsQuota, creeLe }] }
  * `plafond` null = pas de plafond (aucun droit dans Core-Auth, ou Core-Auth injoignable).
  */
 export async function GET(req: NextRequest) {
@@ -21,8 +21,8 @@ export async function GET(req: NextRequest) {
 
 /**
  * PATCH /api/postes
- * Body : { tenantId, posteId, libelle?, actif? }
- * Désactiver un poste libère une place ; le rallumer repasse par le plafond (409 quota_atteint).
+ * Body : { tenantId, posteId, libelle?, actif?, caisse? }
+ * Un changement qui ajoute une caisse active repasse par le plafond (409 quota_atteint).
  * 409 SESSION_OUVERTE : on ne désactive pas un poste en train d'encaisser. 404 POSTE_INCONNU.
  */
 export async function PATCH(req: NextRequest) {
@@ -43,9 +43,14 @@ export async function PATCH(req: NextRequest) {
   if (body.actif !== undefined && typeof body.actif !== "boolean") {
     return NextResponse.json({ error: "actif invalide" }, { status: 400 });
   }
+  const caisse = typeof body.caisse === "string" ? body.caisse.trim() : "";
+  if (body.caisse !== undefined && (!caisse || caisse.length > 40)) {
+    return NextResponse.json({ error: "caisse invalide" }, { status: 400 });
+  }
   const result = await modifierPoste(tenantId, posteId, {
     ...(body.libelle !== undefined ? { libelle: body.libelle as string | null } : {}),
     ...(body.actif !== undefined ? { actif: body.actif as boolean } : {}),
+    ...(body.caisse !== undefined ? { caisse } : {}),
   });
   if (!result.ok) return NextResponse.json(result, { status: result.error === "POSTE_INCONNU" ? 404 : 409 });
   return NextResponse.json(result);
