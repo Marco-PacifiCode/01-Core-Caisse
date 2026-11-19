@@ -1,4 +1,4 @@
-// Quota de la brique Caisse (nombre de POSTES) — partie PURE + lecture des droits dans Core-Auth.
+// Quota de la brique Caisse — partie pure + lecture des droits dans Core-Auth.
 //
 // Les droits (plafond) vivent dans Core-Auth, pas ici : `GET /api/s2s/tenants/{id}/droits`.
 // Ce fichier n'importe RIEN (ni Prisma, ni `./log`) pour rester testable par `node --test`.
@@ -31,24 +31,25 @@ export type DecisionInscription = { action: "rien" } | { action: "inscrire"; hor
  * - inconnu du registre mais AYANT DÉJÀ TRAVAILLÉ (sessions ou ventes à son nom) → c'est un poste
  *   existant, antérieur au registre ou venu du hors-ligne : on l'inscrit SANS contrôle, marqué
  *   hors quota s'il dépasse — un poste qui vendait hier doit pouvoir ouvrir aujourd'hui ;
- * - vraiment nouveau, ou désactivé puis rallumé → contrôle du plafond.
+ * - vraiment nouveau, ou désactivé puis rallumé → contrôle du plafond si sa caisse est inactive.
  */
 export function decisionInscription(a: {
   poste: { actif: boolean } | null;
   aHistorique: boolean;
   plafond: number | null;
-  actifs: number;
+  caissesActives: number;
+  caisseDejaActive: boolean;
 }): DecisionInscription {
   if (a.poste?.actif) return { action: "rien" };
-  const plein = a.plafond !== null && a.actifs >= a.plafond;
+  const plein = !a.caisseDejaActive && a.plafond !== null && a.caissesActives >= a.plafond;
   if (!a.poste && a.aHistorique) return { action: "inscrire", horsQuota: plein };
   return plein ? { action: "refuser" } : { action: "inscrire", horsQuota: false };
 }
 
 export function refusPostes(cle: string, plafond: number, utilise: number, quoi: string | null): QuotaAtteint {
-  const couvre = plafond === 1 ? "1 poste de caisse" : `${plafond} postes de caisse`;
-  const message = `Votre formule couvre ${couvre}. Pour en ajouter un, passez au niveau supérieur ou désactivez un poste.`;
-  return { code: "quota_atteint", error: "quota_atteint", cle, plafond, utilise, quoi: quoi || "postes de caisse", message };
+  const couvre = plafond === 1 ? "1 caisse" : `${plafond} caisses`;
+  const message = `Votre formule couvre ${couvre}. Plusieurs appareils peuvent alimenter la même caisse. Pour ajouter une caisse, passez au niveau supérieur ou désactivez tous les appareils d'une caisse existante.`;
+  return { code: "quota_atteint", error: "quota_atteint", cle, plafond, utilise, quoi: quoi || "caisses", message };
 }
 
 const DUREE_CACHE_MS = 60_000; // un plafond relevé s'applique en une minute

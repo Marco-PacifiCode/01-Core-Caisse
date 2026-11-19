@@ -27,35 +27,35 @@ afterEach(() => {
 });
 
 test("poste déjà enregistré et actif : rien à faire, même au-dessus du plafond", () => {
-  assert.deepEqual(decisionInscription({ poste: { actif: true }, aHistorique: false, plafond: 1, actifs: 5 }), { action: "rien" });
+  assert.deepEqual(decisionInscription({ poste: { actif: true }, aHistorique: false, plafond: 1, caissesActives: 5, caisseDejaActive: false }), { action: "rien" });
 });
 
 test("poste nouveau : inscrit sous le plafond, refusé au plafond", () => {
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 3, actifs: 2 }), { action: "inscrire", horsQuota: false });
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 1, actifs: 1 }), { action: "refuser" });
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 3, actifs: 7 }), { action: "refuser" });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 3, caissesActives: 2, caisseDejaActive: false }), { action: "inscrire", horsQuota: false });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 1, caissesActives: 1, caisseDejaActive: false }), { action: "refuser" });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: 3, caissesActives: 7, caisseDejaActive: false }), { action: "refuser" });
 });
 
 test("sans plafond : toujours inscrit", () => {
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: null, actifs: 40 }), { action: "inscrire", horsQuota: false });
-  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: null, actifs: 40 }), { action: "inscrire", horsQuota: false });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: false, plafond: null, caissesActives: 40, caisseDejaActive: false }), { action: "inscrire", horsQuota: false });
+  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: null, caissesActives: 40, caisseDejaActive: false }), { action: "inscrire", horsQuota: false });
 });
 
 test("poste inconnu du registre mais qui a déjà travaillé : JAMAIS refusé, marqué hors quota s'il dépasse", () => {
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: true, plafond: 1, actifs: 1 }), { action: "inscrire", horsQuota: true });
-  assert.deepEqual(decisionInscription({ poste: null, aHistorique: true, plafond: 1, actifs: 0 }), { action: "inscrire", horsQuota: false });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: true, plafond: 1, caissesActives: 1, caisseDejaActive: false }), { action: "inscrire", horsQuota: true });
+  assert.deepEqual(decisionInscription({ poste: null, aHistorique: true, plafond: 1, caissesActives: 0, caisseDejaActive: false }), { action: "inscrire", horsQuota: false });
 });
 
 test("poste désactivé puis rallumé : repasse par le plafond", () => {
-  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: 1, actifs: 1 }), { action: "refuser" });
-  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: 2, actifs: 1 }), { action: "inscrire", horsQuota: false });
+  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: 1, caissesActives: 1, caisseDejaActive: false }), { action: "refuser" });
+  assert.deepEqual(decisionInscription({ poste: { actif: false }, aHistorique: false, plafond: 2, caissesActives: 1, caisseDejaActive: false }), { action: "inscrire", horsQuota: false });
 });
 
 test("message de refus : singulier et pluriel", () => {
   const un = refusPostes("CAISSE", 1, 1, "postes de caisse");
   assert.equal(un.error, "quota_atteint");
-  assert.equal(un.message, "Votre formule couvre 1 poste de caisse. Pour en ajouter un, passez au niveau supérieur ou désactivez un poste.");
-  assert.match(refusPostes("CAISSE", 3, 3, null).message, /^Votre formule couvre 3 postes de caisse\./);
+  assert.match(un.message, /^Votre formule couvre 1 caisse\. Plusieurs appareils peuvent alimenter la même caisse\./);
+  assert.match(refusPostes("CAISSE", 3, 3, null).message, /^Votre formule couvre 3 caisses\./);
 });
 
 test("droitDepuisReponse lit la forme réelle de Core-Auth (niveau entier)", () => {

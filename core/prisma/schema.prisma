@@ -550,6 +550,7 @@ model Poste {
   id        String   @id @default(uuid()) @db.Uuid
   tenantId  String   @db.Uuid
   posteId   String
+  caisse    String   @default("principale")
   libelle   String?
   actif     Boolean  @default(true)
   horsQuota Boolean  @default(false)
