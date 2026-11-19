@@ -31,21 +31,19 @@ hooks.deregister();
 
 type Poste = { tenantId: string; posteId: string; caisse: string; actif: boolean };
 
-test("le registre compte les caisses actives et accepte trois appareils sur la principale", async (t) => {
-  const postes: Poste[] = [
-    { tenantId, posteId: "tablette-1", caisse: "principale", actif: true },
-    { tenantId, posteId: "inactive", caisse: "reserve", actif: false },
-    { tenantId: "autre", posteId: "autre", caisse: "autre", actif: true },
-  ];
+function registre(postes: Poste[]) {
   const trouve = ({ tenantId, posteId }: Pick<Poste, "tenantId" | "posteId">) =>
     postes.find((poste) => poste.tenantId === tenantId && poste.posteId === posteId);
-  const tx = {
+  return {
     $executeRaw: async () => {},
     cashSession: { findFirst: async () => null },
     sale: { findFirst: async () => null },
     poste: {
       findUnique: async ({ where }: { where: { tenantId_posteId: Parameters<typeof trouve>[0] } }) =>
         trouve(where.tenantId_posteId) ?? null,
+      // Ordre du tableau = ordre de création : le premier actif est le doyen.
+      findFirst: async ({ where }: { where: { tenantId: string; actif: boolean } }) =>
+        postes.find((poste) => poste.tenantId === where.tenantId && poste.actif === where.actif) ?? null,
       findMany: async ({ where }: { where: { tenantId: string } }) =>
         postes.filter((poste) => poste.tenantId === where.tenantId),
       groupBy: async ({ where }: { where: { tenantId: string; actif: boolean } }) => {
@@ -56,12 +54,15 @@ test("le registre compte les caisses actives et accepte trois appareils sur la p
         }
         return Array.from(caisses, ([caisse, count]) => ({ caisse, _count: { _all: count } }));
       },
-      upsert: async ({ create }: { create: Omit<Poste, "actif"> }) => {
-        postes.push({ ...create, actif: true });
+      upsert: async ({ create }: { create: Omit<Poste, "actif" | "caisse"> & { caisse?: string } }) => {
+        postes.push({ caisse: "principale", ...create, actif: true });
       },
       update: async () => assert.fail("le rattachement refusé ne doit rien modifier"),
     },
   };
+}
+
+function brancher(t: { after(fn: () => void): void }, tx: ReturnType<typeof registre>) {
   const contexte = globalThis as typeof globalThis & {
     __postesTestTransaction?: (id: string, fn: (transaction: typeof tx) => unknown) => unknown;
   };
@@ -72,16 +73,40 @@ test("le registre compte les caisses actives et accepte trois appareils sur la p
   t.after(() => {
     delete contexte.__postesTestTransaction;
   });
+}
+
+test("le registre compte les caisses actives et accepte trois appareils sur la principale", async (t) => {
+  brancher(t, registre([
+    { tenantId, posteId: "tablette-1", caisse: "principale", actif: true },
+    { tenantId, posteId: "inactive", caisse: "reserve", actif: false },
+    { tenantId: "autre", posteId: "autre", caisse: "autre", actif: true },
+  ]));
 
   for (const posteId of ["tablette-2", "tablette-3"]) {
     assert.deepEqual(await service.inscrirePosteEnLigne(tenantId, posteId), { ok: true, nouveau: true });
-    const registre = await service.listerPostes(tenantId);
-    assert.equal(registre.utilise, 1);
-    assert.equal(registre.postes.find((poste) => poste.posteId === posteId)?.caisse, "principale");
+    const etat = await service.listerPostes(tenantId);
+    assert.equal(etat.utilise, 1);
+    assert.equal(etat.postes.find((poste) => poste.posteId === posteId)?.caisse, "principale");
   }
   const refus = await service.modifierPoste(tenantId, "tablette-2", { caisse: " seconde " });
   assert.ok(!refus.ok && "code" in refus);
   assert.equal(refus.code, "quota_atteint");
   assert.equal(refus.plafond, 1);
   assert.equal(refus.utilise, 1);
+});
+
+test("un appareil neuf rejoint la caisse existante même si elle n'est plus « principale »", async (t) => {
+  brancher(t, registre([{ tenantId, posteId: "tablette-1", caisse: "comptoir", actif: true }]));
+  assert.deepEqual(await service.inscrirePosteEnLigne(tenantId, "tablette-neuve"), { ok: true, nouveau: true });
+  const etat = await service.listerPostes(tenantId);
+  assert.equal(etat.utilise, 1);
+  assert.equal(etat.postes.find((poste) => poste.posteId === "tablette-neuve")?.caisse, "comptoir");
+});
+
+test("un appareil inconnu noté après un import hors ligne rejoint la caisse existante", async (t) => {
+  brancher(t, registre([{ tenantId, posteId: "tablette-1", caisse: "comptoir", actif: true }]));
+  await service.noterPosteHorsLigne(tenantId, "tablette-hors-ligne");
+  const etat = await service.listerPostes(tenantId);
+  assert.equal(etat.utilise, 1);
+  assert.equal(etat.postes.find((poste) => poste.posteId === "tablette-hors-ligne")?.caisse, "comptoir");
 });

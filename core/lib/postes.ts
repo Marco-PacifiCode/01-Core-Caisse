@@ -43,7 +43,19 @@ function droitCaisse(tenantId: string): Promise<DroitQuota | null> {
  */
 async function verrouRegistre(tx: Prisma.TransactionClient, tenantId: string): Promise<void> {
   await tx.$executeRaw`SELECT set_config('lock_timeout', '3s', true)`;
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"quota-postes:" + tenantId}, 0))`;
+  // Minuscules : PostgreSQL lit le même uuid quelle que soit sa casse, le verrou doit en faire autant.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"quota-postes:" + tenantId.toLowerCase()}, 0))`;
+}
+
+/**
+ * Caisse que rejoint un appareil NOUVEAU : celle du plus ancien appareil actif du tenant, sinon
+ * « principale ». Un appareil de plus ne crée donc jamais une caisse de plus (relecture du 19/11 :
+ * si le dernier appareil de « principale » avait été rattaché ailleurs, un appareil neuf y aurait
+ * fait naître une 2e caisse et pris un 409 ; un import hors ligne aurait fait de même sans contrôle).
+ */
+async function caisseDAccueil(tx: Prisma.TransactionClient, tenantId: string): Promise<string> {
+  const doyen = await tx.poste.findFirst({ where: { tenantId, actif: true }, orderBy: { creeLe: "asc" }, select: { caisse: true } });
+  return doyen?.caisse ?? CAISSE_PRINCIPALE;
 }
 
 /** Ce poste a-t-il déjà travaillé (session ou vente à son nom) ? */
@@ -78,9 +90,10 @@ export async function inscrirePosteEnLigne(
       if (poste?.actif) return { ok: true as const, nouveau: false };
       const aHistorique = poste ? false : await aDejaTravaille(tx, tenantId, posteId);
       const caisses = await compterPostesParCaisse(tx, tenantId);
+      const caisseVisee = poste?.caisse ?? await caisseDAccueil(tx, tenantId);
       const decision = decisionInscription({
         poste, aHistorique, plafond, caissesActives: caisses.size,
-        caisseDejaActive: caisses.has(poste?.caisse ?? CAISSE_PRINCIPALE),
+        caisseDejaActive: caisses.has(caisseVisee),
       });
       if (decision.action === "refuser") {
         return { ok: false as const, quota: refusPostes(CLE, plafond as number, caisses.size, droit?.quoi ?? null) };
@@ -88,7 +101,7 @@ export async function inscrirePosteEnLigne(
       if (decision.action === "inscrire") {
         await tx.poste.upsert({
           where: cle,
-          create: { tenantId, posteId, caisse: CAISSE_PRINCIPALE, horsQuota: decision.horsQuota },
+          create: { tenantId, posteId, caisse: caisseVisee, horsQuota: decision.horsQuota },
           update: { actif: true, horsQuota: decision.horsQuota },
         });
       }
@@ -122,13 +135,12 @@ export async function annulerInscription(tenantId: string, posteId: string): Pro
  */
 export async function noterPosteHorsLigne(tenantId: string, posteId: string): Promise<void> {
   try {
-    await withTenant(tenantId, (tx) =>
-      tx.poste.upsert({
-        where: { tenantId_posteId: { tenantId, posteId } },
-        create: { tenantId, posteId },
-        update: {},
-      }),
-    );
+    await withTenant(tenantId, async (tx) => {
+      const cle = { tenantId_posteId: { tenantId, posteId } };
+      if (await tx.poste.findUnique({ where: cle, select: { id: true } })) return;
+      await verrouRegistre(tx, tenantId);
+      await tx.poste.upsert({ where: cle, create: { tenantId, posteId, caisse: await caisseDAccueil(tx, tenantId) }, update: {} });
+    });
   } catch (e) {
     journal("quota.noterPosteHorsLigne", e, { tenantId, posteId });
   }
@@ -157,7 +169,7 @@ export async function listerPostes(tenantId: string) {
 }
 
 export type ModifierPosteResult =
-  | { ok: true; poste: { posteId: string; libelle: string | null; actif: boolean; horsQuota: boolean } }
+  | { ok: true; poste: { posteId: string; libelle: string | null; caisse: string; actif: boolean; horsQuota: boolean } }
   | { ok: false; error: "POSTE_INCONNU" | "SESSION_OUVERTE" }
   | ({ ok: false } & QuotaAtteint);
 
@@ -199,7 +211,7 @@ export async function modifierPoste(
         ...(caisse !== poste.caisse ? { caisse } : {}),
         ...(changeEtat ? { actif: input.actif, horsQuota: false } : {}),
       },
-      select: { posteId: true, libelle: true, actif: true, horsQuota: true },
+      select: { posteId: true, libelle: true, caisse: true, actif: true, horsQuota: true },
     });
     return { ok: true as const, poste: maj };
   });
