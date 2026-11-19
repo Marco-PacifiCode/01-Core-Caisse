@@ -2,6 +2,12 @@
 
 > ✅ **Lot 2A EN LIGNE le 05/11 à 22 h 44 NC** (c85b27b, migration 2026110400000 jouée avant) : la prod a les colonnes et la table de bail ; plus de contrainte d'ordre pour les prochains ships.
 
+## 🧮 19/11 — Quota CAISSE = nombre de caisses, plus d'appareils — ✅ FUSIONNÉ (PR 126, main 1f33420, ci-local GREEN 22897ec), migration JOUÉE en prod, ⛔ code NON LIVRÉ (question d'Archi à Marco)
+- Décision Marco 19/11 (QCM « Les caisses, pas les appareils (Recommandé) ») : « rotisserie n'a qu'un seule caisse. il enregiste avec plusieur appareills mais ça alimente la même caisse. » La Rôtisserie affichait 2/1 « Dépassé » (2 tablettes).
+- `Poste.caisse` (TEXT NOT NULL DEFAULT 'principale', migration `20261119000000_poste_caisse` jouée le 19/11 à 17 h 13 par migrate-local, structure d'avant dans `/home/deploy/backups/premigration/core-caisse-20261119T061306Z-avant.sql`). `utilise` = caisses distinctes parmi les appareils actifs. Un appareil NEUF (en ligne ou noté après un import hors ligne) rejoint la caisse du plus ancien appareil actif (`caisseDAccueil`) : il ne crée jamais de caisse. Seul `PATCH /api/postes` avec `caisse` vers une caisse nouvelle repasse par le plafond (409 quota_atteint). Verrou du registre en minuscules. GET : même forme + `postes[].caisse`.
+- Relecture GPT : 2 bloquants corrigés (dernier appareil déplacé → appareil neuf refusé ; import hors ligne qui recréait « principale »), tests `lib/postes-caisses.test.ts`.
+- Reste : le libellé du droit Core-Auth et la carte CAISSE du catalogue de l'admin disent encore « postes de caisse ».
+
 ## 📦 15/11 — État d'un dépôt : `rejeuTablette` (qui enregistre la pièce) — ✅ EN LIGNE @619957d depuis le 16/11 (lot du jour)
 - **Livraison** : PR 124 fusionnée (main `619957d`, ci-local GREEN `5777efb`), livrée au lot du 16/11 sur l'accord de Marco (QCM du lot, « Tout », 16 h 39 NC) ; demande `_queue/ship/s-20261116-0200-core-caisse.json`. Version servie relue le 16/11 à 22 h 15 NC : `619957d`.
 - **Pourquoi** (Marco, 15/11 : « on garde que le bulk c'est plus fiable ») : mesuré à la Rôtisserie le 15/11, la tablette dépose en bloc, le serveur enregistre, et la tablette renvoie quand même chaque pièce une par une : elle ne savait pas si le serveur allait l'enregistrer.
