@@ -7,6 +7,10 @@ export type PaymentLike = {
   method: PayMethodLike;
   amountXpf: bigint; // montant imputé à la vente
   tenderedXpf?: bigint; // remis par le client (espèces) → sert au rendu monnaie
+  // Détail facultatif d'un chèque (n° + banque, demande V-Cut 20/11) : PORTÉ tel quel, jamais
+  // lu par un calcul d'argent ici. Normalisé par lib/cheque-detail.ts avant d'arriver.
+  chequeNumber?: string | null;
+  chequeBank?: string | null;
 };
 
 /**
@@ -73,6 +77,9 @@ export function normalizePayments(totalXpf: bigint, payments: PaymentLike[]): No
       amountXpf: take,
       // On garde la trace du remis (utile au reçu) uniquement s'il diffère de l'imputé.
       tenderedXpf: received > take ? received : undefined,
+      // Le détail du chèque suit SA ligne (une sortie par entrée, même ordre) ; absent = clés absentes.
+      ...(p.chequeNumber ? { chequeNumber: p.chequeNumber } : {}),
+      ...(p.chequeBank ? { chequeBank: p.chequeBank } : {}),
     });
   }
 

@@ -76,6 +76,10 @@ export type SettleInput = {
   amountXpf: number;
   method: string; // CASH | CARD | TRANSFER | CHEQUE | OTHER
   paymentRef: string; // idempotence côté Compta
+  /** Détail facultatif d'un chèque (V-Cut, 20/11). Omis du corps quand vide : la requête
+   *  d'un paiement sans chèque reste celle d'avant, au champ près. */
+  chequeNumber?: string | null;
+  chequeBank?: string | null;
 };
 
 export type SettleResult = {
@@ -261,6 +265,8 @@ const httpCompta: ComptaClient = {
       amountXpf: input.amountXpf,
       method: input.method,
       paymentRef: input.paymentRef,
+      ...(input.chequeNumber ? { chequeNumber: input.chequeNumber } : {}),
+      ...(input.chequeBank ? { chequeBank: input.chequeBank } : {}),
     });
     return (await res.json()) as SettleResult;
   },

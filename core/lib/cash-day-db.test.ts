@@ -10,6 +10,7 @@ import * as projection from "./cash-day-projection.ts";
 import * as policy from "./cash-shared-policy.ts";
 import * as money from "./money.ts";
 import * as credit from "./credit.ts";
+import * as chequeDetail from "./cheque-detail.ts";
 import * as refundPolicy from "./partial-refund.ts";
 import * as movements from "./cash-movement.ts";
 import * as gifts from "./gift-card.ts";
@@ -277,7 +278,7 @@ function api(f: ReturnType<typeof fixture>, path: string, native: Row) {
     "next/server": { NextResponse: { json: (body: unknown, options: Row = {}) => ({ body, status: options.status ?? 200 }) } },
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": native,
     "@/lib/cash-day-guard": load("cash-day-guard.ts", { "./tenant": { withTenant: f.withTenant }, "./caisse-sync": f.sync, "./cash-day-projection": projection }),
-    "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
+    "@/lib/partial-refund": refundPolicy, "@/lib/cash-day-projection": projection, "@/lib/credit": credit, "@/lib/cheque-detail": chequeDetail,
     "@/lib/tenant": { withTenant: f.withTenant }, "@/lib/serialize": { xpf: Number },
     "@/lib/log": { log: { info() {} } }, "@/lib/postes": { noterPosteHorsLigne: async () => {} },
   });

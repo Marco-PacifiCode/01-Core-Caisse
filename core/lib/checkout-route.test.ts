@@ -77,3 +77,13 @@ test("les erreurs de fidélité renvoyées par checkoutSale sont mappées sur 40
   assert.match(body, /LOYALTY_AMOUNT_MISMATCH:\s*409/);
   assert.match(body, /LOYALTY_ACCOUNT_MISMATCH:\s*409/);
 });
+
+test("V-Cut 20/11 : `seller` et le détail du chèque ne produisent JAMAIS de 400", () => {
+  const src = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "app", "api", "sales", "[id]", "checkout", "route.ts"), "utf8");
+  const bloc = src.slice(src.indexOf("let seller"), src.indexOf("const options"));
+  assert.ok(bloc.length > 50, "bloc seller introuvable");
+  assert.doesNotMatch(bloc, /status: 400/);
+  assert.match(bloc, /UUID_RE\.test\(sellerId\)/);
+  assert.match(src, /\.\.\.detailCheque\(p\.method, p\.chequeNumber, p\.chequeBank\)/);
+  assert.match(src, /\.\.\.\(seller \? \{ seller \} : \{\}\)/);
+});

@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runSaleSync, type SyncSaleSnapshot, type SyncPersist, type SyncGuard } from "./sync.ts";
 import { CoreClientError } from "./clients.ts";
-import type { ComptaClient, StockClient, CreateInvoiceResult, SettleResult, MovementResult, MovementInput } from "./clients.ts";
+import type { ComptaClient, StockClient, CreateInvoiceResult, SettleResult, SettleInput, MovementResult, MovementInput } from "./clients.ts";
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
@@ -68,6 +68,7 @@ function emptyState(): FakeState {
 function makeCompta(opts: { failCreate?: CoreClientError; failSettle?: CoreClientError } = {}) {
   const calls = { createInvoice: 0, settle: 0 };
   const createInvoiceArgs: unknown[] = [];
+  const settleArgs: SettleInput[] = [];
   const client: ComptaClient = {
     async createInvoice(input): Promise<CreateInvoiceResult> {
       calls.createInvoice++;
@@ -75,14 +76,15 @@ function makeCompta(opts: { failCreate?: CoreClientError; failSettle?: CoreClien
       if (opts.failCreate) throw opts.failCreate;
       return { invoiceId: "inv-1", number: "FAC-1", totalXpf: 8000, alreadyExisted: false };
     },
-    async settle(): Promise<SettleResult> {
+    async settle(input): Promise<SettleResult> {
       calls.settle++;
+      settleArgs.push(input);
       if (opts.failSettle) throw opts.failSettle;
       return { ok: true, invoiceId: "inv-1", paid: 8000, remaining: 0 };
     },
     receiptUrl: (invoiceId) => `http://compta/receipt/${invoiceId}`,
   };
-  return { client, calls, opts, createInvoiceArgs };
+  return { client, calls, opts, createInvoiceArgs, settleArgs };
 }
 
 /** Stock fake : compte les appels ; peut échouer sur commande. */
@@ -291,4 +293,20 @@ test("stock négatif : option active au premier passage et au rejeu, avec et san
       }
     }
   }
+});
+
+test("chèque (V-Cut 20/11) : n° et banque de la ligne CHEQUE transmis au settle Compta, rien sur les autres", async () => {
+  const state = emptyState();
+  const compta = makeCompta();
+  const sale = makeSale({ payments: [
+    { id: "p-1", method: "CASH", amountXpf: 3000n, settleRef: "caisse:sale-1:0", chequeNumber: null, chequeBank: null },
+    { id: "p-2", method: "CHEQUE", amountXpf: 5000n, settleRef: "caisse:sale-1:1", chequeNumber: "1234567", chequeBank: "BCI" },
+  ] });
+  await runSaleSync(sale, compta.client, makeStock().client, makePersist(state));
+  assert.equal(compta.settleArgs.length, 2);
+  assert.equal(compta.settleArgs[0].chequeNumber ?? null, null);
+  assert.equal(compta.settleArgs[1].chequeNumber, "1234567");
+  assert.equal(compta.settleArgs[1].chequeBank, "BCI");
+  // Les montants ne bougent pas d'un franc.
+  assert.deepEqual(compta.settleArgs.map((a) => a.amountXpf), [3000, 5000]);
 });

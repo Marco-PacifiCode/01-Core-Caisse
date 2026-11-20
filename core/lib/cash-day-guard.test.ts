@@ -6,6 +6,7 @@ import ts from "typescript";
 import * as refundPolicy from "./partial-refund.ts";
 import * as projection from "./cash-day-projection.ts";
 import * as credit from "./credit.ts";
+import * as chequeDetail from "./cheque-detail.ts";
 import * as sync from "./caisse-sync.ts";
 import { createHash } from "node:crypto";
 
@@ -47,7 +48,7 @@ function fixture(mode: "canonical" | "alias" | "sale-only" | "standalone" | "oth
     "@/lib/service-auth": { hasServiceKey: () => true }, "@/lib/cles-service": { horsPortee: () => null }, "@/lib/caisse": native,
     "@/lib/log": { log: { info() {} } }, "@/lib/postes": { noterPosteHorsLigne: async () => {} },
     "@/lib/tenant": {}, "@/lib/serialize": { xpf: Number }, "@/lib/partial-refund": refundPolicy,
-    "@/lib/cash-day-projection": projection, "@/lib/credit": credit,
+    "@/lib/cash-day-projection": projection, "@/lib/credit": credit, "@/lib/cheque-detail": chequeDetail,
     "next/cache": { revalidatePath: () => {} }, "@/lib/guards": { requireStaff: async () => ({ user: { id: actionId }, tenant: { id: tenant } }) },
   };
   return { guard, writes, imports };

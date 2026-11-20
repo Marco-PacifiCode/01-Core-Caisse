@@ -122,7 +122,7 @@ test("🛑 LOT : `take` vaut le NOMBRE d'identifiants, pas la limite plafonnée 
   // L'unicité (tenantId, sourceType, sourceId) rend cette borne exacte. Repasser par
   // `limit` ici rendrait la réponse tronquée sans que personne ne le sache.
   const body = getBody();
-  assert.match(body, /const take = enLot \? tousLesIds\.length : limit/);
+  assert.match(body, /const take = parIds \? ventesDemandees\.length : enLot \? tousLesIds\.length : limit/);
   assert.match(body, /take,/);
   assert.ok(!/take:\s*limit/.test(body), "le lot est encore borné par `limit`");
 });
@@ -148,4 +148,20 @@ test("ARTICLES : le rendu expose `lines` (libellé, quantité, montants en xpf, 
   // Montants BigInt : sans `xpf()`, NextResponse.json lève et la route rend 500.
   assert.match(body, /unitXpf:\s*xpf\(l\.unitXpf\)/);
   assert.match(body, /lineXpf:\s*xpf\(l\.lineXpf\)/);
+});
+
+test("« qui encaisse » (20/11) : sellerId/sellerName rendus, lot `ids` borné sans troncature", () => {
+  const body = getBody();
+  assert.match(body, /sellerId: s\.sellerId/);
+  assert.match(body, /sellerName: s\.sellerName/);
+  // Le lot d'identifiants de VENTE : borné par son propre nombre, refusé au-delà, jamais rogné.
+  assert.match(body, /id: \{ in: ventesDemandees \}/);
+  assert.match(body, /take = parIds \? ventesDemandees\.length/);
+  assert.match(body, /TOO_MANY_IDS/);
+});
+
+test("chèque (20/11) : n° et banque rendus seulement quand présents", () => {
+  const body = getBody();
+  assert.match(body, /chequeNumber: true, chequeBank: true/);
+  assert.match(body, /\.\.\.\(p\.chequeNumber \? \{ chequeNumber: p\.chequeNumber \} : \{\}\)/);
 });
