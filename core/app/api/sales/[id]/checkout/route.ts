@@ -7,6 +7,7 @@ import { CashContractError } from "@/lib/cash-day-projection";
 import { parseDueAt } from "@/lib/credit";
 import type { GiftCardInput } from "@/lib/gift-card";
 import type { PayMethod } from "@prisma/client";
+import { detailCheque } from "@/lib/cheque-detail";
 
 export const runtime = "nodejs";
 
@@ -23,7 +24,10 @@ const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0
  * (décrément SALE). Idempotent de bout en bout : rejouer avec le même saleId ne double NI la facture
  * NI le stock NI les paiements.
  *
- * Body : { tenantId, payments: { method, amountXpf, tenderedXpf? }[], credit?: { dueAt } }
+ * Body : { tenantId, payments: { method, amountXpf, tenderedXpf?, chequeNumber?, chequeBank? }[],
+ *          credit?: { dueAt }, seller?: { id, name } }
+ *   chequeNumber/chequeBank (20/11) : détail facultatif d'un chèque, jamais bloquant.
+ *   seller (20/11) : employée à qui la vente est attribuée (Sale.sellerId/sellerName), jamais bloquant.
  *   payments : 1..n (paiement MIXTE supporté). tenderedXpf (espèces) → rendu monnaie.
  *   credit (échéancier, lot A, 2026-09-15) : VENTE À CRÉDIT — `payments` porte alors le 1er
  *     versement (montant libre, strictement > 0), `dueAt` (YYYY-MM-DD) la date de la DERNIÈRE
@@ -49,7 +53,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   let body: {
     tenantId?: string;
-    payments?: { method?: string; amountXpf?: number; tenderedXpf?: number }[];
+    payments?: { method?: string; amountXpf?: number; tenderedXpf?: number; chequeNumber?: unknown; chequeBank?: unknown }[];
+    /** « Qui encaisse » (V-Cut, 20/11) : employée à qui la vente est attribuée. Facultatif,
+     *  jamais bloquant : un id qui n'est pas un UUID est IGNORÉ (pas de 400). */
+    seller?: { id?: unknown; name?: unknown };
     /** Date ISO de l'encaissement réel (remontée différée d'une caisse hors ligne). */
     paidAt?: string;
     // OPTIONNEL, et c'est structurant : ce moteur est MUTUALISÉ entre marchands, et toutes les
@@ -95,6 +102,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       method: p.method as PayMethod,
       amountXpf: BigInt(Math.round(p.amountXpf)),
       tenderedXpf: p.tenderedXpf !== undefined && p.tenderedXpf !== null ? BigInt(Math.round(p.tenderedXpf)) : undefined,
+      // Chèque : n° et banque facultatifs, normalisés (tronqués, jamais refusés), null hors CHEQUE.
+      ...detailCheque(p.method, p.chequeNumber, p.chequeBank),
     });
   }
 
@@ -177,8 +186,16 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // On n'ajoute la clé d'options QUE si elle porte quelque chose : sans
   // `giftCards` ni `paidAt` ni `credit` ni `loyalty` ni `redeemLoyalty`, l'appel reste à
   // l'octet près celui d'avant.
+  // « Qui encaisse » — jamais un refus : forme illisible = pas d'attribution.
+  let seller: { id: string; name: string | null } | undefined;
+  const sellerId = typeof body.seller?.id === "string" ? body.seller.id.trim() : "";
+  if (UUID_RE.test(sellerId)) {
+    const sellerName = typeof body.seller?.name === "string" ? body.seller.name.replace(/\s+/g, " ").trim().slice(0, 120) : "";
+    seller = { id: sellerId.toLowerCase(), name: sellerName || null };
+  }
+
   const options =
-    giftCards || paidAt || redeemGiftCards || credit || loyalty || redeemLoyalty
+    giftCards || paidAt || redeemGiftCards || credit || loyalty || redeemLoyalty || seller
       ? {
           ...(giftCards ? { giftCards } : {}),
           ...(paidAt ? { paidAt } : {}),
@@ -186,6 +203,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
           ...(credit ? { credit } : {}),
           ...(loyalty ? { loyalty } : {}),
           ...(redeemLoyalty ? { redeemLoyalty } : {}),
+          ...(seller ? { seller } : {}),
         }
       : undefined;
   let result: Awaited<ReturnType<typeof checkoutSale>>;

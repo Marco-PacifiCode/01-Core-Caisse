@@ -45,6 +45,9 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     partialRefunds: sale.partialRefunds.map(r => ({ actionId: r.actionId, status: r.status, creditNoteId: r.creditNoteId,
       input: r.input, plan: r.plan, createdAt: r.createdAt })),
     cashierId: sale.cashierId,
+    // « Qui encaisse » (V-Cut, 20/11) : employée à qui la vente est attribuée — null si aucune.
+    sellerId: sale.sellerId,
+    sellerName: sale.sellerName,
     clientName: sale.clientName,
     subtotalXpf: xpf(sale.subtotalXpf),
     totalXpf: xpf(sale.totalXpf),
@@ -72,6 +75,9 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       amountXpf: xpf(p.amountXpf),
       method: p.method,
       createdAt: p.createdAt,
+      // Détail du chèque (20/11) : clés ABSENTES quand vides, la réponse d'avant reste identique.
+      ...(p.chequeNumber ? { chequeNumber: p.chequeNumber } : {}),
+      ...(p.chequeBank ? { chequeBank: p.chequeBank } : {}),
     })),
   });
 }

@@ -67,6 +67,9 @@ export type SyncPayment = {
   method: string;
   amountXpf: bigint;
   settleRef: string | null;
+  /** Détail facultatif d'un chèque (V-Cut, 20/11) — transmis tel quel au settle Compta. */
+  chequeNumber?: string | null;
+  chequeBank?: string | null;
 };
 
 /** Photo de la vente nécessaire à la synchro (chargée sous withTenant par l'appelant). */
@@ -290,7 +293,8 @@ async function runGuardedSaleSync(
         for (const p of cur.payments) {
           await compta.settle({ tenantId: cur.tenantId, invoiceId: cur.invoiceId,
             amountXpf: Number(p.amountXpf), method: p.method,
-            paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}` });
+            paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${cur.id}:${p.id}`,
+            chequeNumber: p.chequeNumber ?? null, chequeBank: p.chequeBank ?? null });
         }
         const afterSettle = await guard.reread();
         if (afterSettle?.status === "VOID" || afterSettle?.voidPreparedAt) races.settledOnVoidingSale = true;
@@ -388,6 +392,8 @@ export async function runSaleSync(
           amountXpf: Number(p.amountXpf),
           method: p.method,
           paymentRef: p.settleRef ?? `${CAISSE_SOURCE_TYPE}:${sale.id}:${p.id}`,
+          chequeNumber: p.chequeNumber ?? null,
+          chequeBank: p.chequeBank ?? null,
         });
       }
       await persist.markComptaSynced();

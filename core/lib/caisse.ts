@@ -744,6 +744,10 @@ export type PaymentInput = {
   method: PayMethod;
   amountXpf: bigint; // montant imputé à la vente
   tenderedXpf?: bigint; // remis par le client (espèces) → sert au rendu monnaie
+  /** Détail FACULTATIF d'un chèque (demande V-Cut, 20/11) — déjà normalisé par
+   *  `detailCheque` (lib/cheque-detail.ts) : null hors CHEQUE, jamais bloquant. */
+  chequeNumber?: string | null;
+  chequeBank?: string | null;
 };
 
 /**
@@ -807,6 +811,15 @@ export type CheckoutOptions = {
    * Jamais un `PayMethod` : le CA baisse une seule fois, par la ligne négative.
    */
   redeemLoyalty?: { rewardEntryId: string; by?: string | null; byName?: string | null };
+  /**
+   * « Qui encaisse » (demande V-Cut, QCM Marco 20/11) — l'employée à qui la vente est
+   * ATTRIBUÉE (chiffre par praticienne), choisie au comptoir. Écrite dans `Sale.sellerId` /
+   * `sellerName` (colonnes déjà là depuis 20261016093000), DANS la transaction du passage à
+   * PAID, et SEULEMENT sur une vente DRAFT hors journée partagée : un rejeu d'une vente déjà
+   * payée ne réattribue rien, et le chemin CashDay garde son propre vendeur. Absent = rien
+   * n'est écrit (comportement d'avant). Ne bloque jamais : la route ignore un id illisible.
+   */
+  seller?: { id: string; name: string | null };
 };
 
 /** Un bon à brûler pendant l'encaissement, désigné par son id (la surface l'a retrouvé par son code). */
@@ -922,6 +935,8 @@ function toSnapshot(sale: LoadedSale): SyncSaleSnapshot {
       method: p.method,
       amountXpf: p.amountXpf,
       settleRef: p.settleRef,
+      chequeNumber: p.chequeNumber,
+      chequeBank: p.chequeBank,
     })),
   };
 }
@@ -1451,6 +1466,9 @@ export async function checkoutSale(
             amountXpf: p.amountXpf,
             tenderedXpf: p.tenderedXpf ?? null,
             settleRef: `${CAISSE_SOURCE_TYPE}:${storedSaleId}:${i}`,
+            // Chèque : n° et banque facultatifs, seulement sur une ligne CHEQUE.
+            chequeNumber: p.method === "CHEQUE" ? p.chequeNumber ?? null : null,
+            chequeBank: p.method === "CHEQUE" ? p.chequeBank ?? null : null,
           };
           await tx.salePayment.create({ data });
         }
@@ -1491,7 +1509,9 @@ export async function checkoutSale(
     // hors de cette requête (cf. lib/sync.ts#SyncSaleSnapshot.dueAt).
     const datePaiement =
       options?.paidAt && options.paidAt.getTime() <= Date.now() + 60_000 ? options.paidAt : new Date();
-    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", sessionId, paidAt: datePaiement, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
+    // « Qui encaisse » : attribution posée au passage DRAFT → PAID seulement (cf. CheckoutOptions.seller).
+    const vendeuse = options?.seller && current.status === "DRAFT" && !current.cashDayId ? { sellerId: options.seller.id, sellerName: options.seller.name } : {};
+    await tx.sale.update({ where: { id: saleId }, data: { status: "PAID", sessionId, paidAt: datePaiement, ...vendeuse, ...(creditDueAtIso ? { dueAt: new Date(creditDueAtIso) } : {}) } });
     if (sessionId !== current.sessionId) log.warn("vente_rattachee", { tenantId, saleId, ancienneSession: current.sessionId, nouvelleSession: sessionId });
     if (current.cashDayId) {
       await consumePickupOrder(tx, tenantId, saleId);

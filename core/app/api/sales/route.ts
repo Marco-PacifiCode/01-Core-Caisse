@@ -9,6 +9,7 @@ import { xpf } from "@/lib/serialize";
 import type { LineKind } from "@prisma/client";
 
 const VALID_KINDS: LineKind[] = ["SERVICE", "PRODUCT", "OTHER"];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * POST /api/sales
@@ -118,7 +119,7 @@ export async function POST(req: NextRequest) {
 
 /**
  * GET /api/sales?tenantId=...&status=...&sessionId=...&from=ISO&to=ISO&limit=...
- *              [&sourceType=rdv&sourceId=<uuid>]
+ *              [&sourceType=rdv&sourceId=<uuid>] [&ids=<uuid>,<uuid>,…]
  * Historique des tickets d'un tenant (S2S, X-Core-Key).
  *
  * ── `sourceType` / `sourceId` : répondre « ce ticket existe-t-il ? » ────────────────
@@ -192,6 +193,23 @@ export async function GET(req: NextRequest) {
   const tousLesIds = [...new Set([...(sourceId ? [sourceId] : []), ...idsBruts])];
   const enLot = idsBruts.length > 0;
 
+  // ── `ids` : les ventes elles-mêmes, par LOT exact d'identifiants (20/11, « qui encaisse ») ──
+  // Les statistiques d'un salon partent des FACTURES de Core-Compta (sourceType "caisse",
+  // sourceId = id de la vente) et ont besoin de l'employée à qui chaque vente est attribuée.
+  // Même discipline que `sourceIds` : la borne est le nombre d'identifiants (une vente par id,
+  // clé primaire), jamais `limit` ; au-delà de MAX_SOURCE_IDS on REFUSE au lieu de rogner.
+  // Les identifiants qui ne sont pas des UUID sont ÉCARTÉS (une colonne uuid ferait lever Prisma).
+  const ventesDemandees = [...new Set((searchParams.get("ids") ?? "")
+    .split(",").map((s) => s.trim().toLowerCase()).filter((s) => UUID_RE.test(s)))];
+  const parIds = searchParams.has("ids");
+  if (ventesDemandees.length > MAX_SOURCE_IDS) {
+    return NextResponse.json(
+      { error: "TOO_MANY_IDS", max: MAX_SOURCE_IDS, recu: ventesDemandees.length },
+      { status: 400 },
+    );
+  }
+  if (parIds && ventesDemandees.length === 0) return NextResponse.json({ sales: [] });
+
   if (enLot && !sourceType) {
     return NextResponse.json({ error: "sourceType requis avec sourceIds" }, { status: 400 });
   }
@@ -210,7 +228,7 @@ export async function GET(req: NextRequest) {
 
   // 🛑 En lot, la borne est le NOMBRE D'IDENTIFIANTS, jamais `limit` : l'unicité
   // `(tenantId, sourceType, sourceId)` rend cette borne exacte, donc sans troncature.
-  const take = enLot ? tousLesIds.length : limit;
+  const take = parIds ? ventesDemandees.length : enLot ? tousLesIds.length : limit;
 
   const sales = await withTenant(tenantId, (tx) =>
     tx.sale.findMany({
@@ -219,12 +237,13 @@ export async function GET(req: NextRequest) {
         ...(status ? { status: status as never } : {}),
         ...(sessionId ? { sessionId } : {}),
         ...sourceFilter,
+        ...(parIds ? { id: { in: ventesDemandees } } : {}),
         ...(from || to
           ? { createdAt: { ...(from ? { gte: new Date(from) } : {}), ...(to ? { lte: new Date(to) } : {}) } }
           : {}),
       },
       include: {
-        payments: { select: { method: true, amountXpf: true } },
+        payments: { select: { method: true, amountXpf: true, chequeNumber: true, chequeBank: true } },
         lines: { select: { kind: true, label: true, qty: true, unitXpf: true, lineXpf: true, tgcRatePpm: true }, orderBy: { createdAt: "asc" } },
       },
       orderBy: { createdAt: "desc" },
@@ -243,6 +262,9 @@ export async function GET(req: NextRequest) {
       invoiceNumber: s.invoiceNumber,
       sourceType: s.sourceType,
       sourceId: s.sourceId,
+      // « Qui encaisse » (20/11) : employée à qui la vente est attribuée — null si aucune.
+      sellerId: s.sellerId,
+      sellerName: s.sellerName,
       paidXpf: xpf(s.payments.reduce((t, p) => t + p.amountXpf, 0n)),
       // VENTILATION PAR MOYEN DE PAIEMENT — ajoutée le 2026-08-10 (demande Marco).
       //
@@ -262,7 +284,13 @@ export async function GET(req: NextRequest) {
       // ⚠️ `xpf()` est OBLIGATOIRE sur `amountXpf` : un BigInt laissé brut fait LEVER
       // `NextResponse.json` (« Do not know how to serialize a BigInt ») et la route rend
       // 500 — le journal de caisse deviendrait vide, sans message.
-      payments: s.payments.map((p) => ({ method: p.method, amountXpf: xpf(p.amountXpf) })),
+      payments: s.payments.map((p) => ({
+        method: p.method,
+        amountXpf: xpf(p.amountXpf),
+        // Détail du chèque (20/11) : clés ABSENTES quand vides (réponse d'avant identique).
+        ...(p.chequeNumber ? { chequeNumber: p.chequeNumber } : {}),
+        ...(p.chequeBank ? { chequeBank: p.chequeBank } : {}),
+      })),
       // ARTICLES DE LA VENTE — ajoutés le 2026-10-22 (PC Rôtisserie : tableau de bord à « TGC 0 F,
       // détail de 0 ticket sur 19 » sur un appareil qui n'a pas encaissé lui-même). Même principe que
       // `payments` : purement additif, une seule requête de plus pour toute la page (pas de N+1),

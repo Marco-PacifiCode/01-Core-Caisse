@@ -208,6 +208,11 @@ model SalePayment {
   // Référence idempotente vers le Payment côté Compta (POST /api/settle paymentRef).
   // Déterministe : "caisse:<saleId>:<index>" → rejouer /api/settle ne double pas le paiement.
   settleRef   String?
+  // Détail FACULTATIF d'un chèque (demande V-Cut, 20/11) : n° et banque, seulement si
+  // method = CHEQUE. Transmis à Core-Compta au settle (Payment.chequeNumber/chequeBank).
+  // Ne participe à AUCUN calcul ni à l'idempotence.
+  chequeNumber String?
+  chequeBank   String?
   createdAt   DateTime  @default(now())
 
   @@index([tenantId, saleId])

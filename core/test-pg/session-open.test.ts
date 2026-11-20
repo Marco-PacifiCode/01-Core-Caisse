@@ -229,3 +229,38 @@ test("sabotages sur copie : garde seule échoue g ; sans garde échoue b", async
     assert.equal(readFileSync(sourcePath, "utf8"), original, "production intacte");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+test("g) V-Cut 20/11 : « qui encaisse » et détail du chèque écrits en vraie base ; un rejeu ne réattribue rien", async () => {
+  await fixture(async (tenant, session) => {
+    const id = await sale(tenant, session);
+    const mado = randomUUID(), autre = randomUUID();
+    const pays = [
+      { method: "CHEQUE", amountXpf: 600n, chequeNumber: "1234567", chequeBank: "BCI" },
+      { method: "CASH", amountXpf: 400n, chequeNumber: "ignoré", chequeBank: "ignoré" },
+    ];
+    const paid = await api.checkoutSale(tenant, id, pays, { seller: { id: mado, name: "Mado" } });
+    assert.equal(paid.status, "PAID");
+    assert.equal(paid.paidXpf, 1000);
+    const lu = await transaction(tenant, tx => tx.sale.findFirstOrThrow({ where: { tenantId: tenant, id }, include: { payments: { orderBy: { createdAt: "asc" } } } }));
+    assert.equal(lu.sellerId, mado);
+    assert.equal(lu.sellerName, "Mado");
+    const cheque = lu.payments.find(p => p.method === "CHEQUE")!;
+    const especes = lu.payments.find(p => p.method === "CASH")!;
+    assert.equal(cheque.chequeNumber, "1234567");
+    assert.equal(cheque.chequeBank, "BCI");
+    assert.equal(cheque.amountXpf, 600n);
+    // Le détail d'un chèque ne se pose JAMAIS sur une autre ligne.
+    assert.equal(especes.chequeNumber, null);
+    assert.equal(especes.chequeBank, null);
+    // Rejeu (même vente déjà PAID) avec une autre employée : l'attribution ne bouge pas.
+    const replay = await api.checkoutSale(tenant, id, pays, { seller: { id: autre, name: "Autre" } });
+    assert.equal(replay.alreadyPaid, true);
+    const relu = await transaction(tenant, tx => tx.sale.findFirstOrThrow({ where: { tenantId: tenant, id } }));
+    assert.equal(relu.sellerId, mado);
+    // Sans `seller` : rien n'est écrit (comportement d'avant).
+    const sans = await sale(tenant, session);
+    assert.equal((await api.checkoutSale(tenant, sans, payments)).status, "PAID");
+    const nu = await transaction(tenant, tx => tx.sale.findFirstOrThrow({ where: { tenantId: tenant, id: sans } }));
+    assert.equal(nu.sellerId, null);
+    assert.equal(nu.sellerName, null);
+  });
+});
